@@ -230,54 +230,40 @@ class ResNetUNet(nn.Module):
             resnet.layer4,  # 2048 channels, /32
         )
 
-        # Decoder (U-Net up path)
-        self.decoder = nn.Sequential(
-            # From layer4 (2048 ch, /32) → up to /16
-            nn.ConvTranspose2d(2048, 1024, 2, stride=2),
-            nn.BatchNorm2d(1024),
-            nn.ReLU(inplace=True),
-            # Skip from layer3 (1024 ch) — concat
-            # From /16 → up to /8
-            nn.ConvTranspose2d(1024 + 1024, 512, 2, stride=2),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            # From /8 → up to /4
-            nn.ConvTranspose2d(512 + 512, 256, 2, stride=2),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            # From /4 → up to /2
-            nn.ConvTranspose2d(256 + 256, 128, 2, stride=2),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            # From /2 → up to /1 (original resolution)
-            nn.ConvTranspose2d(128 + 64, 64, 2, stride=2),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            # Final 1x1 conv to output channels
-            nn.Conv2d(64, num_classes, 1),
-        )
+        # Decoder (U-Net up path) — NOTE: resnet34 channels, not resnet50:
+        # layer1=64 (/4), layer2=128 (/8), layer3=256 (/16), layer4=512 (/32).
+        # Must be a module list, not nn.Sequential: each up-step needs to receive
+        # a skip connection that a Sequential container cannot route.
+        self.up4 = nn.ConvTranspose2d(512, 256, 2, stride=2)   # /32 → /16
+        self.bn4 = nn.BatchNorm2d(256)
+        self.up3 = nn.ConvTranspose2d(256, 128, 2, stride=2)   # /16 → /8
+        self.bn3 = nn.BatchNorm2d(128)
+        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)    # /8 → /4
+        self.bn2 = nn.BatchNorm2d(64)
+        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)     # /4 → /2
+        self.bn1b = nn.BatchNorm2d(32)
+        self.up0 = nn.ConvTranspose2d(32, 32, 2, stride=2)     # /2 → /1
+        self.bn0 = nn.BatchNorm2d(32)
+        self.final_conv = nn.Conv2d(32, num_classes, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Encoder
-        feats = []
-        x = self.encoder[0](x)  # conv1
-        x = self.encoder[1](x)  # bn1
-        x = self.encoder[2](x)  # relu
-        x = self.encoder[3](x)  # maxpool
-        x = self.encoder[4](x)  # layer1 → save for skip
-        feats.append(x)
-        x = self.encoder[5](x)  # layer2
-        feats.append(x)
-        x = self.encoder[6](x)  # layer3
-        feats.append(x)
-        x = self.encoder[7](x)  # layer4 (bottleneck)
+        # Encoder: conv1 -> bn1 -> relu -> maxpool -> layer1..layer4, saving skips
+        x = self.encoder[0](x)
+        x = self.encoder[1](x)
+        x = self.encoder[2](x)
+        x = self.encoder[3](x)
+        s1 = self.encoder[4](x)   # layer1, 64 ch, /4
+        s2 = self.encoder[5](s1)  # layer2, 128 ch, /8
+        s3 = self.encoder[6](s2)  # layer3, 256 ch, /16
+        x  = self.encoder[7](s3)  # layer4, 512 ch, /32 (bottleneck)
 
-        # Decoder with skip connections (simplified — proper U-Net would concatenate)
-        # For the hackathon, a simpler decoder is acceptable
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        x = self.decoder(x)
-
-        return torch.sigmoid(x)
+        # Decoder: upsample + add the matching encoder skip (same resolution)
+        x = F.relu(self.bn4(self.up4(x)) + s3)          # 256ch @ /16 + s3 (256ch /16)
+        x = F.relu(self.bn3(self.up3(x)) + s2)          # 128ch @ /8 + s2
+        x = F.relu(self.bn2(self.up2(x)) + s1)          # 64ch @ /4 + s1
+        x = F.relu(self.bn1b(self.up1(x)))              # 32ch @ /2
+        x = F.relu(self.bn0(self.up0(x)))               # 32ch @ /1
+        return torch.sigmoid(self.final_conv(x))
 
 
 # ─── Loss Functions ──────────────────────────────────────────
@@ -779,9 +765,10 @@ def _synthetic_flood_river(h: int, w: int) -> np.ndarray:
     mask = np.zeros((h, w), dtype=np.float32)
     y, x = np.ogrid[:h, :w]
     # Sine-wave river path
-    river_y = h // 2 + (np.sin(x / w * 6 * np.pi) * h * 0.2).astype(int)
+    x1 = np.arange(w)  # column indices,
+    river_y = (h // 2 + (np.sin((x1 / w) * 6 * np.pi) * h * 0.2).astype(int)).astype(int)
     for i in range(w):
-        ry = min(max(river_y[i], 0), h - 1)
+        ry = int(min(max(int(river_y[i]), 0), h - 1))
         mask[max(0, ry - 3):ry + 4, i] = 1.0
     # Add noise to mask edges
     noise = np.random.rand(h, w) * 0.3

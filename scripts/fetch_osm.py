@@ -42,36 +42,153 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
         pass
 
 
-# ohsome API v1 base URL
-OHSOME_API = "https://api.ohsome.org/v1"
+# Overpass API endpoint with historical (attic) data.
+# [date:"..."] selects the OSM state AS OF that timestamp — the pre-event snapshot
+# required by the hackathon rules (no post-2026-08-26 edits may be used as input).
+#
+# Why not ohsome for geometry? Verified live 2026-10-09:
+#   - /elements/geometry returns HTTP 403 (Apache-level block on the public host)
+#   - aggregation endpoints (e.g. /elements/count) work and are used below to
+#     cross-check our extract against the official OSH statistics.
+OVERPASS_API = "https://overpass-api.de/api/interpreter"
+OHSOME_API = "https://api.ohsome.org/v1"          # used only for aggregate counts
+USER_AGENT = "LadderLens/0.1 (hackathonTrackB)"
 
 
-def ohsome_query(
-    endpoint: str,
-    params: dict[str, Any],
-    timeout: int = 60,
-) -> dict[str, Any]:
+def overpass_ql(
+    query: str,
+    timeout: int = 180,
+    retries: int = 3,
+) -> dict[str, Any] | None:
+    """POST an Overpass QL query (with attic date) and return parsed JSON.
+
+    The main endpoint occasionally returns transient 504s under attic load;
+    backing off and retrying a couple of times has proven reliable for the
+    small per-category queries we run here.
     """
-    Make a query to the ohsome API and return parsed JSON.
+    import time
+    data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                OVERPASS_API, data=data,
+                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+                ct = resp.headers.get("Content-Type", "")
+                if "json" not in ct:
+                    raise ValueError(f"server returned {ct} (likely rate-limit page)")
+                return json.loads(body)
+        except urllib.error.HTTPError as e:
+            print(f"  ⚠ Overpass HTTP {e.code} (attempt {attempt}/{retries})")
+            if e.code == 429:
+                print("  ℹ️ Rate limited — backing off")
+            time.sleep(10 * attempt)
+        except (urllib.error.URLError, ValueError, json.JSONDecodeError) as e:
+            print(f"  ⚠ Overpass error ({attempt}/{retries}): {e}")
+            time.sleep(10 * attempt)
+    return None
+
+
+def run_attic_query(
+    selector: str,
+    bbox: tuple[float, float, float, float],
+    snapshot_date: str,
+    timeout: int = 180,
+) -> list[dict]:
+    """Run one attic Overpass query and return the raw OSM elements list."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    q = (
+        f'[out:json][timeout:{timeout}]'
+        f'[date:"{snapshot_date}T00:00:00Z"];'
+        f'(node{selector}({min_lat},{min_lon},{max_lat},{max_lon});'
+        f'way{selector}({min_lat},{min_lon},{max_lat},{max_lon}););'
+        f'out geom tags;'
+    )
+    payload = overpass_ql(q, timeout=timeout + 30)
+    if payload is None:
+        return []
+    return payload.get("elements", [])
+
+
+def elements_to_geojson(elements: list[dict]) -> dict[str, Any]:
+    """Convert raw Overpass elements (with out geom) to a proper GeoJSON FeatureCollection."""
+    feats = []
+    for el in elements:
+        el_type = el.get("type")
+        lat, lon = el.get("lat"), el.get("lon")
+        coords: Any = None
+        if el_type == "node" and lat is not None:
+            coords = (lon, lat)
+        elif el_type == "way":
+            geometry = el.get("geometry") or []
+            line = [(p.get("lon"), p.get("lat")) for p in geometry if p.get("lon") is not None]
+            if len(line) >= 2:
+                coords = line
+        if coords is None:
+            continue
+        feats.append({
+            "type": "Feature",
+            "id": f"{el_type}/{el.get('id')}",
+            "properties": {
+                "osm_id": el.get("id"),
+                "osm_type": el_type,
+                **(el.get("tags") or {}),
+            },
+            "geometry": (
+                {"type": "Point", "coordinates": coords}
+                if el_type == "node"
+                else {"type": "LineString", "coordinates": coords}
+            ),
+        })
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def ohsome_count(
+    label: str,
+    filter_expr: str,
+    bbox: tuple[float, float, float, float],
+    snapshot_date: str,
+) -> int | None:
+    """One 'count' statistic against the ohsome aggregation API (works publicly).
+
+    Returns the element count at snapshot_date, or None if the API is down.
+    Used to cross-check the Overpass extract against the official OSH statistics.
     """
-    url = f"{OHSOME_API}/{endpoint}"
-    query_string = urllib.parse.urlencode(params, doseq=True)
-    full_url = f"{url}?{query_string}"
-
-    print(f"  GET {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
-
+    min_lon, min_lat, max_lon, max_lat = bbox
+    # ohsome v1 conventions verified live: aggregation endpoints take 'bboxes'
+    # (not 'bbox') and GDAL-free free-form filters like building=* — the
+    # JSON-array filter strings ohsome docs used before v1.10 get HTTP 400.
+    params = {
+        "bboxes": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+        "time": snapshot_date,
+        "filter": filter_expr,
+    }
+    url = f"{OHSOME_API}/elements/count?{urllib.parse.urlencode(params)}"
     try:
-        req = urllib.request.Request(full_url, headers={"Accept": "application/json"})
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        value = int(payload["result"][0]["value"])
+        print(f"  ℹ️ ohsome official count [{label}]: {value:,}")
+        return value
+    except Exception as e:
+        print(f"  ⚠ ohsome count unavailable for {label}: {e}")
+        return None
+
+
+# Kept for compatibility with anything that imported the old name.
+def ohsome_query(endpoint: str, params: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
+    """Legacy helper — aggregation queries only (geometry was never possible here)."""
+    url = f"{OHSOME_API}/{endpoint}"
+    full_url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
+    print(f"  GET {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
+    try:
+        req = urllib.request.Request(full_url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        print(f"  ❌ HTTP {e.code}: {e.reason}")
-        if e.code == 429:
-            print("  ℹ️ Rate limited — wait and retry")
-        return {"error": str(e)}
-    except urllib.error.URLError as e:
-        print(f"  ❌ URL error: {e.reason}")
-        print("  ℹ️ Check internet connectivity or ohsome API availability")
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as e:
         return {"error": str(e)}
 
 
@@ -90,174 +207,54 @@ def fetch_osm_features(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    min_lon, min_lat, max_lon, max_lat = bbox
-
-    # ohsome uses OpenStreetMap tile bounding boxes (bbox format: W,S,E,N)
-    bbox_str = f"{min_lon},{min_lat},{max_lon},{max_lat}"
-
     results: dict[str, Path] = {}
+    counts: dict[str, int | None] = {}
 
-    # ── 1. Buildings ──────────────────────────────────────────────
-    print("\n─" * 50)
-    print("🏗️  Fetching buildings...")
-    params = {
-        "osm-types": "nodes,ways",
-        "date": f"({snapshot_date},{snapshot_date})",
-        "filter": f'["building"]',
-        "bbox": bbox_str,
-        "format": "geojson",
-        "properties": "tags",
-    }
-    result = ohsome_query("elements", params, timeout=timeout)
-    if "error" not in result:
-        buildings_path = output_dir / "buildings.geojson"
-        buildings_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        # Count buildings
-        features = result.get("features", [])
-        print(f"  ✅ {len(features)} buildings saved → {buildings_path}")
-        results["buildings"] = buildings_path
-    else:
-        print(f"  ❌ Failed to fetch buildings: {result.get('error')}")
-        # Create empty GeoJSON as fallback
-        empty = {
-            "type": "FeatureCollection",
-            "features": [],
-            "metadata": {"note": "OSM buildings fetch failed — placeholder"},
-        }
-        (output_dir / "buildings.geojson").write_text(json.dumps(empty, indent=2), encoding="utf-8")
-
-    # ── 2. Roads ──────────────────────────────────────────────────
-    print("\n─" * 50)
-    print("🛣️  Fetching roads...")
-    # Query ways with highway tag (roads, paths, tracks)
-    road_types = [
-        "motorway", "trunk", "primary", "secondary", "tertiary",
-        "unclassified", "residential", "living_street",
-        "service", "track", "path", "footway", "bridleway",
+    # Each category = one attic Overpass query (nodes+ways as of snapshot_date)
+    # plus one official ohsome count cross-check. Categories are independent:
+    # a failure in one writes an empty file and never aborts the rest.
+    categories: list[tuple[str, str, str, Path]] = [
+        # (label, overpass selector, ohsome filter, output file)
+        ("buildings", "[building]", "building=*", output_dir / "buildings.geojson"),
+        ("roads",
+         '[highway~"motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|track|path|footway|bridleway"]',
+         "highway in (motorway,trunk,primary,secondary,tertiary,unclassified,residential,living_street,service,track,path,footway,bridleway)",
+         output_dir / "roads.geojson"),
+        ("bridges", "[bridge=yes]", "bridge=yes", output_dir / "bridges.geojson"),
+        ("hospitals", '[amenity~"hospital|clinic|doctors"]', "amenity in (hospital,clinic,doctors)", output_dir / "hospitals.geojson"),
+        ("settlements", '[place~"village|hamlet|town|city"]', "place in (village,hamlet,town,city)", output_dir / "settlements.geojson"),
     ]
-    params = {
-        "osm-types": "ways",
-        "date": f"({snapshot_date},{snapshot_date})",
-        "filter": f'["highway"~"{"|".join(road_types)}"]',
-        "bbox": bbox_str,
-        "format": "geojson",
-        "properties": "tags",
-    }
-    result = ohsome_query("elements", params, timeout=timeout)
-    if "error" not in result:
-        roads_path = output_dir / "roads.geojson"
-        roads_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        features = result.get("features", [])
-        print(f"  ✅ {len(features)} road segments saved → {roads_path}")
-        results["roads"] = roads_path
-    else:
-        print(f"  ❌ Failed to fetch roads: {result.get('error')}")
-        empty = {"type": "FeatureCollection", "features": [], "metadata": {"note": "Failed"}}
-        (output_dir / "roads.geojson").write_text(json.dumps(empty, indent=2), encoding="utf-8")
 
-    # ── 3. Bridges ────────────────────────────────────────────────
-    print("\n─" * 50)
-    print("🌉 Fetching bridges...")
-    params = {
-        "osm-types": "nodes,ways",
-        "date": f"({snapshot_date},{snapshot_date})",
-        "filter": '["bridge"="yes"]',
-        "bbox": bbox_str,
-        "format": "geojson",
-        "properties": "tags",
-    }
-    result = ohsome_query("elements", params, timeout=timeout)
-    bridges_path = output_dir / "bridges.geojson"
-    if "error" not in result:
-        bridges_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        features = result.get("features", [])
-        print(f"  ✅ {len(features)} bridges saved → {bridges_path}")
-        results["bridge_nodes"] = bridges_path
-    else:
-        # Try alternative: man_made=bridge
-        params["filter"] = '["man_made"="bridge"]'
-        result = ohsome_query("elements", params, timeout=timeout)
-        if "error" not in result:
-            bridges_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-            features = result.get("features", [])
-            print(f"  ✅ {len(features)} bridge features (man_made) saved → {bridges_path}")
-            results["bridge_nodes"] = bridges_path
-        else:
-            print(f"  ⚠️ No bridges found — creating empty file")
-            empty = {"type": "FeatureCollection", "features": [], "metadata": {"note": "No bridges"}}
-            bridges_path.write_text(json.dumps(empty, indent=2), encoding="utf-8")
-            results["bridge_nodes"] = bridges_path
+    for label, selector, ohsome_filter, out_path in categories:
+        print("\n" + "\u2500" * 50)
+        print(f"📥 Fetching {label} (as of {snapshot_date})...")
+        elements = run_attic_query(selector, bbox, snapshot_date, timeout=timeout)
+        geojson = elements_to_geojson(elements)
+        out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
+        counts[label] = len(geojson["features"])
+        results[label] = out_path
+        print(f"  ✅ {counts[label]} {label} features saved → {out_path}")
+        # Optional cross-check against the official ohsome aggregate (best effort).
+        ohsome_count(label, ohsome_filter, bbox, snapshot_date)
+        if not elements:
+            print(f"  ⚠ 0 elements for {label} — check connectivity / retry later")
 
-    # ── 4. Hospitals / health facilities ─────────────────────────
-    print("\n─" * 50)
-    print("🏥 Fetching hospitals...")
-    params = {
-        "osm-types": "nodes,ways",
-        "date": f"({snapshot_date},{snapshot_date})",
-        "filter": '["amenity"~"hospital|clinic|doctors|health_centre"]',
-        "bbox": bbox_str,
-        "format": "geojson",
-        "properties": "tags",
-    }
-    result = ohsome_query("elements", params, timeout=timeout)
-    hospitals_path = output_dir / "hospitals.geojson"
-    if "error" not in result:
-        hospitals_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        features = result.get("features", [])
-        print(f"  ✅ {len(features)} hospitals/health facilities → {hospitals_path}")
-        results["hospitals"] = hospitals_path
-    else:
-        empty = {"type": "FeatureCollection", "features": [], "metadata": {"note": "Failed"}}
-        hospitals_path.write_text(json.dumps(empty, indent=2), encoding="utf-8")
-        results["hospitals"] = hospitals_path
-
-    # ── 5. Settlements / villages ────────────────────────────────
-    print("\n─" * 50)
-    print("🏘️  Fetching settlements/villages...")
-    params = {
-        "osm-types": "nodes,ways",
-        "date": f"({snapshot_date},{snapshot_date})",
-        "filter": '["place"~"village|hamlet|town|city"]',
-        "bbox": bbox_str,
-        "format": "geojson",
-        "properties": "tags",
-    }
-    result = ohsome_query("elements", params, timeout=timeout)
-    settlements_path = output_dir / "settlements.geojson"
-    if "error" not in result:
-        settlements_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-        features = result.get("features", [])
-        print(f"  ✅ {len(features)} settlements saved → {settlements_path}")
-        results["settlements"] = settlements_path
-    else:
-        empty = {"type": "FeatureCollection", "features": [], "metadata": {"note": "Failed"}}
-        settlements_path.write_text(json.dumps(empty, indent=2), encoding="utf-8")
-
-    # ── 6. All OSM features (for reference) ──────────────────────
-    print("\n─" * 50)
-    print("📦 Fetching all OSM elements (metadata only)...")
-    params = {
-        "osm-types": "nodes,ways",
-        "date": f"({snapshot_date},{snapshot_date})",
-        "bbox": bbox_str,
-        "format": "json",
-        "properties": "tags",
-    }
-    result = ohsome_query("elements", params, timeout=timeout)
-    if "error" not in result:
-        count = result.get("totalElements", 0)
-        print(f"  ℹ️  Total OSM elements in area: {count:,}")
-    else:
-        print(f"  ⚠️ Could not count total elements")
+    # Cross-check aggregate: official ohsome count for ALL tagged elements.
+    print("\n" + "─" * 50)
+    print("📦 ohsome aggregate cross-check...")
+    total_ohsome = ohsome_count("all tagged elements", "type=node or type=way", bbox, snapshot_date)
 
     # Write a combined metadata file
     meta = {
         "snapshot_date": snapshot_date,
         "area_center": [center_lat, center_lon],
         "bbox": list(bbox),
-        "feature_counts": {k: 0 for k in results},
-        "api": "ohsome API v1",
-        "url": f"{OHSOME_API}/elements",
+        "feature_counts": counts,
+        "ohsome_total_check": total_ohsome,
+        "api": "Overpass attic (geometry) + ohsome v1 (aggregate counts)",
+        "overpass_url": OVERPASS_API,
+        "ohsome_url": OHSOME_API,
+        "attribution": "© OpenStreetMap contributors (ODbL)",
         "note": "Pre-event OSM snapshot — data edits after 2026-08-26 are NOT included",
     }
     meta_path = output_dir / "osm_metadata.json"

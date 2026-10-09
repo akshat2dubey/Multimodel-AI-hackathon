@@ -55,8 +55,15 @@ def load_model(model_path: Path, device: torch.device) -> torch.nn.Module:
 
     checkpoint = torch.load(model_path, map_location=device)
 
-    model_type = checkpoint.get("config", {}).get("model_type", "unet")
-    in_channels = checkpoint.get("config", {}).get("in_channels", 2)
+    config = checkpoint.get("config", {})
+    model_type = config.get("model_type", "unet")
+    in_channels = config.get("in_channels", 2)
+    if not isinstance(model_type, str):
+        model_type = model_type.__name__ if hasattr(model_type, "__name__") else "unet"
+    model_type = model_type.lower()  # "ResNetUNet" or "UNet" -> "resnetunet" / "unet"
+    print(f"  Checkpoint config: model_type={model_type} in_channels={in_channels}")
+    if model_type == "resnetunet":
+        model_type = "resnet_unet"
 
     if model_type in MODEL_CLASSES:
         model = MODEL_CLASSES[model_type](
@@ -130,10 +137,22 @@ def preprocess_sentinel1(image_path: Path | None) -> np.ndarray | None:
     if vv_path and vh_path:
         with rasterio.open(vv_path) as src_vv:
             vv = src_vv.read(1).astype(np.float32)
-            vv_db = 10 * np.log10(np.clip(vv, 1e-6, None))
+            nodata = src_vv.nodata
+            if nodata is not None:
+                vv[vv == nodata] = np.nan
         with rasterio.open(vh_path) as src_vh:
             vh = src_vh.read(1).astype(np.float32)
-            vh_db = 10 * np.log10(np.clip(vh, 1e-6, None))
+            nodata = src_vh.nodata
+            if nodata is not None:
+                vh[vh == nodata] = np.nan
+        # Synthetic fixture already stores dB; real GRD tifs also come as dB
+        # values here (the mask engine expects dB). Clip to a sane no-data range:
+        # anything < -50 dB (~1e-5 linear) is considered void, replaced by the
+        # image median instead of -9999 noise.
+        vv_db = vv.copy()
+        vh_db = vh.copy()
+        for arr, db in ((vv, vv_db), (vh, vh_db)):
+            db[db < -50] = np.median(db[db >= -50]) if (db >= -50).any() else -20.0
         ratio = vv_db - vh_db
         return np.stack([vv_db, vh_db, ratio], axis=0)
 
@@ -234,17 +253,22 @@ def tile_inference(
                 pred = model(tile_tensor)  # (1, 1, tile_size, tile_size)
                 pred_prob = F.sigmoid(pred).squeeze().cpu().numpy()
 
-            # Add to output with overlap averaging
-            output_mask[y : y + tile_size, x : x + tile_size] += pred_prob
-            output_count[y : y + tile_size, x : x + tile_size] += 1
+            # Add to output with overlap averaging. The slice may be smaller
+            # than tile_size when x+tile_size exceeds the padded width — crop
+            # the prediction to the same window.
+            region = output_mask[y : y + tile_size, x : x + tile_size]
+            output_mask[y : y + tile_size, x : x + tile_size] = region + pred_prob[: region.shape[0], : region.shape[1]]
+            count_region = output_count[y : y + tile_size, x : x + tile_size]
+            output_count[y : y + tile_size, x : x + tile_size] = count_region + 1.0
 
-    # Average overlaps
-    output_mask = np.divide(output_mask, output_count, out=np.zeros_like(output_mask), where=output_count > 0)
+    # Average overlaps — masks exist in padded space (H_pad, W_pad)
+    output_mask = np.divide(
+        output_mask, output_count,
+        out=np.zeros_like(output_mask), where=output_count > 0,
+    )
 
-    # Crop back to original size
+    # Crop back to original size FIRST, then threshold on the valid region.
     output_mask = output_mask[:H, :W]
-
-    # Apply threshold
     binary_mask = (output_mask > threshold).astype(np.float32)
 
     return binary_mask, output_mask
@@ -385,8 +409,17 @@ def main():
     print("Loading and preprocessing imagery")
     print(f"{'='*70}")
 
-    before_img = preprocess_sentinel1(args.before_dir / "before")
-    after_img = preprocess_sentinel1(args.after_dir / "after")
+    # The download layout IS before-dir/before (set by download_sentinel.py), but
+    # callers may also pass either a plain directory containing the VV/VH tifs
+    # directly, or the download root. Handle both without guessing.
+    before_dir = args.before_dir
+    if not (before_dir / "s1_before_VV.tif").exists() and (before_dir / "before").is_dir():
+        before_dir = before_dir / "before"
+    after_dir = args.after_dir
+    if not (after_dir / "s1_after_VV.tif").exists() and (after_dir / "after").is_dir():
+        after_dir = after_dir / "after"
+    before_img = preprocess_sentinel1(before_dir)
+    after_img = preprocess_sentinel1(after_dir)
 
     # Fallback to Sentinel-2 if Sentinel-1 not available
     if before_img is None:
@@ -407,16 +440,30 @@ def main():
         before_img = before_img[:n_bands]
         after_img = after_img[:n_bands]
 
+    # Match the model's expected channel count. preprocess_sentinel1 returns
+    # [VV, VH, ratio] (3 ch) but the checkpoint may be trained on fewer. Crop
+    # from the front: VV+VH kept, ratio dropped as it is derivable.
+    chk_in = getattr(model, "in_channels", None)
+    if chk_in is None:
+        for m_ in model.modules():
+            if isinstance(m_, torch.nn.Conv2d):
+                chk_in = m_.in_channels
+                break
+    if before_img is not None and chk_in and before_img.shape[0] != chk_in:
+        print(f"  Adjusting channels {before_img.shape[0]} → {chk_in} (model was trained with {chk_in})")
+        before_img = before_img[:chk_in]
+        after_img = after_img[:chk_in]
+
     # Load geospatial profile from after image (for georeferencing output)
     profile = None
-    if after_img is not None and (args.after_dir / "after").exists():
-        for tif in (args.after_dir / "after").glob("*.tif"):
-            try:
-                with rasterio.open(tif) as src:
-                    profile = src.profile
-                break
-            except Exception:
-                pass
+    after_tif_dir = after_dir if (after_dir / "s1_after_VV.tif").exists() else args.after_dir / "after"
+    for tif in after_tif_dir.glob("*.tif"):
+        try:
+            with rasterio.open(tif) as src:
+                profile = src.profile
+            break
+        except Exception:
+            pass
 
     # Run inference
     print(f"\n{'='*70}")
