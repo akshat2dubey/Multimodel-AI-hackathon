@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Situation Report — Bhote Koshi – Trishuli Corridor, Nepal</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+    background: #f5f5f5;
+    color: #222;
+    line-height: 1.5;
+  }
+  .page {
+    max-width: 800px;
+    margin: 0 auto;
+    background: white;
+    padding: 40px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  }
+  .header {
+    border-bottom: 3px solid #c62828;
+    padding-bottom: 20px;
+    margin-bottom: 24px;
+  }
+  .header .badge {
+    display: inline-block;
+    background: #c62828;
+    color: white;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .header h1 {
+    font-size: 24px;
+    margin: 8px 0 4px;
+    color: #1a1a1a;
+  }
+  .header .meta {
+    color: #666;
+    font-size: 14px;
+    margin-top: 4px;
+  }
+  .header .report-date {
+    color: #999;
+    font-size: 12px;
+    margin-top: 8px;
+  }
+  .alert-box {
+    background: #fff3f3;
+    border: 1px solid #ef9a9a;
+    border-left: 4px solid #c62828;
+    padding: 16px 20px;
+    margin: 20px 0;
+    border-radius: 4px;
+  }
+  .alert-box .alert-num {
+    font-size: 32px;
+    font-weight: 700;
+    color: #c62828;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 20px 0;
+  }
+  .card {
+    background: #fafafa;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h3 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #888;
+    margin-bottom: 8px;
+  }
+  .card .value {
+    font-size: 28px;
+    font-weight: 700;
+    color: #222;
+  }
+  .card .value.danger { color: #c62828; }
+  .card .value.warning { color: #e65100; }
+  .card .value.ok { color: #2e7d32; }
+  .card .sub {
+    font-size: 12px;
+    color: #999;
+    margin-top: 2px;
+  }
+  .full-width { grid-column: 1 / -1; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    margin: 12px 0;
+  }
+  th {
+    background: #f5f5f5;
+    text-align: left;
+    padding: 8px 12px;
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    color: #666;
+    border-bottom: 2px solid #e0e0e0;
+  }
+  td {
+    padding: 8px 12px;
+    border-bottom: 1px solid #eee;
+  }
+  tr:nth-child(even) td { background: #fafafa; }
+  .cutoff-list {
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .footer {
+    margin-top: 32px;
+    padding-top: 16px;
+    border-top: 1px solid #e0e0e0;
+    font-size: 11px;
+    color: #999;
+    line-height: 1.6;
+  }
+  .rating {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .rating.critical { background: #ffcdd2; color: #b71c1c; }
+  .rating.high { background: #ffe0b2; color: #e65100; }
+  .rating.moderate { background: #fff9c4; color: #f57f17; }
+  .rating.low { background: #c8e6c9; color: #2e7d32; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="header">
+    <span class="badge">Situation Report • Automated</span>
+    <h1>Bhote Koshi – Trishuli Corridor, Nepal</h1>
+    <div class="meta">
+      Flood Event Analysis • 2026-08-28 • Bhote Koshi–Trishuli River Corridor, Nepal
+    </div>
+    <div class="report-date">
+      Generated: 08 October 2026 • By FloodMapper System • Data: SYNTHETIC DEMO DATA — not real Earth observation data
+    </div>
+  </div>
+
+  <div style="background:#fff3e0; border:1px solid #ffb74d; border-left:4px solid #e65100;
+              padding:14px 18px; margin:0 0 20px; border-radius:4px;">
+    <strong style="color:#e65100;">DEMONSTRATION OUTPUT — SYNTHETIC DATA</strong>
+    <div style="font-size:12px; color:#6d4c41; margin-top:4px;">
+      Every figure in this report was computed from a fabricated test fixture
+      (scripts/make_demo_data.py), not from Copernicus Sentinel-1/-2 or a real DEM.
+      It validates the pipeline, and must not be quoted as a measurement of the
+      August 2026 Nepal event.
+    </div>
+  </div>
+
+  <div class="alert-box">
+    <span class="alert-num">68</span>
+    settlements cut off from hospitals and towns due to flood-damaged roads.
+    <span style="margin-left: 16px; color: #666; font-size: 13px;">
+      Rescue teams should prioritize road clearance on the segments listed below.
+    </span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Flood Extent</h3>
+      <div class="value danger">6,740.8 <span style="font-size:14px;color:#888;">hectares</span></div>
+      <div class="sub">10,122 pixels • 2.47% of area • 81.77m resolution</div>
+    </div>
+
+    <div class="card">
+      <h3>Buildings Affected</h3>
+      <div class="value warning">25 <span style="font-size:14px;color:#888;">of 96</span></div>
+      <div class="sub">26.0% affected • 20 destroyed</div>
+    </div>
+
+    <div class="card">
+      <h3>Road Segments Blocked</h3>
+      <div class="value danger">27</div>
+      <div class="sub">network edges cut by flooding &middot;
+        8 of 18
+        OSM ways touched, 0 fully cut</div>
+    </div>
+
+    <div class="card">
+      <h3>Bridges Damaged</h3>
+      <div class="value danger">3</div>
+      <div class="sub">of 3 total bridges</div>
+    </div>
+  </div>
+
+  <div class="full-width">
+    <h2 style="font-size:16px; margin-bottom:12px; color:#444;">Cut-Off Settlements — Priority Rescue Targets</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Settlement</th>
+          <th>Location (lat, lon)</th>
+          <th>Nearest Reachable Town</th>
+          <th>Distance (km)</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+
+        <tr>
+          <td>1</td>
+          <td><strong>Kodari</strong></td>
+          <td>28.5017, 78.9401</td>
+          <td>Barhabise</td>
+          <td>22.49</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><strong>Tatopani</strong></td>
+          <td>28.4372, 78.8972</td>
+          <td>Barhabise</td>
+          <td>15.3</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><strong>Tatopani</strong></td>
+          <td>28.4381, 78.9035</td>
+          <td>Barhabise</td>
+          <td>15.9</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><strong>Tatopani</strong></td>
+          <td>28.4727, 78.8858</td>
+          <td>Barhabise</td>
+          <td>16.3</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td><strong>Larcha</strong></td>
+          <td>28.4354, 78.8474</td>
+          <td>Barhabise</td>
+          <td>10.87</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td><strong>Larcha</strong></td>
+          <td>28.4397, 78.8471</td>
+          <td>Barhabise</td>
+          <td>11.09</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>7</td>
+          <td><strong>Larcha</strong></td>
+          <td>28.4243, 78.8445</td>
+          <td>Barhabise</td>
+          <td>10.03</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>8</td>
+          <td><strong>Larcha</strong></td>
+          <td>28.4212, 78.8492</td>
+          <td>Barhabise</td>
+          <td>10.29</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>9</td>
+          <td><strong>Larcha</strong></td>
+          <td>28.4608, 78.8448</td>
+          <td>Barhabise</td>
+          <td>12.37</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>10</td>
+          <td><strong>Larcha</strong></td>
+          <td>28.4319, 78.8422</td>
+          <td>Barhabise</td>
+          <td>10.23</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>11</td>
+          <td><strong>Jhirpu</strong></td>
+          <td>28.4306, 78.7890</td>
+          <td>Barhabise</td>
+          <td>6.2</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>12</td>
+          <td><strong>Kodari</strong></td>
+          <td>28.5049, 78.9341</td>
+          <td>Barhabise</td>
+          <td>22.22</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>13</td>
+          <td><strong>Jhirpu</strong></td>
+          <td>28.4340, 78.7883</td>
+          <td>Barhabise</td>
+          <td>6.48</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>14</td>
+          <td><strong>Jhirpu</strong></td>
+          <td>28.4208, 78.7940</td>
+          <td>Barhabise</td>
+          <td>5.7</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>15</td>
+          <td><strong>Jhirpu</strong></td>
+          <td>28.4203, 78.7896</td>
+          <td>Barhabise</td>
+          <td>5.36</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>16</td>
+          <td><strong>Jhirpu</strong></td>
+          <td>28.4411, 78.7859</td>
+          <td>Barhabise</td>
+          <td>7.04</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>17</td>
+          <td><strong>Jhirpu</strong></td>
+          <td>28.4162, 78.7986</td>
+          <td>Barhabise</td>
+          <td>5.71</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>18</td>
+          <td><strong>Barhabise</strong></td>
+          <td>28.3889, 78.7354</td>
+          <td>Barhabise</td>
+          <td>0.16</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>19</td>
+          <td><strong>Kodari</strong></td>
+          <td>28.4971, 78.9480</td>
+          <td>Barhabise</td>
+          <td>22.85</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+        <tr>
+          <td>20</td>
+          <td><strong>Barhabise</strong></td>
+          <td>28.3948, 78.7262</td>
+          <td>Barhabise</td>
+          <td>1.27</td>
+          <td><span class="rating critical">CUT OFF</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="full-width" style="margin-top:20px;">
+    <h2 style="font-size:16px; margin-bottom:12px; color:#444;">Damage Breakdown</h2>
+    <div class="grid" style="grid-template-columns: 1fr 1fr 1fr;">
+      <div class="card">
+        <h3>Buildings by Damage Level</h3>
+        <table style="font-size:13px;">
+          <tbody>
+            <tr><td>Destroyed</td><td><span class="rating critical">20</span></td></tr>
+            <tr><td>Severely damaged</td><td><span class="rating high">4</span></td></tr>
+            <tr><td>Partially flooded</td><td><span class="rating moderate">1</span></td></tr>
+            <tr><td>Unaffected</td><td><span class="rating low">71</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>Road Network Status</h3>
+        <table style="font-size:13px;">
+          <tbody>
+            <tr><td>Total segments</td><td>18</td></tr>
+            <tr><td>OSM ways fully cut (feature-level)</td><td><span class="rating critical">0</span></td></tr>
+            <tr><td>Road-network edges cut (graph-level)</td><td><span class="rating critical">27</span></td></tr>
+            <tr><td>Segments affected</td><td><span class="rating high">8</span></td></tr>
+            <tr><td>Bridges damaged</td><td><span class="rating critical">3</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>Connectivity</h3>
+        <table style="font-size:13px;">
+          <tbody>
+            <tr><td>Total settlements</td><td>96</td></tr>
+            <tr><td>Reachable</td><td><span class="rating low">28</span></td></tr>
+            <tr><td>Cut off</td><td><span class="rating critical">68</span></td></tr>
+            <tr><td>Cut-off rate</td><td><strong>70.8%</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <strong>Data sources:</strong> Contains modified Copernicus Sentinel data 2026 •
+    Produced using Copernicus WorldDEM-30 — DLR e.V. 2010–2014 and © Airbus Defence and Space GmbH
+    2014–2018 provided under COPERNICUS by the European Union and ESA; all rights reserved •
+    © OpenStreetMap contributors (pre-event snapshot: 27 July 2026) •
+    Training data: Bountos et al., 2024 (Kuro Siwo, NeurIPS 2024) •
+    <br>
+    <strong>Disclaimer:</strong> This is an educational prototype, not an operational disaster response tool.
+    Sentinel satellite revisit times (several days) mean this system cannot provide real-time warnings.
+    Results should be verified by ground teams before rescue operations.
+    Generated by FloodMapper — Multimodal AI Hackathon 2026, Track B.
+  </div>
+</div>
+</body>
+</html>

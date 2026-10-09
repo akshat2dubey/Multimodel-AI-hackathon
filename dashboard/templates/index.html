@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FloodMapper — Track B Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; }
+  .app { display: flex; height: 100vh; }
+  
+  /* Sidebar */
+  .sidebar {
+    width: 340px;
+    background: #16213e;
+    padding: 20px;
+    overflow-y: auto;
+    border-right: 1px solid #0f3460;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .sidebar h1 {
+    font-size: 20px;
+    color: #e94560;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .sidebar .subtitle { font-size: 12px; color: #888; margin-top: -8px; }
+  
+  .stat-card {
+    background: #1a1a2e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 14px;
+  }
+  .stat-card .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #888;
+    margin-bottom: 4px;
+  }
+  .stat-card .value {
+    font-size: 24px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .stat-card .value.danger { color: #e94560; }
+  .stat-card .value.warning { color: #ffa726; }
+  .stat-card .value.ok { color: #66bb6a; }
+  
+  .section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #e94560;
+    margin: 8px 0 4px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #0f3460;
+  }
+  
+  .menu-btn {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    background: #0f3460;
+    color: #e0e0e0;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    text-align: left;
+    margin: 2px 0;
+    transition: background 0.2s;
+  }
+  .menu-btn:hover { background: #1a4a8a; }
+  .menu-btn.active { background: #e94560; color: white; }
+  
+  .cutoff-item {
+    background: #1a1a2e;
+    border-left: 3px solid #e94560;
+    padding: 10px 12px;
+    margin: 4px 0;
+    border-radius: 4px;
+    font-size: 13px;
+  }
+  .cutoff-item .name { font-weight: 600; color: #fff; }
+  .cutoff-item .meta { font-size: 11px; color: #888; margin-top: 2px; }
+  
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .badge.critical { background: #ffcdd2; color: #b71c1c; }
+  .badge.high { background: #ffe0b2; color: #e65100; }
+  .badge.moderate { background: #fff9c4; color: #f57f17; }
+  .badge.low { background: #c8e6c9; color: #2e7d32; }
+  
+  /* Map */
+  .map-container { flex: 1; position: relative; }
+  #map { width: 100%; height: 100%; }
+  
+  .legend {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    background: rgba(22, 33, 62, 0.9);
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 12px 16px;
+    z-index: 1000;
+    font-size: 12px;
+  }
+  .legend h4 { color: #e94560; margin-bottom: 6px; font-size: 11px; text-transform: uppercase; }
+  .legend-item { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  .legend-color { width: 16px; height: 16px; border-radius: 3px; }
+  
+  .loading-overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2000;
+    font-size: 16px;
+    color: white;
+  }
+  
+  .footer-note {
+    position: absolute;
+    bottom: 20px;
+    left: 20px;
+    font-size: 10px;
+    color: rgba(255,255,255,0.5);
+    z-index: 1000;
+    background: rgba(0,0,0,0.5);
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div>
+      <h1>🌊 FloodMapper</h1>
+      <div class="subtitle">Multimodal AI Hackathon 2026 — Track B</div>
+    </div>
+
+    <div id="stats-panel">
+      <div class="section-title">Event Overview</div>
+      <div class="stat-card">
+        <div class="label">Flood Extent</div>
+        <div class="value danger" id="flood-area">— ha</div>
+        <div class="label" style="margin-top:4px;">Area inundated by flood water</div>
+      </div>
+      <div class="stat-card" style="margin-top:8px;">
+        <div class="label">Buildings Affected</div>
+        <div class="value warning" id="buildings-affected">—</div>
+        <div class="label" style="margin-top:4px;">
+          <span id="buildings-destroyed">0</span> destroyed
+          &middot; <span id="buildings-severe">0</span> severe
+        </div>
+      </div>
+      <div class="stat-card" style="margin-top:8px;">
+        <div class="label">Road Segments Cut</div>
+        <div class="value danger" id="roads-cut">—</div>
+        <div class="label" style="margin-top:4px;">
+          network edges severed &middot;
+          <span id="roads-affected">0</span> OSM ways touched
+        </div>
+      </div>
+      <div class="stat-card" style="margin-top:8px;">
+        <div class="label">Cut-off Settlements</div>
+        <div class="value danger" id="cutoff-count">—</div>
+        <div class="label" style="margin-top:4px;">
+          structures with no road access &middot;
+          <span id="cutoff-villages">0</span> villages
+        </div>
+      </div>
+    </div>
+
+    <div id="layers-panel" style="display:none;">
+      <div class="section-title">Map Layers</div>
+      <button class="menu-btn active" data-layer="flood">🗺️ Flood Extent</button>
+      <button class="menu-btn" data-layer="buildings">🏗️ Buildings (damaged)</button>
+      <button class="menu-btn" data-layer="roads">🛣️ Roads (cut)</button>
+      <button class="menu-btn" data-layer="bridges">🌉 Bridges (damaged)</button>
+      <button class="menu-btn" data-layer="cutoffs">🚫 Cut-off Settlements</button>
+      <button class="menu-btn" data-layer="floodpath">🔄 Flood Path (bonus)</button>
+    </div>
+
+    <div id="cutoffs-panel" style="display:none;">
+      <div class="section-title">🚫 Cut-Off Settlements</div>
+      <div id="cutoffs-list">
+        <div style="color:#888; font-size:13px; text-align:center; padding:20px;">
+          Loading cut-off data...
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:auto; border-top:1px solid #0f3460; padding-top:12px;">
+      <button class="menu-btn" id="btn-run-pipeline" style="background:#e94560; color:white;">
+        ▶ Run Full Pipeline
+      </button>
+      <button class="menu-btn" id="btn-view-report">
+        📄 View Situation Report
+      </button>
+      <button class="menu-btn" id="btn-demo-mode">
+        🎮 Demo Mode (sample data)
+      </button>
+    </div>
+
+    <div id="synthetic-warning" style="display:none; font-size:11px; line-height:1.45;
+         background:#3a2a00; border:1px solid #b8860b; color:#ffd479;
+         padding:8px 10px; border-radius:4px; margin-bottom:8px;">
+      <strong>SYNTHETIC DEMO DATA</strong><br>
+      These figures come from a fabricated test fixture, not from Copernicus
+      Sentinel imagery. For pipeline validation only.
+    </div>
+
+    <div style="font-size:10px; color:#555; line-height:1.5; padding-top:8px;">
+      <strong>Data:</strong> <span id="data-attrib">Contains modified Copernicus Sentinel data 2026</span> &bull;
+      © OpenStreetMap contributors &bull;
+      Copernicus WorldDEM-30 &bull;
+      Kuro Siwo (Bountos et al., 2024)
+    </div>
+  </div>
+
+  <div class="map-container">
+    <div id="map"></div>
+    <div id="loading" class="loading-overlay" style="display:none;">
+      Loading map data...
+    </div>
+    <div class="legend" id="legend" style="display:none;">
+      <h4>Legend</h4>
+      <div id="legend-items"></div>
+    </div>
+    <div class="footer-note">
+      FloodMapper Dashboard &bull; Track B &bull; Hackathon 2026
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── Map Initialization ────────────────────────────────
+const map = L.map('map', {
+  center: [28.3, 85.7],
+  zoom: 11,
+  maxBounds: [
+    [27.5, 84.5],
+    [29.1, 86.9]
+  ]
+});
+
+// Dark basemap (CartoDB Dark Matter)
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+  subdomains: 'abcd',
+  maxZoom: 19
+}).addTo(map);
+
+// Feature layers
+const layers = {
+  flood: null,
+  buildings: null,
+  roads: null,
+  bridges: null,
+  cutoffs: null,
+  floodpath: null,
+};
+
+// Status
+let mapDataLoaded = false;
+
+// ─── API Calls ──────────────────────────────────────────
+async function loadAllData() {
+  document.getElementById('loading').style.display = 'flex';
+  
+  // Each layer loads independently. One failing endpoint used to abort the whole
+  // sequence and show "No satellite data available" even when the data was there.
+  const failed = [];
+  const step = async (label, fn) => {
+    try { await fn(); } catch (e) { failed.push(label); console.error(label + ' failed:', e); }
+  };
+
+  await step('status', async () => updateStats(await fetch('/api/status').then(r => r.json())));
+  await step('flood extent', async () => addFloodLayer(await fetch('/api/flood-mask').then(r => r.json())));
+  await step('damage', async () => addDamageLayers(await fetch('/api/damage').then(r => r.json())));
+  await step('cut-offs', async () => addCutoffLayer(await fetch('/api/cutoffs').then(r => r.json())));
+  await step('flood path', async () => addFloodPathLayer(await fetch('/api/flood-path').then(r => r.json())));
+
+  mapDataLoaded = true;
+  document.getElementById('layers-panel').style.display = 'block';
+  document.getElementById('cutoffs-panel').style.display = 'block';
+
+  const loading = document.getElementById('loading');
+  if (failed.length === 0) {
+    loading.style.display = 'none';
+  } else {
+    const allDown = failed.length === 5;
+    loading.innerHTML =
+      '<div style="text-align:center;"><div style="font-size:40px;margin-bottom:8px;">⚠️</div>' +
+      (allDown ? '<div>No results available yet.<br>' +
+                 '<span style="font-size:12px;color:#888;">Run the pipeline first or use Demo Mode.</span></div>'
+               : '<div>Some layers could not be loaded:<br>' +
+                 '<span style="font-size:12px;color:#888;">' + failed.join(', ') +
+                 ' — showing the rest.</span></div>') +
+      '</div>';
+  }
+}
+
+function updateStats(status) {
+  const fs = status.flood_stats || {};
+  const ds = status.damage_summary || {};
+  const cs = status.cutoff_summary || {};
+  
+  document.getElementById('flood-area').textContent = 
+    (fs.flood_area_ha || fs.flood_pixels ? 
+     (fs.flood_area_ha ? fs.flood_area_ha.toLocaleString() + ' ha' : (fs.flood_pixels || 0).toLocaleString() + ' px') :
+     '—');
+  
+  document.getElementById('buildings-affected').textContent = 
+    (ds.affected_buildings || 0) + ' / ' + (ds.total_buildings || 0);
+  document.getElementById('buildings-destroyed').textContent = ds.destroyed_buildings || 0;
+  document.getElementById('buildings-severe').textContent = 
+    (ds.affected_buildings || 0) - (ds.destroyed_buildings || 0);
+  // Prefer the network-graph figure: it is the count that actually explains the
+  // cut-off settlements. Fall back to the feature-level count if absent.
+  document.getElementById('roads-cut').textContent =
+    ds.flooded_road_segments != null ? ds.flooded_road_segments : (ds.cut_roads || 0);
+  document.getElementById('roads-affected').textContent = ds.affected_roads || 0;
+  document.getElementById('cutoff-villages').textContent = cs.village_count || 0;
+
+  const warn = document.getElementById('synthetic-warning');
+  if (warn) warn.style.display = status.synthetic ? 'block' : 'none';
+  const attrib = document.getElementById('data-attrib');
+  if (attrib && status.synthetic) {
+    attrib.textContent = 'SYNTHETIC DEMO FIXTURE — not Copernicus Sentinel data';
+  }
+  document.getElementById('cutoff-count').textContent = cs.cutoff_count || 0;
+}
+
+// ─── Layer Functions ────────────────────────────────────
+function addFloodLayer(data) {
+  if (layers.flood) map.removeLayer(layers.flood);
+  
+  const features = data.features || [];
+  if (features.length === 0) {
+    // Show placeholder area
+    const geojson = {
+      type: 'FeatureCollection',
+      features: [{
+        type: 'Feature',
+        properties: { note: 'Flood mask GeoTIFF — run pipeline to generate' },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[[78.55, 28.15], [78.85, 28.15], [78.85, 28.45], [78.55, 28.45], [78.55, 28.15]]]
+        }
+      }]
+    };
+    layers.flood = L.geoJSON(geojson, {
+      style: { color: '#e94560', weight: 2, fillColor: '#e94560', fillOpacity: 0.2 }
+    }).addTo(map);
+    return;
+  }
+  
+  layers.flood = L.geoJSON({
+    type: 'FeatureCollection',
+    features: features.map(f => ({
+      type: 'Feature',
+      properties: { flood: true, probability: f.properties.probability || 0.5 },
+      geometry: f.geometry
+    }))
+  }, {
+    style: function(feature) {
+      const p = feature.properties.probability || 0.5;
+      return {
+        color: '#e94560',
+        weight: 1,
+        fillColor: '#e94560',
+        fillOpacity: 0.3 + p * 0.4,
+      };
+    }
+  }).addTo(map);
+}
+
+function addDamageLayers(data) {
+  const features = data.features || [];
+  
+  // Buildings
+  if (layers.buildings) map.removeLayer(layers.buildings);
+  const buildingFeatures = features.filter(f => f.properties.feature_type === 'building');
+  if (buildingFeatures.length > 0) {
+    layers.buildings = L.geoJSON({
+      type: 'FeatureCollection',
+      features: buildingFeatures.map(f => ({
+        type: 'Feature',
+        properties: {
+          damage: f.properties.damage_level,
+          ratio: f.properties.damage_overlap_ratio || 0,
+          osm_tags: f.properties.osm_tags || {},
+        },
+        geometry: f.geometry
+      }))
+    }, {
+      style: function(feature) {
+        const d = feature.properties.damage;
+        const colors = {
+          'DESTROYED': '#b71c1c',
+          'SEVERELY_DAMAGED': '#e65100', 
+          'PARTIAL': '#ffa726',
+          'UNAFFECTED': '#4caf50',
+          'UNKNOWN': '#999',
+        };
+        return {
+          color: colors[d] || '#999',
+          weight: d === 'DESTROYED' ? 2 : 1,
+          fillColor: colors[d] || '#999',
+          fillOpacity: d === 'UNAFFECTED' ? 0.1 : 0.5,
+        };
+      },
+      pointToLayer: function(feature, latlng) {
+        return L.circleMarker(latlng, {
+          radius: feature.properties.ratio > 0.5 ? 8 : 5,
+          fillColor: '#e94560',
+          fillOpacity: 0.7,
+          color: '#fff',
+          weight: 1,
+        });
+      }
+    }).addTo(map);
+    
+    layers.buildings.bindPopup(function(feature) {
+      const d = feature.properties.damage;
+      const r = feature.properties.ratio;
+      return `<b>Building</b><br>` +
+        `Damage: <span class="badge ${d === 'DESTROYED' ? 'critical' : d === 'SEVERELY_DAMAGED' ? 'high' : d === 'PARTIAL' ? 'moderate' : 'low'}">${d}</span><br>` +
+        `Flood overlap: ${(r * 100).toFixed(1)}%`;
+    });
+  }
+  
+  // Roads
+  if (layers.roads) map.removeLayer(layers.roads);
+  const roadFeatures = features.filter(f => f.properties.feature_type === 'road');
+  if (roadFeatures.length > 0) {
+    layers.roads = L.geoJSON({
+      type: 'FeatureCollection',
+      features: roadFeatures.map(f => ({
+        type: 'Feature',
+        properties: {
+          damage: f.properties.damage_level,
+          cut: f.properties.road_cut || false,
+        },
+        geometry: f.geometry
+      }))
+    }, {
+      style: function(feature) {
+        if (feature.properties.cut) {
+          return { color: '#b71c1c', weight: 4, dashArray: '5,5' };
+        }
+        if (feature.properties.damage === 'SEGMENT_AFFECTED') {
+          return { color: '#ffa726', weight: 2 };
+        }
+        return { color: '#666', weight: 1, opacity: 0.5 };
+      }
+    }).addTo(map);
+  }
+  
+  // Bridges
+  if (layers.bridges) map.removeLayer(layers.bridges);
+  const bridgeFeatures = features.filter(f => f.properties.feature_type === 'bridge');
+  if (bridgeFeatures.length > 0) {
+    layers.bridges = L.geoJSON({
+      type: 'FeatureCollection',
+      features: bridgeFeatures.map(f => ({
+        type: 'Feature',
+        properties: {
+          damaged: f.properties.bridge_damaged || false,
+          damage: f.properties.damage_level,
+        },
+        geometry: f.geometry
+      }))
+    }, {
+      pointToLayer: function(feature, latlng) {
+        return L.circleMarker(latlng, {
+          radius: feature.properties.damaged ? 10 : 6,
+          fillColor: feature.properties.damaged ? '#b71c1c' : '#4caf50',
+          fillOpacity: 0.8,
+          color: '#fff',
+          weight: 2,
+        });
+      }
+    }).addTo(map);
+  }
+}
+
+function addCutoffLayer(data) {
+  if (layers.cutoffs) map.removeLayer(layers.cutoffs);
+  
+  // The analysis produces one record per building footprint. Plotting and listing
+  // villages answers "who is cut off?" far better than 68 stacked markers on the
+  // same street, so use the server-side village grouping when it is available.
+  const villages = (data.cutoff_villages && data.cutoff_villages.length)
+    ? data.cutoff_villages
+    : (data.cutoff_settlements || []).map(c => ({
+        name: c.settlement_name || c.settlement_id || 'Unnamed',
+        structures_cut_off: 1,
+        nearest_reachable_town_name: c.nearest_reachable_town_name || c.nearest_reachable_town,
+        min_distance_km: c.nearest_reachable_distance_km,
+        coordinates: c.coordinates,
+      }));
+
+  if (villages.length === 0) {
+    document.getElementById('cutoffs-list').innerHTML =
+      '<div style="color:#888; font-size:13px; text-align:center; padding:12px;">No cut-off settlements identified.</div>';
+    return;
+  }
+
+  const markers = [];
+  villages.forEach((v, i) => {
+    if (!v.coordinates) return;
+    const lat = v.coordinates.latitude;
+    const lon = v.coordinates.longitude;
+    const nearest = v.nearest_reachable_town_name || 'Unknown';
+    const dist = (v.min_distance_km === null || v.min_distance_km === undefined) ? '—' : v.min_distance_km;
+    const n = v.structures_cut_off || 1;
+
+    const marker = L.circleMarker([lat, lon], {
+      radius: Math.min(18, 7 + Math.sqrt(n) * 2),
+      fillColor: '#e94560',
+      fillOpacity: 0.85,
+      color: '#fff',
+      weight: 2,
+    }).addTo(map);
+
+    marker.bindPopup(`
+      <b>🚫 Cut off: ${v.name}</b><br>
+      <span class="meta">${lat.toFixed(4)}, ${lon.toFixed(4)}</span><br>
+      Structures cut off: <b>${n}</b><br>
+      Nearest reachable town: ${nearest}<br>
+      Distance: ${dist} km<br>
+      <span class="badge critical">NO ROAD ACCESS</span>
+    `);
+
+    markers.push(marker);
+  });
+
+  layers.cutoffs = L.layerGroup(markers).addTo(map);
+
+  // Update cutoff list in sidebar
+  const listEl = document.getElementById('cutoffs-list');
+  const shown = villages.slice(0, 10);
+  listEl.innerHTML = shown.map((v, i) => `
+    <div class="cutoff-item">
+      <div class="name">#${i+1} ${v.name || 'Unnamed'}
+        <span style="color:#888; font-weight:400;">(${v.structures_cut_off || 1})</span></div>
+      <div class="meta">
+        ${v.coordinates ? v.coordinates.latitude.toFixed(4) + ', ' + v.coordinates.longitude.toFixed(4) : '—'}
+        &middot; Nearest: ${v.nearest_reachable_town_name || '—'}
+        &middot; ${(v.min_distance_km === null || v.min_distance_km === undefined) ? '—' : v.min_distance_km} km
+      </div>
+    </div>
+  `).join('');
+
+  if (villages.length > shown.length) {
+    listEl.innerHTML += `<div style="text-align:center; color:#888; font-size:12px; margin-top:8px;">
+      + ${villages.length - shown.length} more cut-off villages (${(data.cutoff_settlements || []).length} structures total)
+    </div>`;
+  }
+}
+
+function addFloodPathLayer(data) {
+  if (layers.floodpath) map.removeLayer(layers.floodpath);
+  
+  const features = data.features || [];
+  const pathFeatures = features.filter(f => f.properties.type === 'flood_path');
+  const settlementFeatures = features.filter(f => f.properties.type === 'settlement');
+  
+  if (pathFeatures.length > 0) {
+    layers.floodpath = L.geoJSON(pathFeatures[0], {
+      style: { color: '#29b6f6', weight: 3, dashArray: '10,5' }
+    }).addTo(map);
+  }
+  
+  // Settlement markers along path
+  if (settlementFeatures.length > 0) {
+    const markers = settlementFeatures.map(f => {
+      const coords = f.geometry.coordinates;
+      return L.marker([coords[1], coords[0]])
+        .bindPopup(`<b>${f.properties.name}</b><br>Along flood path<br>${f.properties.distance_along_path_km} km from start`)
+        .addTo(map);
+    });
+    if (markers.length > 0) {
+      layers.floodpath = L.layerGroup(markers).addTo(map);
+    }
+  }
+}
+
+// ─── Layer Toggle ───────────────────────────────────────
+document.querySelectorAll('[data-layer]').forEach(btn => {
+  btn.addEventListener('click', function() {
+    const layerName = this.dataset.layer;
+    document.querySelectorAll('[data-layer]').forEach(b => b.classList.remove('active'));
+    this.classList.add('active');
+    
+    // Show/hide layers
+    map.eachLayer(l => {
+      if (l instanceof L.GeoJSON || l instanceof L.layerGroup || l instanceof L.CircleMarker) {
+        // Only toggle feature layers (not basemap)
+      }
+    });
+    
+    if (layers[layerName]) {
+      if (map.hasLayer(layers[layerName])) {
+        map.removeLayer(layers[layerName]);
+      } else {
+        map.addLayer(layers[layerName]);
+      }
+    }
+  });
+});
+
+// ─── Buttons ────────────────────────────────────────────
+document.getElementById('btn-run-pipeline').addEventListener('click', async function() {
+  this.textContent = '⏳ Running...';
+  this.disabled = true;
+  try {
+    const resp = await fetch('/api/run-pipeline', { method: 'POST' });
+    const data = await resp.json();
+    if (data.success) {
+      this.textContent = '✅ Pipeline Complete';
+      setTimeout(() => { location.reload(); }, 2000);
+    } else {
+      this.textContent = '❌ Failed — see console';
+      console.error(data);
+    }
+  } catch(e) {
+    this.textContent = '❌ Error';
+  }
+  setTimeout(() => {
+    this.textContent = '▶ Run Full Pipeline';
+    this.disabled = false;
+  }, 5000);
+});
+
+document.getElementById('btn-view-report').addEventListener('click', function() {
+  window.open('/report', '_blank');
+});
+
+document.getElementById('btn-demo-mode').addEventListener('click', function() {
+  window.open('/demo', '_self');
+});
+
+document.getElementById('btn-view-report').addEventListener('dblclick', function() {
+  window.open('/report', '_blank');
+});
+
+// ─── Init ───────────────────────────────────────────────
+loadAllData();
+
+// Auto-refresh data every 30 seconds
+setInterval(loadAllData, 30000);
+</script>
+</body>
+</html>

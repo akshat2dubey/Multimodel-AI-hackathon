@@ -1,0 +1,55 @@
+# FloodMapper — runtime dependencies
+# Verified working on Python 3.14 (Windows), cp314 wheels available for all of these.
+#
+#   python -m pip install -r requirements.txt
+#
+# Heavy but optional ML/GIS extras are grouped at the bottom.
+
+# --- Core geospatial -------------------------------------------------------
+rasterio>=1.3          # GeoTIFF I/O, rasterization, mask vectorisation
+geopandas>=0.14        # OSM GeoJSON handling (pulls in pandas + pyproj + pyogrio)
+shapely>=2.0           # Geometry operations
+scipy>=1.10            # distance transforms, Gaussian smoothing (DEM, demo data)
+
+# --- Core numerics ---------------------------------------------------------
+numpy>=1.24
+
+# --- Road-network analysis -------------------------------------------------
+networkx>=3.0          # cut-off settlement reachability (BFS over road graph)
+
+# --- Deep learning (flood segmentation) ------------------------------------
+torch>=2.0             # CPU wheels are the default on Windows
+torchvision>=0.15      # ResNet-34 encoder for ResNetUNet
+
+# --- Dashboard -------------------------------------------------------------
+flask>=3.0
+flask-cors>=6.0
+
+# --- Progress + CLI --------------------------------------------------------
+tqdm>=4.65
+
+# --- Copernicus Data Space client (needed only for real downloads) ---------
+# NOTE: this is 'cdse-client' (import name: cdse). The package literally named
+# 'cdse' does NOT exist on PyPI, so `pip install cdse` / a `cdse>=2.0` pin will
+# fail with "No matching distribution found".
+#
+# Authenticate with OAuth2 client credentials (no interactive login):
+#   1. Register free at https://dataspace.copernicus.eu/
+#   2. Create an OAuth client under Identity & Access Management
+#   3. set CDSE_CLIENT_ID=... and set CDSE_CLIENT_SECRET=...
+# Required by download_sentinel.py and download_sentinel2.py. Without valid
+# credentials those scripts exit non-zero — they no longer write placeholders.
+# download_dem.py needs no account (AWS Open Data bucket) and no credentials.
+cdse-client>=1.2
+
+# --- Development (not required to run anything) ----------------------------
+# black>=23.0
+# flake8>=6.0
+
+# Deliberately NOT required:
+#   gdown / requests  — only needed if you script bulk Kuro Siwo downloads;
+#                       fetch them from https://github.com/Orion-AI-Lab/KuroSiwo
+#   matplotlib / contextily / folium — the dashboard renders with Leaflet, no
+#                       server-side plotting is done
+#   scikit-learn / scikit-image — no classical-ML or image-processing step remains
+#   flatpak — NOT a Python package and NOT the CDSE client; do not add it
