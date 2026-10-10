@@ -354,7 +354,7 @@ def save_damage_assessment(
             "flood_mask_source": str(output_path.parent / "flood_mask.tif"),
             "osm_snapshot_date": "2026-07-27 (pre-event)",
             "event_date": "2026-08-26",
-            "generated_by": "FloodMapper damage_assessment.py",
+            "generated_by": "Jalnetra damage_assessment.py",
         },
     }
 

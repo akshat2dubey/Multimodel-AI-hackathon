@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FloodMapper — Pipeline Orchestrator
+Jalnetra — Pipeline Orchestrator
 Run the complete flood damage mapping pipeline end-to-end.
 
 Usage:
@@ -82,7 +82,7 @@ def run(cmd: list[str], cwd: Path | None = None) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FloodMapper — Full Pipeline")
+    parser = argparse.ArgumentParser(description="Jalnetra — Full Pipeline")
     parser.add_argument("--area", required=True, help="Area description")
     parser.add_argument("--center-lat", type=float, required=True, help="Center latitude")
     parser.add_argument("--center-lon", type=float, required=True, help="Center longitude")
@@ -106,7 +106,7 @@ def main():
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║                                                              ║
-║     🌊  FloodMapper — Mapping Flood Damage from Space       ║
+║     🌊  Jalnetra — Mapping Flood Damage from Space       ║
 ║                                                              ║
 ║     Area:  {args.area:<47}║
 ║     Center: {args.center_lat}, {args.center_lon}               ║

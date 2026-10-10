@@ -1,4 +1,4 @@
-# FloodMapper: Mapping Flood Damage from Space
+# Jalnetra: Mapping Flood Damage from Space
 ## Multimodal AI Hackathon 2026 — Track B
 
 **Case study:** August 2026 Trishuli GLOF, Nepal (Copernicus EMS activation EMSR927) · October 2026
@@ -15,9 +15,9 @@ On 26 August 2026, the partial collapse of a high-altitude glacier in northern N
 2. **What was damaged?**
 3. **Who is cut off?** — settlements without road access to towns or hospitals.
 
-### 1.2 Our Solution: FloodMapper
+### 1.2 Our Solution: Jalnetra
 
-FloodMapper is an end-to-end system that takes an area and a flood date and answers all three questions from free data: Sentinel-1 radar (sees through monsoon cloud), Sentinel-2 optical, a pre-event OpenStreetMap snapshot (via ohsome/Overpass attic), Copernicus GLO-30 DEM, and a U-Net flood-segmentation model trained on Kuro Siwo (Bountos et al., NeurIPS 2024). NetworkX graph analysis finds cut-off settlements from road connectivity. Outputs are a web dashboard, a one-page situation report, and GeoJSON result layers.
+Jalnetra is an end-to-end system that takes an area and a flood date and answers all three questions from free data: Sentinel-1 radar (sees through monsoon cloud), Sentinel-2 optical, a pre-event OpenStreetMap snapshot (via ohsome/Overpass attic), Copernicus GLO-30 DEM, and a U-Net flood-segmentation model trained on Kuro Siwo (Bountos et al., NeurIPS 2024). NetworkX graph analysis finds cut-off settlements from road connectivity. Outputs are a web dashboard, a one-page situation report, and GeoJSON result layers.
 
 ### 1.3 Scope
 
@@ -146,4 +146,4 @@ cd dashboard && python app.py   # opens http://localhost:5000
 
 ## 8. Conclusion
 
-FloodMapper demonstrates the feasibility of open-data flood damage assessment for terrain where no ground access exists. This submission cycle produced verified real artifacts: a same-orbit Sentinel-1 pair bracketing the event, a pre-event OSM snapshot triple-verified against official aggregates, a 251 km DEM-based flood-path trace, a debugged and runnable AI chain, and a quantified comparison frame against EMSR927's official bulletin — with every remaining gap (Kuro Siwo training, real flood mask, EMSR927 IoU check) explicitly documented rather than papered over.
+Jalnetra demonstrates the feasibility of open-data flood damage assessment for terrain where no ground access exists. This submission cycle produced verified real artifacts: a same-orbit Sentinel-1 pair bracketing the event, a pre-event OSM snapshot triple-verified against official aggregates, a 251 km DEM-based flood-path trace, a debugged and runnable AI chain, and a quantified comparison frame against EMSR927's official bulletin — with every remaining gap (Kuro Siwo training, real flood mask, EMSR927 IoU check) explicitly documented rather than papered over.

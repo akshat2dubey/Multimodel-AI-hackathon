@@ -1,4 +1,4 @@
-# FloodMapper — runtime dependencies
+# Jalnetra — runtime dependencies
 # Verified working on Python 3.14 (Windows), cp314 wheels available for all of these.
 #
 #   python -m pip install -r requirements.txt

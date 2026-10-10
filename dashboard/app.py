@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FloodMapper Dashboard — Flask Backend
+Jalnetra Dashboard — Flask Backend
 
 Serves a web dashboard for visualizing flood mapping results:
   - Interactive map with flood overlay (Leaflet + MapLibre)
@@ -380,7 +380,7 @@ if __name__ == "__main__":
     # for anything that tracks the server PID.
     debug = os.environ.get("FLASK_DEBUG", "1").lower() not in ("0", "false", "no")
     print(f'\
-FloodMapper Dashboard — Open: http://localhost:{port}  (debug={debug})\
+Jalnetra Dashboard — Open: http://localhost:{port}  (debug={debug})\
 Features: flood map, OSM damage, cut-offs, report, flood path\
 ')
     app.run(host="0.0.0.0", port=port, debug=debug)

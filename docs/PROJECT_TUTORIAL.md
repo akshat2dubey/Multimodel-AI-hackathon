@@ -1,4 +1,4 @@
-# FloodMapper — Complete Tutorial, Status & Security Baseline
+# Jalnetra — Complete Tutorial, Status & Security Baseline
 
 **Project:** Bhote Koshi–Trishuli flood mapping pipeline (Track B hackathon entry)
 **Last audited:** 2026‑10‑09
