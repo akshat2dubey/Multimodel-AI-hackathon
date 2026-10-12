@@ -17,8 +17,12 @@ import hmac
 import json
 import math
 import os
+import re
 import subprocess
 import sys
+import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 # The dashboard is normally started as `cd dashboard && python app.py`, so the
@@ -66,11 +70,307 @@ else:
     RESULTS = RESULTS_DIR
 DATA = DATA_DIR
 
-# POST /api/run-pipeline spawns a long download+compute job, so it must not be
-# callable by anyone who can reach the port. Without a configured token the
-# endpoint refuses every request (fail closed).
+# State-changing routes spawn a long download+compute job, so they must not be
+# callable by anyone who can reach the port. Without a configured token these
+# endpoints refuse every request (fail closed).
 PIPELINE_TOKEN = os.environ.get("JALNETRA_PIPELINE_TOKEN", "")
 PIPELINE_TOKEN_HEADER = "X-Pipeline-Token"
+
+
+# ─── Background pipeline job ────────────────────────────────────────────────
+# POST /api/runs starts scripts/run_pipeline.py as a BACKGROUND process and
+# returns 202 immediately: a real run downloads imagery and can take minutes, so
+# blocking the request would freeze the page a judge is watching. The UI polls
+# GET /api/run-status instead.
+#
+# Only one job may run at a time — two runs would fight over the same results/
+# directory. The state is mirrored into results/run_status.json so the status
+# survives a page reload and a crash leaves evidence behind.
+RUN_STATUS_FILENAME = "run_status.json"
+MAX_ARG_STRING = 80
+LOG_TAIL_LINES = 40
+# The orchestrator's steps, in order. Used only to turn a log line into a step
+# label and a rough progress fraction — it is not a scheduler.
+PIPELINE_STEPS = [
+    "download_sentinel.py",
+    "download_sentinel2.py",
+    "fetch_osm.py",
+    "download_dem.py",
+    "inference.py",
+    "damage_assessment.py",
+    "cutoff_analysis.py",
+    "flood_path.py",
+    "generate_report.py",
+]
+STEP_LABELS = {
+    "download_sentinel.py": "downloading Sentinel-1 radar",
+    "download_sentinel2.py": "downloading Sentinel-2 optical",
+    "fetch_osm.py": "fetching the pre-event OSM snapshot",
+    "download_dem.py": "downloading the Copernicus DEM",
+    "inference.py": "computing the flood mask",
+    "damage_assessment.py": "assessing damage to roads and buildings",
+    "cutoff_analysis.py": "finding cut-off settlements",
+    "flood_path.py": "tracing the flood path",
+    "generate_report.py": "generating the situation report",
+}
+
+_job_lock = threading.Lock()
+_active_job: dict | None = None          # JSON-safe description of the run
+_active_proc: "subprocess.Popen | None" = None   # the process itself
+
+
+# Credential shapes that must never reach a log tail. The tail is rendered in the
+# browser, so a signed URL or an Authorization header printed by a download step
+# would otherwise be published to whoever is looking at the dashboard.
+_SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)\b(client_secret|access_token|authorization|password|api[_-]?key|"
+        r"token)\b(\s*[:=]?\s*)(\"?)([^\s\"',;]+)"
+    ),
+    re.compile(r"\b[A-Za-z0-9_\-]{32,}\b"),
+)
+
+
+def redact(text: str) -> str:
+    """Mask credentials before a line is stored or served."""
+    out = str(text)
+    out = _SECRET_PATTERNS[0].sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}<redacted>", out
+    )
+    out = _SECRET_PATTERNS[1].sub("<redacted>", out)
+    return out
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _status_path() -> Path:
+    return RESULTS / RUN_STATUS_FILENAME
+
+
+def _write_status(status: dict) -> None:
+    """Write the status file atomically so a reader never sees a half-written JSON."""
+    try:
+        RESULTS.mkdir(parents=True, exist_ok=True)
+        path = _status_path()
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass  # a status file that cannot be written must not kill the run
+
+
+def _read_status_file() -> dict:
+    path = _status_path()
+    if path.is_file():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    return {"state": "idle", "run_id": None, "step": None, "progress": 0.0,
+            "log_tail": [], "started_utc": None}
+
+
+def _step_from_line(line: str) -> str | None:
+    for script in PIPELINE_STEPS:
+        if script in line:
+            return script
+    return None
+
+
+def _parse_run_request(payload: dict) -> dict:
+    """Validate a run request into run_pipeline.py keyword arguments.
+
+    Returns the kwargs dict, or ``(message, field)`` on a bad value. This is a
+    deliberately small guard — T17 replaces it with the full allowlist. It exists
+    here so no unvalidated value can reach argv or the filesystem.
+    """
+    def _num(name, low, high):
+        if name not in payload or payload[name] in (None, ""):
+            return None
+        try:
+            value = float(payload[name])
+        except (TypeError, ValueError):
+            return (f"{name} must be a number", name)
+        if not (low <= value <= high):
+            return (f"{name} must be between {low} and {high}", name)
+        return value
+
+    def _date(name):
+        if name not in payload or payload[name] in (None, ""):
+            return None
+        value = str(payload[name]).strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return (f"{name} must be an ISO date (YYYY-MM-DD)", name)
+        return value
+
+    def _text(name, limit=MAX_ARG_STRING):
+        if name not in payload or payload[name] in (None, ""):
+            return None
+        value = str(payload[name]).strip()
+        if len(value) > limit:
+            return (f"{name} must be at most {limit} characters", name)
+        return value
+
+    bbox = payload.get("bbox")
+    if isinstance(bbox, str):
+        bbox = [part for part in re.split(r"[,\s]+", bbox.strip()) if part]
+    if bbox not in (None, "", []):
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return ("bbox must be four numbers: min_lon,min_lat,max_lon,max_lat", "bbox")
+        try:
+            bbox = [float(v) for v in bbox]
+        except (TypeError, ValueError):
+            return ("bbox values must be numbers", "bbox")
+        west, south, east, north = bbox
+        if not (-180 <= west <= 180 and -180 <= east <= 180):
+            return ("bbox longitudes must be between -180 and 180", "bbox")
+        if not (-90 <= south <= 90 and -90 <= north <= 90):
+            return ("bbox latitudes must be between -90 and 90", "bbox")
+        if west >= east or south >= north:
+            return ("bbox must be min_lon,min_lat,max_lon,max_lat with min<max", "bbox")
+    else:
+        bbox = None
+
+    params = {"bbox": bbox}
+    for name, low, high in (("center_lat", -90, 90), ("center_lon", -180, 180),
+                            ("extent", 0.0001, 90)):
+        value = _num(name, low, high)
+        if isinstance(value, tuple):
+            return value
+        params[name] = value
+    for name in ("event_date", "osm_snapshot", "before_date", "after_date"):
+        value = _date(name)
+        if isinstance(value, tuple):
+            return value
+        params[name] = value
+    for name in ("area", "preset"):
+        value = _text(name)
+        if isinstance(value, tuple):
+            return value
+        params[name] = value
+
+    # Nothing supplied: run the documented case-study preset so the one-click
+    # button still works. A judge-entered bbox always takes precedence.
+    if not any(params.values()):
+        params["preset"] = DEFAULT_PRESET
+    return params
+
+
+def _pipeline_argv(params: dict) -> list[str]:
+    """Build the orchestrator's argv.
+
+    An argv LIST, never a shell string: a value typed into the browser must not
+    be able to become a command.
+    """
+    argv = [sys.executable, str(ROOT / "scripts" / "run_pipeline.py")]
+    if params.get("preset"):
+        argv += ["--preset", params["preset"]]
+    if params.get("area"):
+        argv += ["--area", params["area"]]
+    if params.get("bbox"):
+        argv += ["--bbox", ",".join(f"{v:.6f}" for v in params["bbox"])]
+    if params.get("center_lat") is not None:
+        argv += ["--center-lat", str(params["center_lat"])]
+    if params.get("center_lon") is not None:
+        argv += ["--center-lon", str(params["center_lon"])]
+    if params.get("extent") is not None:
+        argv += ["--extent", str(params["extent"])]
+    for flag, key in (("--before-date", "before_date"), ("--after-date", "after_date"),
+                      ("--event-date", "event_date"), ("--osm-snapshot", "osm_snapshot")):
+        if params.get(key):
+            argv += [flag, params[key]]
+    return argv
+
+
+def _terminate(proc) -> None:
+    """Stop a running job, including the child processes it spawned.
+
+    run_pipeline.py is a thin orchestrator: killing only it would leave a
+    download running. On POSIX the job gets its own process group; on Windows it
+    gets CREATE_NEW_PROCESS_GROUP and is killed with taskkill /T.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, check=False)
+        else:
+            os.killpg(os.getpgid(proc.pid), 15)
+    except Exception:  # noqa: BLE001 — cancellation must never raise at the caller
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _launch_job(argv: list[str], params: dict) -> dict:
+    """Start the pipeline in the background and return its JSON-safe status."""
+    run_id = str(uuid.uuid4())
+    job = {
+        "run_id": run_id,
+        "state": "running",
+        "step": "starting",
+        "progress": 0.0,
+        "started_utc": _utc_now(),
+        "finished_utc": None,
+        "exit_code": None,
+        "params": {k: v for k, v in params.items() if v not in (None, [], "")},
+        "log_tail": [],
+    }
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=creationflags,
+    )
+    global _active_proc
+    _active_proc = proc
+    _write_status(job)
+
+    def _reader() -> None:
+        seen: list[str] = []
+        try:
+            for raw in proc.stdout:  # type: ignore[union-attr]
+                line = redact(str(raw).rstrip("\n"))
+                job["log_tail"].append(line)
+                del job["log_tail"][:-LOG_TAIL_LINES]
+                script = _step_from_line(line)
+                if script and script not in seen:
+                    seen.append(script)
+                    job["step"] = STEP_LABELS.get(script, script)
+                    job["progress"] = round(min(0.95, len(seen) / len(PIPELINE_STEPS)), 3)
+                with _job_lock:
+                    _write_status(job)
+        finally:
+            code = proc.wait()
+            global _active_job, _active_proc
+            with _job_lock:
+                job["exit_code"] = code
+                job["finished_utc"] = _utc_now()
+                if job["state"] != "cancelled":
+                    if code == 0:
+                        job["state"] = "done"
+                        job["step"] = "finished"
+                        job["progress"] = 1.0
+                    else:
+                        job["state"] = "failed"
+                        job["step"] = "failed"
+                        job["error"] = f"the pipeline exited with code {code}"
+                _write_status(job)
+                _active_job = None
+                _active_proc = None
+
+    threading.Thread(target=_reader, name=f"jalnetra-run-{run_id[:8]}", daemon=True).start()
+    return job
 
 
 def json_safe(value):
@@ -455,43 +755,96 @@ def demo_mode():
     return render_template("demo.html")
 
 
-@app.route("/api/run-pipeline", methods=["POST"])
-def api_run_pipeline():
-    """Trigger the full pipeline (for demo/UI trigger).
-
-    Runs the same case-study preset the CLI documents (``--preset``), so the
-    dashboard cannot drift from the pipeline: the area, bbox and dates are
-    resolved by run_pipeline.py into results/run_meta.json, not restated here.
-
-    Gated by a shared token (header ``X-Pipeline-Token``) so a public port cannot
-    be made to start a multi-minute download job. Fails closed: with no
-    JALNETRA_PIPELINE_TOKEN configured, every request is rejected.
-    """
+def _token_ok() -> bool:
+    """State-changing routes fail closed: no configured token means no access."""
     supplied = request.headers.get(PIPELINE_TOKEN_HEADER, "")
-    if not PIPELINE_TOKEN or not hmac.compare_digest(supplied, PIPELINE_TOKEN):
+    if not PIPELINE_TOKEN:
+        return False
+    return hmac.compare_digest(supplied, PIPELINE_TOKEN)
+
+
+@app.route("/api/runs", methods=["POST"])
+@app.route("/api/run-pipeline", methods=["POST"])  # legacy name, same behaviour
+def api_start_run():
+    """Start the pipeline as a background job and return 202 with a run_id.
+
+    Runs the same orchestrator the CLI documents, so the dashboard cannot drift
+    from the pipeline: the area, bbox and dates are resolved by run_pipeline.py
+    into results/run_meta.json, not restated here.
+
+    Token-gated and single-job: a public port must not be able to start (or
+    stack) multi-minute download jobs. The request returns immediately and the
+    UI polls /api/run-status, so the page never freezes during a live demo.
+    """
+    if not _token_ok():
         return jsonify({
             "success": False,
             "error": "Forbidden: missing or invalid pipeline token.",
         }), 403
 
-    try:
-        result = subprocess.run(
-            [sys.executable, str(ROOT / "scripts" / "run_pipeline.py"),
-             "--preset", DEFAULT_PRESET],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+    global _active_job
+    with _job_lock:
+        if _active_job is not None and _active_job.get("state") == "running":
+            return jsonify({
+                "success": False,
+                "error": "A pipeline run is already in progress.",
+                "run_id": _active_job.get("run_id"),
+            }), 409
+
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({"success": False, "error": "invalid input"}), 400
+
+        params = _parse_run_request(payload)
+        if isinstance(params, tuple):
+            message, field = params
+            return jsonify({"success": False, "error": message, "field": field}), 400
+
+        _active_job = _launch_job(_pipeline_argv(params), params)
         return jsonify({
-            "success": result.returncode == 0,
-            "stdout": result.stdout[-2000:],
-            "stderr": result.stderr[-1000:],
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"success": False, "error": "Pipeline timed out (>5 min)"}), 504
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+            "success": True,
+            "run_id": _active_job["run_id"],
+            "state": _active_job["state"],
+        }), 202
+
+
+@app.route("/api/run-status")
+def api_run_status():
+    """The active job's state, or the last one recorded on disk.
+
+    Safe to poll: the payload carries no filesystem paths and no secrets (the
+    log tail is redacted as it is read).
+    """
+    with _job_lock:
+        payload = dict(_active_job) if _active_job is not None else _read_status_file()
+    return jsonify(json_safe(payload))
+
+
+@app.route("/api/cancel", methods=["POST"])
+def api_cancel_run():
+    """Kill switch: stop the active job (and the children it spawned)."""
+    if not _token_ok():
+        return jsonify({
+            "success": False,
+            "error": "Forbidden: missing or invalid pipeline token.",
+        }), 403
+
+    global _active_job, _active_proc
+    with _job_lock:
+        job = _active_job
+        proc = _active_proc
+        if job is None:
+            return jsonify({"success": False,
+                            "error": "No pipeline run is active."}), 409
+    _terminate(proc)
+    with _job_lock:
+        job["state"] = "cancelled"
+        job["step"] = "cancelled"
+        job["finished_utc"] = _utc_now()
+        _write_status(job)
+        _active_job = None
+        _active_proc = None
+    return jsonify({"success": True, "run_id": job["run_id"], "state": "cancelled"})
 
 
 if __name__ == "__main__":

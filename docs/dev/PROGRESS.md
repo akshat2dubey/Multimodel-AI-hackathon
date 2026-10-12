@@ -25,7 +25,7 @@ Each row was checked against the code and by running the check, not by assuming.
 | #7 | T13 | Cut-off logic rewrite | **PASS** | `tests/test_08_cutoff_logic.py` |
 | #8 | T12 | Empty-data crash fixes | **PASS** | `tests/test_07_empty_inputs.py` |
 | #9 | T09 | Inference bug fixes | **PASS** | `tests/test_03_tiling_coverage.py`, `tests/test_04_pixel_area.py` |
-| #10 | T16 | Area/date form + background job | **FAIL** | `POST /api/run-pipeline` is **synchronous** (`subprocess.run`, `timeout=300`), returns `200`/`500` with raw `stdout`/`stderr`, has no `run_id`, no `202`, no single-job lock. `GET /api/run-status` → **404**. |
+| #10 | T16 | Area/date form + background job | **PASS** (fixed 2026-10-12) | `POST /api/runs` spawns `run_pipeline.py` in the background and answers **202 + run_id**; `GET /api/run-status` returns state/step/progress/redacted log tail; a second POST while running → **409**; `POST /api/cancel` stops the job. `tests/test_19_run_job.py` (9 tests). UI verified live: bbox form, draw-AOI-on-map, 2 s polling. |
 
 ### Extra gate checks (all cheap ones, done)
 
@@ -36,17 +36,19 @@ Each row was checked against the code and by running the check, not by assuming.
 | No banned literal outside `config/` and `docs/` (shipped test) | **PASS** | `test_14` passes; stricter plan wording is PARTIAL (see T04) |
 | No script silently creates synthetic data; `run_pipeline.py` never trains | **PASS** | generator is explicit, confined to `*_demo/`, banner printed; no training call in the orchestrator |
 | Every script valid on empty inputs (exit 0) | **PASS** | `tests/test_07_empty_inputs.py` |
-| T06 sub-check: no wildcard CORS | **FAIL** | Live probe: `Origin: http://evil.example` → `Access-Control-Allow-Origin: http://evil.example` reflected on both `GET /api/status` and `POST /api/run-pipeline`. `CORS(app)` is still at `dashboard/app.py`. |
+| T06 sub-check: no wildcard CORS | **PASS** (fixed 2026-10-12) | `CORS(app)` removed. Live probe: `Origin: http://evil.example` → **no** `Access-Control-Allow-Origin` on `/api/status`, `/api/cutoffs`, `/api/damage`, `/api/flood-mask`. Guarded by `test_api_grants_no_cross_origin_read_access`. |
 | T06 sub-check: loopback bind + debug off | **PASS** | `test_server_binds_loopback_with_debug_off_by_default` passes |
 | T18 sub-check: token on state-changing routes | **PARTIAL** | No/wrong token → 403 (correct, fails closed). But Origin/Host allowlist is absent and the token is env-only (`JALNETRA_PIPELINE_TOKEN`), not generated at startup and injected into the page as T18 requires. |
 
 ### Gate verdict summary
 
-**7 PASS, 1 PARTIAL-with-fix-needed (T07), 2 PARTIAL (T03, T04), 2 FAIL (T06 CORS, T16).**
-Gate fixes to complete in Phase 1: **T16** (background job + status + lock), **T06/T18**
-(remove wildcard CORS, add Origin allowlist + startup token), **T07** (re-run preprocessing
-on the confirmed AOI once H1/H2 land), **T03/T04** (move demo scripts to `demo/`, strip the
-remaining case-study literals).
+**8 PASS, 1 PARTIAL-with-fix-needed (T07), 2 PARTIAL (T03, T04), 1 OPEN (T18 Origin/token).**
+
+Gate fixes completed 2026-10-12: **T06** (wildcard CORS removed, loopback/debug defaults) and
+**T16** (background job + status route + single-job lock), both with tests and a live check.
+Still open: **T18** (Origin/Host allowlist + startup-generated token), **T07** (re-run
+preprocessing on the confirmed AOI once H1/H2 land), **T03/T04** (move the demo scripts to
+`demo/`, strip the remaining case-study literals from docstrings and `demo.html`).
 
 ---
 
@@ -124,3 +126,9 @@ remaining case-study literals).
   (says 96 buildings, `synthetic: true`) while the real snapshot metadata is
   `data/osm/osm_metadata.json` (3,755 buildings). Its `ohsome_total_check` is `0`.
 - **T11 choice**: performance gate kept at the plan's 20 s budget; measured 7.20 s.
+- **T16 design**: the job's state is mirrored to `results/run_status.json` (written atomically)
+  so it survives a page reload and a crash leaves evidence; the process handle lives outside
+  that dict so the JSON payload stays serialisable and path-free. `POST /api/run-pipeline` is
+  kept as an alias of `/api/runs` so the existing UI and tests keep working.
+- **T06 decision**: `JALNETRA_HOST` / `JALNETRA_DEBUG` are the documented knobs; the older
+  `HOST` / `FLASK_DEBUG` names are still honoured so existing commands do not break.

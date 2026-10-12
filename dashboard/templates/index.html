@@ -79,6 +79,17 @@
   }
   .menu-btn:hover { background: #1a4a8a; }
   .menu-btn.active { background: #e94560; color: white; }
+  .run-input {
+    background: #0f3460;
+    border: 1px solid #1a4a8a;
+    color: #e0e0e0;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 11px;
+    width: 100%;
+    font-family: inherit;
+  }
+  .run-input::placeholder { color: #667; }
   
   .cutoff-item {
     background: #1a1a2e;
@@ -231,10 +242,30 @@
       </div>
     </div>
 
-    <div style="margin-top:auto; border-top:1px solid #0f3460; padding-top:12px;">
+    <div id="run-panel" style="margin-top:auto; border-top:1px solid #0f3460; padding-top:12px;">
+      <div class="section-title">▶ Run Pipeline</div>
+      <div style="font-size:11px; color:#8899aa; margin-bottom:6px;">
+        Area of interest — bbox, or draw it on the map.
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:5px;">
+        <input id="run-min-lon" class="run-input" placeholder="min_lon" inputmode="decimal">
+        <input id="run-min-lat" class="run-input" placeholder="min_lat" inputmode="decimal">
+        <input id="run-max-lon" class="run-input" placeholder="max_lon" inputmode="decimal">
+        <input id="run-max-lat" class="run-input" placeholder="max_lat" inputmode="decimal">
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:8px;">
+        <input id="run-event-date" class="run-input" placeholder="event date" inputmode="decimal">
+        <input id="run-area" class="run-input" placeholder="area name">
+      </div>
+      <button class="menu-btn" id="btn-draw-aoi">▭ Draw AOI on map</button>
       <button class="menu-btn" id="btn-run-pipeline" style="background:#e94560; color:white;">
         ▶ Run Full Pipeline
       </button>
+      <button class="menu-btn" id="btn-preset">📌 Case-study preset</button>
+      <button class="menu-btn" id="btn-cancel-run" style="display:none; background:#7a2b3a; color:white;">
+        ■ Cancel run
+      </button>
+      <div id="run-status" style="font-size:11px; color:#8899aa; margin:6px 0; min-height:14px;"></div>
       <button class="menu-btn" id="btn-view-report">
         📄 View Situation Report
       </button>
@@ -698,43 +729,166 @@ document.querySelectorAll('[data-layer]').forEach(btn => {
 });
 
 // ─── Buttons ────────────────────────────────────────────
-document.getElementById('btn-run-pipeline').addEventListener('click', async function() {
-  // POST /api/run-pipeline is token-gated server-side (it spawns the full
-  // download+compute job). Ask the operator once, then keep it for this browser.
+// ─── Pipeline run (T16) ─────────────────────────────────
+// POST /api/runs starts the orchestrator in the background and answers 202; the
+// page then polls /api/run-status every 2s. A run takes minutes, so blocking the
+// request would freeze the page a judge is watching.
+let runPollTimer = null;
+const aoiDraw = { active: false, start: null, rect: null };
+
+function pipelineToken() {
+  // State-changing routes are token-gated server-side. Ask once, then remember.
   let token = window.localStorage.getItem('jalnetra_pipeline_token');
   if (!token) {
-    token = window.prompt('Pipeline token (JALNETRA_PIPELINE_TOKEN on the server):') || '';
-    if (!token) { return; }
+    token = window.prompt('Pipeline token (printed by the server on startup):') || '';
+    if (!token) { return ''; }
     window.localStorage.setItem('jalnetra_pipeline_token', token);
   }
-  this.textContent = '⏳ Running...';
-  this.disabled = true;
+  return token;
+}
+
+function readRunForm() {
+  const val = id => (document.getElementById(id).value || '').trim();
+  const corners = ['run-min-lon', 'run-min-lat', 'run-max-lon', 'run-max-lat'].map(val);
+  const body = {};
+  if (corners.every(v => v !== '')) { body.bbox = corners.map(Number); }
+  if (val('run-event-date')) { body.event_date = val('run-event-date'); }
+  if (val('run-area')) { body.area = val('run-area'); }
+  return body;
+}
+
+function setRunBusy(busy) {
+  document.getElementById('btn-run-pipeline').disabled = busy;
+  document.getElementById('btn-preset').disabled = busy;
+  document.getElementById('btn-cancel-run').style.display = busy ? 'block' : 'none';
+}
+
+function setRunStatus(text) {
+  document.getElementById('run-status').textContent = text || '';
+}
+
+async function startRun(body) {
+  const token = pipelineToken();
+  if (!token) { return; }
   try {
-    const resp = await fetch('/api/run-pipeline', {
+    const resp = await fetch('/api/runs', {
       method: 'POST',
-      headers: { 'X-Pipeline-Token': token }
+      headers: { 'Content-Type': 'application/json', 'X-Pipeline-Token': token },
+      body: JSON.stringify(body)
     });
+    const data = await resp.json().catch(() => ({}));
     if (resp.status === 403) {
       window.localStorage.removeItem('jalnetra_pipeline_token');
-      this.textContent = '🔒 Token rejected';
+      setRunStatus('🔒 Token rejected — ask the operator for the startup token.');
       return;
     }
-    const data = await resp.json();
-    if (data.success) {
-      this.textContent = '✅ Pipeline Complete';
-      setTimeout(() => { location.reload(); }, 2000);
-    } else {
-      this.textContent = '❌ Failed — see console';
-      console.error(data);
+    if (resp.status === 409) {
+      setRunBusy(true);
+      setRunStatus('⏳ A run is already in progress.');
+      pollRunStatus();
+      return;
     }
-  } catch(e) {
-    this.textContent = '❌ Error';
+    if (!resp.ok) {
+      setRunStatus('❌ ' + (data.error || 'invalid input'));
+      return;
+    }
+    setRunBusy(true);
+    setRunStatus('⏳ Starting…');
+    pollRunStatus();
+  } catch (e) {
+    setRunStatus('❌ ' + e.message);
   }
-  setTimeout(() => {
-    this.textContent = '▶ Run Full Pipeline';
-    this.disabled = false;
-  }, 5000);
+}
+
+async function pollRunStatus() {
+  clearTimeout(runPollTimer);
+  try {
+    const s = await fetch('/api/run-status').then(r => r.json());
+    if (s.state === 'running') {
+      const pct = Math.round((s.progress || 0) * 100);
+      setRunStatus('⏳ ' + (s.step || 'running') + (pct ? ' — ' + pct + '%' : ''));
+      runPollTimer = setTimeout(pollRunStatus, 2000);
+      return;
+    }
+    setRunBusy(false);
+    if (s.state === 'done') {
+      setRunStatus('✅ Run complete — reloading layers…');
+      await loadAllData();
+      setRunStatus('✅ Run complete');
+    } else if (s.state === 'failed') {
+      setRunStatus('❌ ' + (s.error || 'Run failed — see the log tail below.'));
+    } else if (s.state === 'cancelled') {
+      setRunStatus('■ Run cancelled.');
+    } else {
+      setRunStatus('');
+    }
+  } catch (e) {
+    setRunStatus('❌ ' + e.message);
+    setRunBusy(false);
+  }
+}
+
+function setDrawMode(on) {
+  aoiDraw.active = on;
+  document.getElementById('btn-draw-aoi').classList.toggle('active', on);
+  document.getElementById('map').style.cursor = on ? 'crosshair' : '';
+  if (on) { map.dragging.disable(); } else { map.dragging.enable(); aoiDraw.start = null; }
+}
+
+map.on('mousedown', e => {
+  if (!aoiDraw.active) { return; }
+  aoiDraw.start = e.latlng;
+  if (aoiDraw.rect) { map.removeLayer(aoiDraw.rect); aoiDraw.rect = null; }
 });
+
+map.on('mousemove', e => {
+  if (!aoiDraw.active || !aoiDraw.start) { return; }
+  const bounds = L.latLngBounds(aoiDraw.start, e.latlng);
+  if (!aoiDraw.rect) {
+    aoiDraw.rect = L.rectangle(bounds, { color: '#e94560', weight: 1, fill: false }).addTo(map);
+  } else {
+    aoiDraw.rect.setBounds(bounds);
+  }
+});
+
+map.on('mouseup', e => {
+  if (!aoiDraw.active || !aoiDraw.start) { return; }
+  const bounds = L.latLngBounds(aoiDraw.start, e.latlng);
+  document.getElementById('run-min-lon').value = bounds.getWest().toFixed(5);
+  document.getElementById('run-min-lat').value = bounds.getSouth().toFixed(5);
+  document.getElementById('run-max-lon').value = bounds.getEast().toFixed(5);
+  document.getElementById('run-max-lat').value = bounds.getNorth().toFixed(5);
+  setDrawMode(false);
+});
+
+document.getElementById('btn-draw-aoi').addEventListener('click', function() {
+  setDrawMode(!aoiDraw.active);
+});
+
+document.getElementById('btn-run-pipeline').addEventListener('click', function() {
+  startRun(readRunForm());
+});
+
+document.getElementById('btn-preset').addEventListener('click', function() {
+  // Empty body: the server falls back to the documented case-study preset.
+  startRun({});
+});
+
+document.getElementById('btn-cancel-run').addEventListener('click', async function() {
+  const token = pipelineToken();
+  if (!token) { return; }
+  const resp = await fetch('/api/cancel', {
+    method: 'POST',
+    headers: { 'X-Pipeline-Token': token }
+  });
+  const data = await resp.json().catch(() => ({}));
+  setRunStatus(resp.ok ? '■ Cancelling…' : '❌ ' + (data.error || 'cancel failed'));
+});
+
+// Resume polling if a run was already in flight when the page was (re)loaded.
+fetch('/api/run-status').then(r => r.json()).then(s => {
+  if (s.state === 'running') { setRunBusy(true); pollRunStatus(); }
+}).catch(() => {});
 
 document.getElementById('btn-view-report').addEventListener('click', function() {
   window.open('/report', '_blank');
