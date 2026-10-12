@@ -84,14 +84,14 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
 
 ### Phase 3 — Security
 - [ ] **T05** Secrets management + redaction
-- [ ] **T17** Input validation allowlist
-- [ ] **T19** Safe errors + logging
-- [ ] **T20** Rate limiting + resource limits
+- [x] **T17** Input validation allowlist — done 2026-10-13. `_parse_run_request()` now takes an **allowlist of keys** (unknown keys → 400 naming the key), caps the bbox at `MAX_BBOX_DEG2` (1.0 deg²; a 10°×10° request is refused), requires real ISO dates in the order the analysis needs (`osm_snapshot` < `event_date` ≤ `after_date`, `before_date` ≤ `event_date`), forbids future and non-existent dates (`2026-02-31`), pattern-checks the area name and checks the preset against `config.presets.PRESETS`. `tests/test_26_input_allowlist.py` (19 tests) also asserts a surviving value arrives as **one** argv element. **Residual:** `run_pipeline.py` still does not re-validate (S1-7's second half).
+- [x] **T19** Safe errors + logging — done 2026-10-13. One rotating, git-ignored log (`logs/jalnetra.log`, owner-only where the OS allows) with a redaction filter that masks credentials, `Authorization` headers, repo paths (`<repo>`) and absolute paths (`<path>`); a global handler answers `{"error": "internal error", "id": <uuid>}` and keeps the traceback in the log under that id; no stdout/stderr tail is returned over HTTP. **A real bug was found by the import test this produced:** the log setup called a helper defined further down the module, so `import app` raised `NameError` — fixed by making the chmod inline. Verified: the live log contains **no** token and **no** Windows path.
+- [x] **T20** Rate limiting + resource limits — done 2026-10-13. Per-client rate limit on `POST /api/runs` (5/min → **429**), 64 KB body cap (**413**, checked live with an 80 KB body), single-job lock (409), job wall-clock timeout (default 30 min) that kills the **process group** and marks the run `timeout` rather than `failed`, a free-disk floor before downloading, and a cache cap that prunes oldest-first. `tests/test_22_limits.py` (6 tests, including a real dummy process being killed).
 - [x] **T21** XSS-safe rendering + security headers — done 2026-10-12. Every OSM-controlled value now goes through `escapeHtml()` before it reaches `innerHTML`/`bindPopup` (an OSM `name` tag is editable by anyone, so this was a real stored-XSS path). Added the missing headers: CSP (`default-src 'self'`, `frame-ancestors 'none'`, per-response `nonce`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on `/api/*`. A strict `script-src 'self'` was only possible after vendoring Leaflet 1.9.4 into `dashboard/static/vendor/leaflet/` — the CDN dependency is gone. Verified live: page loads under the CSP with **zero console messages**, tiles still load, and `escapeHtml('<img src=x onerror=alert(1)>')` returns escaped text.
 - [x] **T22** Safe file handling + payload size — done 2026-10-12. `/api/damage` is affected-only by default (36 of 117 features) and drops the unused `osm_tags` blob: **90.5 KB → 23.5 KB**, or **16.8 KB gzipped** for the full layer via `?all=1`. Responses are capped at `MAX_FEATURES`, JSON is gzipped when the client asks, `_is_inside()` refuses to serve anything outside the results/report directories, and the file this app writes is chmod'ed owner-only where the OS allows. Verified live plus 12 tests.
-- [ ] **T36** Dependency hygiene
-- [ ] **T34** Provenance manifest + rule checks
-- [ ] **T35** Safe deserialization / model supply chain
+- [x] **T36** Dependency hygiene — done 2026-10-13. `flask-cors` (declared, never imported) removed. Every outbound fetch now goes through `scripts/net_safe.py`, which asserts the scheme is HTTPS — this **fixes** the four bandit `B310` findings instead of suppressing them. Audit results recorded in `docs/SECURITY.md`: `pip-audit -r requirements.txt` → *No known vulnerabilities found*; `bandit -r scripts dashboard` → **0 HIGH, 0 MEDIUM** (the remaining LOWs are `try/except/pass` around optional imports, `subprocess` with an argv list, and `random` for training seeds). The Python-version claim in `requirements.txt` was corrected to what was actually verified (3.14.2 on Windows; 3.10–3.12 untested). **Not done:** making `torch` optional — `inference.py` imports it unconditionally, so the baseline is not torch-free (stated in `requirements.txt` and `docs/SECURITY.md` rather than papered over).
+- [x] **T34** Provenance manifest + rule checks — done 2026-10-13. Every run writes `results/manifest.json`: SHA-256 + size for **every input and output**, run id, UTC time, git commit, parameters, method (model vs baseline), model hash verification against its sidecar, and package versions. `scripts/manifest.py` evaluates the hard rules in code — `osm_snapshot_before_event`, `acquisitions_bracket_event`, `no_forbidden_input_sources` (EMS/UNOSAT/damage-map path patterns), `sentinel_orbit_same_for_pair` (reads both `S1_PROCESSED.json` sidecars) — refuses to start when one is already broken (exit 3, before anything is written or downloaded) and fails the run at the end otherwise. A rule that cannot be evaluated is recorded as `null`, never as a pass. `tests/test_24_provenance.py` (9 tests); the EMSR leakage guard now allowlists the detector by name and `test_24` proves the detector rejects such a path.
+- [x] **T35** Safe deserialization / model supply chain — done 2026-10-13. `scripts/safe_model.py` is the only loader: `torch.load(..., weights_only=True)` (a pickled object is refused, proven by a test that saves one), a required matching `.sha256` sidecar written by `train_segmentation.py`, and a shape check. A checkpoint with no sidecar is refused unless `--trust-unverified-model` is passed explicitly. `tests/test_23_model_trust.py` (7 tests, including tamper-after-evaluation and an inference-level refusal).
 - [ ] **T37** CI security pipeline
 - [ ] **T39** Tamper-evident audit log + kill switch + incident checklist
 - [ ] **T38** Container sandbox (optional)
@@ -138,3 +138,26 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
   rebinding — already carries the attacker's `Origin`, which is rejected, and enforcing Host
   would refuse the documented LAN demo (`JALNETRA_HOST=0.0.0.0`) without adding protection.
   A missing `Origin` is allowed (curl/CLI/tests cannot be a cross-site browser request).
+- **Live security sweep (2026-10-13, 14/14 checks, `127.0.0.1:5077`)**: page 200 with a nonce
+  CSP + `nosniff`/`DENY`/`no-referrer`; no CDN script in the served page; `/api/status` 200 with
+  `Cache-Control: no-store`, no CORS grant, no absolute path in the payload; `POST /api/runs`
+  without a token **403**, from a foreign `Origin` **403**, with an 80 KB body **413**, with a
+  half-filled custom area **400** naming the fields, with a malformed bbox **400** then **429**
+  on the burst; **no job was started** by any probe; `/static/../app.py` → 404; the log holds no
+  token and no Windows path.
+- **T17 limits (chosen, not measured)**: `MAX_BBOX_DEG2 = 1.0` (env `JALNETRA_MAX_BBOX_DEG2`),
+  area pattern `^[\w .,\-()/]{1,80}$`, rate limit 5 POST/min, body cap 64 KB, job timeout 30 min,
+  free-disk floor 2 GB, cache cap 10 GB. All are env-overridable; the defaults are sized for a
+  laptop and a ~110 km analysis window.
+- **T35 strictness decision**: an unverifiable checkpoint (no `.sha256`) is **refused**, not
+  warned about. Trainers write the sidecar, so the only way to hit this is weights from
+  somewhere else — which is exactly the case where loading is unsafe. The escape hatch names
+  itself (`--trust-unverified-model`) and is never passed by the dashboard.
+- **T34 unknown rules**: `sentinel_orbit_same_for_pair` is `null` unless both `S1_PROCESSED.json`
+  sidecars exist, because the current `results/` predates them. Recording `null` keeps the
+  manifest honest; the alternative (treating unknown as pass) would be a false assurance.
+- **Probe incident (2026-10-13)**: a live probe posted a 5 KB body (under the cap) with a valid
+  bbox and the server returned **202**, starting a real job that then exited 2 ("missing
+  case-study value(s)"). No download happened and `results/` was cleaned; the two real defects
+  it exposed (a 400-less half-filled request, and an unmeasured body cap) were fixed and are
+  covered by tests.
