@@ -13,6 +13,14 @@ from pathlib import Path
 SOURCE_SUFFIXES = {".py", ".html", ".js", ".json", ".txt", ".cfg", ".ini", ".toml"}
 FORBIDDEN = "emsr"
 
+# ("scripts", "manifest.py") is the provenance guard: it names the forbidden
+# sources in order to REFUSE any input whose path matches them (manifest.rules_check
+# -> no_forbidden_input_sources). That is the opposite of a dependency, so it is
+# the one file allowed to contain the token. The test below still applies to it
+# (it must not read a docs/ reference path), and tests/test_24_provenance.py
+# proves the detector actually rejects such a path.
+GUARD_FILES = {("scripts", "manifest.py")}
+
 
 def _source_files(scripts_dir: Path, dashboard_dir: Path):
     for base in (scripts_dir, dashboard_dir):
@@ -26,6 +34,8 @@ def _source_files(scripts_dir: Path, dashboard_dir: Path):
 def test_no_source_file_references_the_reference_maps(scripts_dir, dashboard_dir):
     offenders = []
     for path in _source_files(scripts_dir, dashboard_dir):
+        if (path.parent.name, path.name) in GUARD_FILES:
+            continue
         text = path.read_text(encoding="utf-8", errors="replace").lower()
         if FORBIDDEN in text:
             for lineno, line in enumerate(text.splitlines(), start=1):

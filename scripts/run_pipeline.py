@@ -51,6 +51,7 @@ from config.presets import (  # noqa: E402
     DATA_DIR,
     MODELS_DIR,
     PRESETS,
+    PROJECT_ROOT as ROOT,
     REPORT_DIR,
     RESULTS_DIR,
 )
@@ -59,6 +60,20 @@ from config.run_meta import (  # noqa: E402
     describe,
     resolve_run_meta,
     write_run_meta,
+)
+
+# Provenance + the disqualification boundary (T34). The rules are evaluated at
+# the start (dates, and where the inputs come from) and again at the end, when
+# the acquisitions and their hashes are known.
+from manifest import (  # noqa: E402
+    RuleViolation,
+    build_manifest,
+    describe_rule_failure,
+    enforce_rules,
+    input_paths_from,
+    output_paths_from,
+    rules_check,
+    write_manifest,
 )
 
 # Pre-load Copernicus credentials from the git-ignored secret file so
@@ -171,6 +186,16 @@ def main():
     data_dir = DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
     results_dir = RESULTS_DIR
+
+    # Hard data rules first, before anything is written or fetched (T34): a run
+    # that would use a post-event OSM snapshot or an EMS/UNOSAT input must leave
+    # no artifact behind that could be mistaken for a result. The checks that
+    # need the acquisitions are re-evaluated on the manifest at the end.
+    try:
+        enforce_rules(rules_check(run_meta))
+    except RuleViolation as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(3)
 
     meta_path = write_run_meta(results_dir, run_meta)
     # One string, used verbatim by all four download stages, so they cannot
@@ -334,6 +359,27 @@ def main():
         "--output", str(REPORT_DIR / "situation_report.html"),
     ]):
         print("\n⚠️ Report generation failed")
+
+    # Step 11: Provenance manifest (T34). Every run leaves one, including a run
+    # whose later steps failed — the inputs it used are still evidence.
+    manifest = build_manifest(
+        run_meta=run_meta,
+        inputs=input_paths_from(data_dir),
+        outputs=output_paths_from(results_dir),
+        repo_root=ROOT,
+        method="unet" if not use_baseline else "log_ratio_baseline",
+        model=None if use_baseline else model_path,
+        sentinel_dir=data_dir / "sentinel1",
+    )
+    manifest_path = write_manifest(results_dir, manifest)
+    print(f"\n📜 Provenance manifest: {manifest_path}")
+    for name, ok in manifest["rules_check"].items():
+        print(f"   {name}: {ok}")
+
+    failure = describe_rule_failure(manifest["rules_check"])
+    if failure:
+        print(f"\n❌ {failure}", file=sys.stderr)
+        sys.exit(3)
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
