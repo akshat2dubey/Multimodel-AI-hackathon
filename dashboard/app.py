@@ -50,6 +50,7 @@ from config.presets import (  # noqa: E402  (path set up above)
     DATA_DIR,
     DEFAULT_PRESET,
     EVENT_DATE,
+    PRESETS,
     REPORT_DIR,
     RESULTS_DIR,
     is_demo_dir,
@@ -193,6 +194,17 @@ LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 # survives a page reload and a crash leaves evidence behind.
 RUN_STATUS_FILENAME = "run_status.json"
 MAX_ARG_STRING = 80
+
+# T17 input allowlist. The request body is the only thing a browser can push
+# into argv and the filesystem, so the shape is fixed here: known keys only,
+# an area small enough to download, sane dates, and a preset that exists.
+ALLOWED_REQUEST_KEYS = {
+    "bbox", "center_lat", "center_lon", "extent",
+    "event_date", "osm_snapshot", "before_date", "after_date",
+    "area", "preset",
+}
+MAX_BBOX_DEG2 = float(os.environ.get("JALNETRA_MAX_BBOX_DEG2", "1.0"))
+AREA_NAME_PATTERN = re.compile(r"^[\w .,\-()/]{1,80}$", re.UNICODE)
 LOG_TAIL_LINES = 40
 # The orchestrator's steps, in order. Used only to turn a log line into a step
 # label and a rough progress fraction — it is not a scheduler.
@@ -368,6 +380,12 @@ def _parse_run_request(payload: dict) -> dict:
     deliberately small guard — T17 replaces it with the full allowlist. It exists
     here so no unvalidated value can reach argv or the filesystem.
     """
+    # Unknown keys are refused rather than ignored: an ignored key is how a
+    # "helpful" extra field silently becomes an argument later.
+    unknown = sorted(set(payload) - ALLOWED_REQUEST_KEYS)
+    if unknown:
+        return (f"unknown field(s): {', '.join(unknown)}", unknown[0])
+
     def _num(name, low, high):
         if name not in payload or payload[name] in (None, ""):
             return None
@@ -379,12 +397,22 @@ def _parse_run_request(payload: dict) -> dict:
             return (f"{name} must be between {low} and {high}", name)
         return value
 
+    today = datetime.now(timezone.utc).date().isoformat()
+
     def _date(name):
         if name not in payload or payload[name] in (None, ""):
             return None
         value = str(payload[name]).strip()
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
             return (f"{name} must be an ISO date (YYYY-MM-DD)", name)
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            return (f"{name} is not a real calendar date", name)
+        if value > today:
+            # Sentinel imagery for a future date cannot exist; asking for it
+            # would start a run that downloads nothing.
+            return (f"{name} is in the future ({value} > {today})", name)
         return value
 
     def _text(name, limit=MAX_ARG_STRING):
@@ -412,6 +440,15 @@ def _parse_run_request(payload: dict) -> dict:
             return ("bbox latitudes must be between -90 and 90", "bbox")
         if west >= east or south >= north:
             return ("bbox must be min_lon,min_lat,max_lon,max_lat with min<max", "bbox")
+        # A whole-continent request is not a flood analysis: it would download
+        # for hours and produce a map nobody can read. Cap the area.
+        area_deg2 = abs(east - west) * abs(north - south)
+        if area_deg2 > MAX_BBOX_DEG2:
+            return (
+                f"bbox covers {area_deg2:.2f} deg²; the maximum is "
+                f"{MAX_BBOX_DEG2} deg² (about 110 km across at this latitude)",
+                "bbox",
+            )
     else:
         bbox = None
 
@@ -432,6 +469,29 @@ def _parse_run_request(payload: dict) -> dict:
         if isinstance(value, tuple):
             return value
         params[name] = value
+
+    if params["area"] and not AREA_NAME_PATTERN.match(params["area"]):
+        return (
+            "area may contain letters, digits, spaces and . , - ( ) / only "
+            "(max 80 characters)",
+            "area",
+        )
+    # The preset name selects a hard-coded configuration, so it is checked
+    # against the list rather than passed through.
+    if params["preset"] and params["preset"] not in PRESETS:
+        return (
+            f"unknown preset {params['preset']!r}; available: "
+            + ", ".join(sorted(PRESETS)),
+            "preset",
+        )
+
+    # Dates in the order the analysis requires: the OSM snapshot must predate the
+    # event, and the imagery must bracket it.
+    for earlier, later in (("osm_snapshot", "event_date"),
+                           ("before_date", "event_date"),
+                           ("event_date", "after_date")):
+        if params.get(earlier) and params.get(later) and params[earlier] > params[later]:
+            return (f"{earlier} must not be after {later}", earlier)
 
     # Nothing supplied: run the documented case-study preset so the one-click
     # button still works. A judge-entered bbox always takes precedence.
