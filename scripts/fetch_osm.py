@@ -68,7 +68,8 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 #     cross-check our extract against the official OSH statistics.
 OVERPASS_API = "https://overpass-api.de/api/interpreter"
 OHSOME_API = "https://api.ohsome.org/v1"          # used only for aggregate counts
-USER_AGENT = "LadderLens/0.1 (hackathonTrackB)"
+# Identifies this tool to Overpass/ohsome, as the tile/API etiquette asks.
+USER_AGENT = "Jalnetra/0.1 (Multimodal AI Hackathon 2026, Track B)"
 
 
 def overpass_ql(

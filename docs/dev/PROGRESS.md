@@ -61,7 +61,8 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
 - [ ] **T04** run_meta.json + zero hardcoded area/date/coords — strip remaining docstrings/`demo.html` literals
 
 ### Phase 1 — Remaining fixes
-- [ ] **T01** Repo hygiene + secret scan
+- [x] **T01** Repo hygiene + secret scan — done 2026-10-12. Deleted `NOTICE.md` (non-English agent notes + a local absolute path) and `docs/CEO_STATUS_REPORT.md` (stale: it still claimed there was no git repo); moved `verification_*.json` to `docs/dev/`. `git grep` for `F:/`, `C:\Users`, `Akshat`, `LadderLens` now returns **nothing** (the tutorial's machine-specific `cd` was rewritten generically, and `fetch_osm.py`'s User-Agent now says Jalnetra). `.gitignore` covers `.secrets/`, `.env`, `*.env`, `data/`, `results/`, `logs/`, `*.pt`, `.venv/` while allowing `models/README.md` and `.env.example`; added `LICENSE` (MIT, Akshat Dubey), `.env.example` (placeholder names only) and `models/README.md`.
+  **Secret scan: clean.** No credential literal in any tracked file (the only hits are the variable unpack in `preprocess_s1.py` and obvious fakes in `tests/`), and `git log --all -- .secrets .env *.env` is empty — no secret was ever committed, so no rotation is needed (H5 stays "not needed").
 - [ ] **T02** Test scaffold (already present — extend only)
 - [ ] **T14** Damage labels + accuracy
 - [ ] **T15** Cut-off output = real GeoJSON, no path leak

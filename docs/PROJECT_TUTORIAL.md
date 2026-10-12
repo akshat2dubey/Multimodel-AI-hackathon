@@ -27,19 +27,20 @@ gate on the entire remote‑sensing half.
 
 ### 1.1 Open the folder
 
-Your shell is at `C:\Users\Admin`. The project is on `F:`. PowerShell needs quotes around
-the path because it contains spaces:
+`cd` into the repository root — the directory that holds `scripts/`, `dashboard/` and
+`requirements.txt`. Quote the path if it contains spaces (bash and PowerShell both accept
+forward slashes):
 
-```powershell
-cd "F:/Akshat/edc ideas/LadderLens/MultiModel/hackathon-trackb"
+```bash
+cd "/path/to/Multimodel-AI-hackathon"
 ```
 
-That was the exact error in your terminal — unquoted spaces. Forward slashes work fine in
-PowerShell.
+Every command in this tutorial is written for **bash** (Git Bash or WSL on Windows, or any
+POSIX shell elsewhere).
 
 ### 1.2 Check Python & dependencies
 
-```powershell
+```bash
 python --version
 python -c "import flask, rasterio, numpy, geopandas; print('deps OK')"
 ```

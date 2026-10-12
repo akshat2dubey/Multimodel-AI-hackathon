@@ -1,12 +1,25 @@
-# never commit secrets or big binary data
+# never commit secrets
 .secrets/
 .env
+*.env
+!.env.example
+
+# real downloads and real pipeline output (large, and not ours to redistribute)
 data/
 results/
-# synthetic fixture trees (scripts/make_demo_data.py + run_offline.py)
+logs/
+
+# synthetic fixture trees (demo/make_demo_data.py + demo/run_offline.py)
 data_demo/
 results_demo/
-models/
+
+# model weights are large binaries; models/README.md explains how to obtain or
+# retrain them, and the pipeline runs without one (log-ratio baseline fallback)
+models/*
+!models/README.md
+*.pt
+
+# raster / archive outputs
 *.tif
 *.tiff
 *.jpg
@@ -17,11 +30,15 @@ models/
 *.zip
 *.tar.gz
 *.gz
+
+# python
 __pycache__/
 *.pyc
 *.pyo
-*.log
-tmp_*
+.venv/
+venv/
+
+# tooling
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
@@ -29,3 +46,5 @@ tmp_*
 .idea/
 *.swp
 *.swo
+*.log
+tmp_*
