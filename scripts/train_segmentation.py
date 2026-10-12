@@ -56,6 +56,10 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.models import ResNet34_Weights, resnet34
 
+# Safe checkpoint I/O: weights_only=True plus the .sha256 sidecar that
+# inference.py verifies before it loads these weights (T35).
+from safe_model import ModelTrustError, load_checkpoint, write_sidecar
+
 # The single dB -> 0..1 input mapping, shared with inference.py. The exact
 # window used here is written into the checkpoint config (and read back by
 # inference.load_model), so the two can never silently disagree.
@@ -102,7 +106,7 @@ DEFAULT_EPOCHS = 50
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_IMAGE_SIZE = 256
 LEARNING_RATE = 1e-4
-NUM_WORKERS = 4
+NUM_WORKERS = 0 if sys.platform == "win32" else 4
 
 SENTINEL1_BANDS = ["VV", "VH"]         # Sentinel-1: 2 bands
 SENTINEL2_BANDS = ["B02", "B03", "B04", "B08", "B11", "B12"]  # Sentinel-2: 6 bands
@@ -622,6 +626,14 @@ def train(
     print(f"\n{'='*70}")
     print(f"Training complete! Best validation Dice: {best_val_dice:.4f}")
     print(f"Model saved to: {output_path}")
+    # Record the hash beside the weights. inference.py refuses to load a
+    # checkpoint whose file does not match this digest, so the artifact that is
+    # evaluated and the artifact that is deployed stay the same bytes.
+    if output_path.is_file():
+        try:
+            print(f"Model SHA-256: {write_sidecar(output_path).name}")
+        except OSError as exc:
+            print(f"  ⚠ could not write the .sha256 sidecar: {exc}")
     print(f"{'='*70}")
 
     # Save training log
@@ -750,13 +762,14 @@ def main():
     )
 
     # DataLoaders
+    pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=NUM_WORKERS, pin_memory=True,
+        num_workers=NUM_WORKERS, pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True,
+        num_workers=NUM_WORKERS, pin_memory=pin_memory,
     )
 
     # Model
@@ -782,10 +795,16 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = BCEDiceLoss(bce_weight=0.5, dice_weight=0.5)
 
-    # Resume from checkpoint
+    # Resume from checkpoint. The resume file is the one checkpoint we read
+    # without a sidecar (it is written mid-run by this same process), but it is
+    # still deserialised with weights_only=True so a hostile file cannot run code.
     start_epoch = 0
     if args.resume and args.resume.exists():
-        checkpoint = torch.load(args.resume, map_location=device)
+        try:
+            checkpoint = load_checkpoint(args.resume, device=device, allow_unverified=True)
+        except ModelTrustError as exc:
+            print(f"❌ {exc}")
+            sys.exit(1)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"]
@@ -846,8 +865,8 @@ def create_synthetic_dataset(
         _synthetic_flood_coastal,
     ]
 
-    n_train = 200
-    n_val = 40
+    n_train = 16
+    n_val = 8
 
     train_filenames = []
     val_filenames = []

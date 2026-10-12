@@ -61,6 +61,10 @@ from s1_normalization import (
 # the fixture applies the same rule the real run does.
 from mask_postprocess import MIN_COMPONENT_PIXELS, remove_small_components  # noqa: E402
 
+# Checkpoints are pickles: safe_model is the only place this project loads one,
+# and it enforces weights_only=True plus a matching .sha256 sidecar (T35).
+from safe_model import ModelTrustError, load_checkpoint  # noqa: E402
+
 # Log-ratio change-detection baseline (used when no trained checkpoint exists).
 # A drop of this many dB between the before and after VV acquisitions is new
 # water: calm open water is specular, so it returns far less backscatter.
@@ -78,13 +82,28 @@ PERMANENT_WATER_NAME = "flood_mask_before.tif"
 VALID_MASK_NAME = "valid_mask.tif"
 
 
-def load_model(model_path: Path, device: torch.device) -> torch.nn.Module:
-    """Load trained model from checkpoint, plus the scaling it was trained with."""
+def load_model(
+    model_path: Path,
+    device: torch.device,
+    allow_unverified: bool = False,
+) -> torch.nn.Module:
+    """Load trained model from checkpoint, plus the scaling it was trained with.
+
+    The file is hash-checked and deserialised with weights_only=True before
+    anything from it is used; a tampered or unverifiable checkpoint stops the run
+    with a message rather than loading different weights than the ones evaluated.
+    """
     if not model_path.exists():
         print(f"❌ Model not found: {model_path}")
         sys.exit(1)
 
-    checkpoint = torch.load(model_path, map_location=device)
+    try:
+        checkpoint = load_checkpoint(
+            model_path, device=device, allow_unverified=allow_unverified
+        )
+    except ModelTrustError as exc:
+        print(f"\n❌ {exc}")
+        sys.exit(1)
 
     config = checkpoint.get("config", {})
     model_type = config.get("model_type", "unet")
@@ -741,6 +760,14 @@ def main():
         help=f"dB drop that counts as new water in baseline mode (default {BASELINE_THRESHOLD_DB})",
     )
     parser.add_argument(
+        "--trust-unverified-model",
+        action="store_true",
+        help=(
+            "Load a checkpoint that has no .sha256 sidecar (only for weights you "
+            "produced yourself; train_segmentation.py writes the sidecar)"
+        ),
+    )
+    parser.add_argument(
         "--min-component-pixels", type=int, default=MIN_COMPONENT_PIXELS,
         help=(
             f"Drop flood blobs smaller than this many pixels as speckle "
@@ -769,7 +796,9 @@ def main():
             f"(>{args.baseline_threshold} dB VV drop), no U-Net."
         )
     elif args.model is not None and Path(args.model).is_file():
-        model = load_model(args.model, device)
+        model = load_model(
+            args.model, device, allow_unverified=args.trust_unverified_model
+        )
     else:
         method = "log_ratio_baseline"
         print(
