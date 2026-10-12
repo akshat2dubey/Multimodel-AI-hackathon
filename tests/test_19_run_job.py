@@ -27,6 +27,10 @@ def dashboard(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "PIPELINE_TOKEN", "unit-test-token")
     monkeypatch.setattr(app_module, "_active_job", None)
     monkeypatch.setattr(app_module, "_active_proc", None)
+    # The rate limiter keeps per-client counters in the module; each test must
+    # start with a fresh budget or a later test would see 429 instead of the
+    # authorization/validation result it is actually asserting.
+    monkeypatch.setattr(app_module, "_post_times", {})
     app_module.app.config.update(TESTING=True)
     return app_module
 

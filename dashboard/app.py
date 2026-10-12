@@ -16,13 +16,17 @@ Open: http://localhost:5000
 import gzip
 import hmac
 import json
+import logging
+import logging.handlers
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import secrets
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +41,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from flask import Flask, g, jsonify, render_template, request, send_from_directory
+from werkzeug.exceptions import HTTPException
 
 from config.presets import (  # noqa: E402  (path set up above)
     AREA as CASE_STUDY_AREA,
@@ -81,6 +86,24 @@ CSP = (
 def _attach_csp_nonce():
     """One nonce per response, so only this page's own inline script may run."""
     g.csp_nonce = secrets.token_urlsafe(16)
+
+
+@app.errorhandler(Exception)
+def _handle_error(error):
+    """Answer with a short JSON error; keep the detail in the log.
+
+    A traceback or a stderr tail in an HTTP response tells an attacker about the
+    filesystem and the code path. The client gets an id instead, and the same id
+    appears in the log with the full detail.
+    """
+    if isinstance(error, HTTPException):
+        code = error.code or 500
+        log.info("http %s on %s", code, request.path)
+        return jsonify({"error": (error.name or "error").lower(), "status": code}), code
+
+    error_id = uuid.uuid4().hex
+    log.exception("unhandled error %s on %s", error_id, request.path)
+    return jsonify({"error": "internal error", "id": error_id}), 500
 
 
 @app.after_request
@@ -212,10 +235,86 @@ _SECRET_PATTERNS = (
     re.compile(r"\b[A-Za-z0-9_\-]{32,}\b"),
 )
 
+# Absolute paths: a drive letter, or a POSIX path under a common root.
+_ABSOLUTE_PATH = re.compile(
+    r"[A-Za-z]:\\[^\s\"'<>]+|(?<![\w<])/(?:home|Users|var|tmp|etc|opt|mnt|root)/[^\s\"'<>]+"
+)
+
+
+# ─── Logging ────────────────────────────────────────────────────────────────
+# One rotating file, redacted on the way in. The client never sees this detail:
+# it gets a short JSON error with an id, and the traceback stays in this file
+# keyed by the same id.
+LOG_DIR = ROOT / "logs"
+LOG_FILENAME = "jalnetra.log"
+
+
+class _RedactingFilter(logging.Filter):
+    """Mask secrets and local paths before anything reaches the log file."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 — never lose a log line to formatting
+            return True
+        cleaned = redact(message)
+        if cleaned != message:
+            record.msg = cleaned
+            record.args = ()
+        return True
+
+
+def _chmod_quietly(path: Path, bits: int) -> None:
+    """Owner-only permissions where the OS allows it; never fatal.
+
+    Kept here (above its callers) so _setup_logging runs at import time without
+    depending on a helper defined further down the module.
+    """
+    if not hasattr(os, "chmod"):
+        return
+    try:
+        os.chmod(path, bits)
+    except OSError:
+        pass
+
+
+def _setup_logging() -> logging.Logger:
+    logger = logging.getLogger("jalnetra")
+    if logger.handlers:                 # already configured in this process
+        return logger
+    logger.setLevel(logging.INFO)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _chmod_quietly(LOG_DIR, 0o700)
+        handler = logging.handlers.RotatingFileHandler(
+            LOG_DIR / LOG_FILENAME, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        handler.addFilter(_RedactingFilter())
+        logger.addHandler(handler)
+        _chmod_quietly(LOG_DIR / LOG_FILENAME, 0o600)
+    except OSError:
+        # A read-only checkout must not stop the dashboard from starting.
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+
+log = _setup_logging()
+
 
 def redact(text: str) -> str:
-    """Mask credentials before a line is stored or served."""
+    """Mask credentials and local paths before a line is stored or served.
+
+    The log tail is rendered in the browser, so a signed URL, an Authorization
+    header or a path printed by a download step must not reach the page or the
+    log file. The repo root becomes <repo> and any other absolute path <path>,
+    so a shared log does not carry the operator's directory layout.
+    """
     out = str(text)
+    out = out.replace(str(ROOT), "<repo>")
+    out = _ABSOLUTE_PATH.sub("<path>", out)
     out = _SECRET_PATTERNS[0].sub(
         lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}<redacted>", out
     )
@@ -367,6 +466,126 @@ def _pipeline_argv(params: dict) -> list[str]:
     return argv
 
 
+# ─── Resource limits (SEC-MID 6) ────────────────────────────────────────────
+# The dashboard is a single-user demo tool, so the limits are deliberately
+# simple and in-process: no new dependency, no shared state to keep in sync.
+MAX_BODY_BYTES = int(os.environ.get("JALNETRA_MAX_BODY", str(64 * 1024)))
+# Flask refuses to read a larger body, so an oversized POST is rejected before it
+# is parsed; the error handler turns it into a small JSON 413.
+app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
+RATE_LIMIT_POSTS = int(os.environ.get("JALNETRA_RATE_POSTS", "5"))
+RATE_LIMIT_WINDOW = 60.0                     # seconds
+# A real run downloads imagery and can legitimately take minutes, but a hung
+# job holding the single-job lock would freeze the demo, so it gets a ceiling.
+JOB_TIMEOUT_SECONDS = float(os.environ.get("JALNETRA_JOB_TIMEOUT", str(30 * 60)))
+# Floor of free space before a download starts; a full disk fails mid-download
+# and leaves half-written products behind.
+MIN_FREE_BYTES = int(os.environ.get("JALNETRA_MIN_FREE_MB", "2048")) * 1024 * 1024
+CACHE_MAX_BYTES = int(os.environ.get("JALNETRA_CACHE_MAX_MB", str(10 * 1024))) * 1024 * 1024
+CACHE_DIR = ROOT / "data" / "cache"
+
+_post_times: dict[str, list[float]] = {}     # client key -> monotonic timestamps
+
+
+def _client_key() -> str:
+    """Coarse client identity for rate limiting (never stored or logged)."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return (forwarded.split(",")[0].strip() or request.remote_addr or "local")[:64]
+
+
+def _rate_limited() -> bool:
+    """True when this client has exceeded POST RATE_LIMIT_POSTS per window."""
+    now = time.monotonic()
+    key = _client_key()
+    recent = [t for t in _post_times.get(key, []) if now - t < RATE_LIMIT_WINDOW]
+    if len(recent) >= RATE_LIMIT_POSTS:
+        _post_times[key] = recent
+        return True
+    recent.append(now)
+    _post_times[key] = recent
+    if len(_post_times) > 256:                # keep the table from growing forever
+        for stale in [k for k, v in _post_times.items() if not v or now - v[-1] > RATE_LIMIT_WINDOW]:
+            _post_times.pop(stale, None)
+    return False
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for entry in path.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _prune_cache() -> int:
+    """Delete the oldest cache files until the cache is under the cap.
+
+    Only files inside data/cache are touched, oldest first, so a re-run simply
+    re-downloads rather than failing.
+    """
+    if not CACHE_DIR.is_dir():
+        return 0
+    files = []
+    for entry in CACHE_DIR.rglob("*"):
+        try:
+            if entry.is_file():
+                files.append((entry.stat().st_mtime, entry.stat().st_size, entry))
+        except OSError:
+            continue
+    total = sum(size for _, size, _ in files)
+    removed = 0
+    for _, size, entry in sorted(files):
+        if total <= CACHE_MAX_BYTES:
+            break
+        try:
+            entry.unlink()
+            total -= size
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _capacity_error() -> str | None:
+    """A human-readable refusal when the machine cannot take another run."""
+    try:
+        free = shutil.disk_usage(str(ROOT)).free
+    except OSError:
+        return None                            # cannot measure: do not block the run
+    if free < MIN_FREE_BYTES:
+        return (f"not enough free disk space: {free // (1024 * 1024)} MB available, "
+                f"{MIN_FREE_BYTES // (1024 * 1024)} MB required")
+    if _dir_size(CACHE_DIR) > CACHE_MAX_BYTES:
+        removed = _prune_cache()
+        log.info("cache pruned before run: %s old file(s) removed", removed)
+    return None
+
+
+def _arm_timeout(proc, job: dict) -> None:
+    """Kill the job if it is still running after JOB_TIMEOUT_SECONDS.
+
+    A watchdog thread rather than a per-read check: the reader thread blocks on
+    the child's stdout, so it cannot notice a job that has gone quiet.
+    """
+    def _watchdog() -> None:
+        try:
+            proc.wait(timeout=JOB_TIMEOUT_SECONDS)
+            return                             # finished on its own
+        except subprocess.TimeoutExpired:
+            pass
+        job["state"] = "timeout"
+        job["step"] = "timeout"
+        job["error"] = f"the job exceeded {int(JOB_TIMEOUT_SECONDS)} s and was stopped"
+        log.warning("job %s timed out after %s s", job.get("run_id"), JOB_TIMEOUT_SECONDS)
+        _terminate(proc)
+
+    threading.Thread(target=_watchdog, name=f"jalnetra-timeout-{str(job.get('run_id'))[:8]}",
+                     daemon=True).start()
+
+
 def _terminate(proc) -> None:
     """Stop a running job, including the child processes it spawned.
 
@@ -418,6 +637,7 @@ def _launch_job(argv: list[str], params: dict) -> dict:
     global _active_proc
     _active_proc = proc
     _write_status(job)
+    _arm_timeout(proc, job)
 
     def _reader() -> None:
         seen: list[str] = []
@@ -439,7 +659,9 @@ def _launch_job(argv: list[str], params: dict) -> dict:
             with _job_lock:
                 job["exit_code"] = code
                 job["finished_utc"] = _utc_now()
-                if job["state"] != "cancelled":
+                # A cancelled or timed-out job already has a final state; the
+                # non-zero exit code those produce must not relabel it "failed".
+                if job["state"] not in ("cancelled", "timeout"):
                     if code == 0:
                         job["state"] = "done"
                         job["step"] = "finished"
@@ -987,6 +1209,15 @@ def api_start_run():
     error = _state_change_error()
     if error:
         return jsonify({"success": False, "error": error}), 403
+
+    if _rate_limited():
+        log.warning("rate limit hit on POST /api/runs")
+        return jsonify({"success": False,
+                        "error": "too many run requests — wait a minute and retry"}), 429
+
+    capacity = _capacity_error()
+    if capacity:
+        return jsonify({"success": False, "error": capacity}), 507
 
     global _active_job
     with _job_lock:
