@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-TOKEN_HEADER = {"X-Pipeline-Token": "unit-test-token"}
+TOKEN_HEADER = {"X-Jalnetra-Token": "unit-test-token"}
 VALID_BBOX = [10.0, 20.0, 11.0, 21.0]
 FAKE_RUN_ID = "11111111-1111-1111-1111-111111111111"
 
@@ -135,6 +135,49 @@ def test_cancel_marks_the_job_cancelled(dashboard, monkeypatch):
     assert dashboard._active_job is None, (
         "after a cancel the job slot must be free, or no further run could start"
     )
+
+
+def test_foreign_origin_is_rejected_even_with_the_right_token(dashboard, monkeypatch):
+    """A hostile page must not be able to start a run on this machine.
+
+    The browser attaches the attacker's Origin to a cross-origin POST, so this is
+    the check that stops a drive-by page from kicking off a download job even if
+    it somehow learned the token.
+    """
+    _stub_launch(dashboard, monkeypatch)
+    client = dashboard.app.test_client()
+
+    response = client.post(
+        "/api/runs",
+        json={"bbox": VALID_BBOX},
+        headers={**TOKEN_HEADER, "Origin": "http://evil.example"},
+    )
+
+    assert response.status_code == 403, (
+        f"a POST from http://evil.example returned {response.status_code}; it "
+        "must be refused"
+    )
+    assert dashboard._active_job is None, "no job may start for a foreign origin"
+
+    cancel = client.post("/api/cancel", headers={**TOKEN_HEADER, "Origin": "http://evil.example"})
+    assert cancel.status_code == 403
+
+
+def test_loopback_origin_is_accepted(dashboard, monkeypatch):
+    _stub_launch(dashboard, monkeypatch)
+    client = dashboard.app.test_client()
+
+    for origin in ("http://localhost:5000", "http://127.0.0.1:5077", "http://[::1]:5000"):
+        # Free the single job slot so each origin is tested on its own merit.
+        monkeypatch.setattr(dashboard, "_active_job", None)
+        response = client.post(
+            "/api/runs",
+            json={"bbox": VALID_BBOX},
+            headers={**TOKEN_HEADER, "Origin": origin},
+        )
+        assert response.status_code == 202, (
+            f"a same-origin POST from {origin} must be allowed, got {response.status_code}"
+        )
 
 
 def test_bad_bbox_is_rejected_before_any_process_starts(dashboard, monkeypatch):

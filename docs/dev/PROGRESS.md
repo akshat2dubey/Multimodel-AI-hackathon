@@ -38,16 +38,16 @@ Each row was checked against the code and by running the check, not by assuming.
 | Every script valid on empty inputs (exit 0) | **PASS** | `tests/test_07_empty_inputs.py` |
 | T06 sub-check: no wildcard CORS | **PASS** (fixed 2026-10-12) | `CORS(app)` removed. Live probe: `Origin: http://evil.example` → **no** `Access-Control-Allow-Origin` on `/api/status`, `/api/cutoffs`, `/api/damage`, `/api/flood-mask`. Guarded by `test_api_grants_no_cross_origin_read_access`. |
 | T06 sub-check: loopback bind + debug off | **PASS** | `test_server_binds_loopback_with_debug_off_by_default` passes |
-| T18 sub-check: token on state-changing routes | **PARTIAL** | No/wrong token → 403 (correct, fails closed). But Origin/Host allowlist is absent and the token is env-only (`JALNETRA_PIPELINE_TOKEN`), not generated at startup and injected into the page as T18 requires. |
+| T18 sub-check: token + Origin on state-changing routes | **PASS** (fixed 2026-10-12) | `X-Jalnetra-Token` is required on `/api/runs` and `/api/cancel` (absent/wrong → 403, compared with `hmac.compare_digest`). A foreign `Origin` is refused with 403 even when the token is right. When `JALNETRA_PIPELINE_TOKEN` is unset the token is generated with `secrets.token_urlsafe(32)`, printed once at startup and injected into the served page. `Host` is deliberately not second-guessed (see decisions). Verified live on 127.0.0.1:5078. |
 
 ### Gate verdict summary
 
-**8 PASS, 1 PARTIAL-with-fix-needed (T07), 2 PARTIAL (T03, T04), 1 OPEN (T18 Origin/token).**
+**9 PASS, 1 PARTIAL-with-fix-needed (T07), 2 PARTIAL (T03, T04).**
 
-Gate fixes completed 2026-10-12: **T06** (wildcard CORS removed, loopback/debug defaults) and
-**T16** (background job + status route + single-job lock), both with tests and a live check.
-Still open: **T18** (Origin/Host allowlist + startup-generated token), **T07** (re-run
-preprocessing on the confirmed AOI once H1/H2 land), **T03/T04** (move the demo scripts to
+Gate fixes completed 2026-10-12: **T06** (wildcard CORS removed, loopback/debug defaults),
+**T16** (background job + status route + single-job lock) and **T18** (token + Origin check on
+state-changing routes), each with tests and a live check. Still open: **T07** (re-run
+preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the demo scripts to
 `demo/`, strip the remaining case-study literals from docstrings and `demo.html`).
 
 ---
@@ -132,3 +132,8 @@ preprocessing on the confirmed AOI once H1/H2 land), **T03/T04** (move the demo 
   kept as an alias of `/api/runs` so the existing UI and tests keep working.
 - **T06 decision**: `JALNETRA_HOST` / `JALNETRA_DEBUG` are the documented knobs; the older
   `HOST` / `FLASK_DEBUG` names are still honoured so existing commands do not break.
+- **T18 decision (Host header not enforced)**: the plan says "check Origin/Host against an
+  allowlist". Only `Origin` is enforced. The practical attack a Host check targets — DNS
+  rebinding — already carries the attacker's `Origin`, which is rejected, and enforcing Host
+  would refuse the documented LAN demo (`JALNETRA_HOST=0.0.0.0`) without adding protection.
+  A missing `Origin` is allowed (curl/CLI/tests cannot be a cross-site browser request).

@@ -307,6 +307,11 @@
 </div>
 
 <script>
+// The token for this server process, injected by the "/" route in
+// dashboard/app.py. Keeping it in the page means the operator never has to copy
+// a secret out of the console to run their own demo. It is never in a URL.
+const JALNETRA_TOKEN = "{{ pipeline_token }}";
+
 // ─── Map Initialization ────────────────────────────────
 // The centre comes from /api/status (config/presets.py) on first load; this is
 // only the placeholder shown for the moment before that response lands.
@@ -737,7 +742,9 @@ let runPollTimer = null;
 const aoiDraw = { active: false, start: null, rect: null };
 
 function pipelineToken() {
-  // State-changing routes are token-gated server-side. Ask once, then remember.
+  // Injected by the server (see the "/" route). The prompt is only a fallback
+  // for a page served without the injection, e.g. a saved copy of the HTML.
+  if (typeof JALNETRA_TOKEN === 'string' && JALNETRA_TOKEN) { return JALNETRA_TOKEN; }
   let token = window.localStorage.getItem('jalnetra_pipeline_token');
   if (!token) {
     token = window.prompt('Pipeline token (printed by the server on startup):') || '';
@@ -773,7 +780,7 @@ async function startRun(body) {
   try {
     const resp = await fetch('/api/runs', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Pipeline-Token': token },
+      headers: { 'Content-Type': 'application/json', 'X-Jalnetra-Token': token },
       body: JSON.stringify(body)
     });
     const data = await resp.json().catch(() => ({}));
@@ -879,7 +886,7 @@ document.getElementById('btn-cancel-run').addEventListener('click', async functi
   if (!token) { return; }
   const resp = await fetch('/api/cancel', {
     method: 'POST',
-    headers: { 'X-Pipeline-Token': token }
+    headers: { 'X-Jalnetra-Token': token }
   });
   const data = await resp.json().catch(() => ({}));
   setRunStatus(resp.ok ? '■ Cancelling…' : '❌ ' + (data.error || 'cancel failed'));

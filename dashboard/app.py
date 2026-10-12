@@ -20,10 +20,12 @@ import os
 import re
 import subprocess
 import sys
+import secrets
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # The dashboard is normally started as `cd dashboard && python app.py`, so the
 # project root is NOT on sys.path. Add it before importing config.presets — the
@@ -71,10 +73,26 @@ else:
 DATA = DATA_DIR
 
 # State-changing routes spawn a long download+compute job, so they must not be
-# callable by anyone who can reach the port. Without a configured token these
-# endpoints refuse every request (fail closed).
-PIPELINE_TOKEN = os.environ.get("JALNETRA_PIPELINE_TOKEN", "")
-PIPELINE_TOKEN_HEADER = "X-Pipeline-Token"
+# callable by anyone who can reach the port.
+#
+# The token is either configured (JALNETRA_PIPELINE_TOKEN) or generated for this
+# process. Generating it means an operator does not have to invent one before a
+# demo; it is printed ONCE at startup and injected into the served page so the
+# same-origin UI can call the run routes without anyone copying it around. It is
+# never put in a URL, never written to run_meta.json and never logged.
+#
+# A foreign page cannot read the dashboard page to steal the token (the app
+# grants no cross-origin read access, T06) and cannot post to these routes (the
+# Origin check below rejects it), so the token stays unreachable off-origin.
+TOKEN_FROM_ENV = os.environ.get("JALNETRA_PIPELINE_TOKEN", "").strip()
+PIPELINE_TOKEN = TOKEN_FROM_ENV or secrets.token_urlsafe(32)
+TOKEN_IS_GENERATED = not TOKEN_FROM_ENV
+PIPELINE_TOKEN_HEADER = "X-Jalnetra-Token"
+
+# An Origin is accepted only when it names this machine's loopback interface.
+# Loopback covers `localhost`, `127.0.0.1` and IPv6 `::1`, on any port, so a dev
+# server on a free port is not blocked by its own allowlist.
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 # ─── Background pipeline job ────────────────────────────────────────────────
@@ -480,8 +498,13 @@ def load_flood_mask_info() -> dict | None:
 
 @app.route("/")
 def index():
-    """Serve the main dashboard page."""
-    return render_template("index.html")
+    """Serve the main dashboard page.
+
+    The pipeline token is injected here so this page can drive the run routes
+    without the operator copying it out of the console. It is never placed in a
+    URL, and a foreign page cannot read this response (no CORS, T06).
+    """
+    return render_template("index.html", pipeline_token=PIPELINE_TOKEN)
 
 
 @app.route("/api/status")
@@ -756,11 +779,44 @@ def demo_mode():
 
 
 def _token_ok() -> bool:
-    """State-changing routes fail closed: no configured token means no access."""
+    """True when the request carries this process's token.
+
+    Compared with hmac.compare_digest so a wrong guess cannot be narrowed down by
+    timing. An empty configured token still fails closed.
+    """
     supplied = request.headers.get(PIPELINE_TOKEN_HEADER, "")
     if not PIPELINE_TOKEN:
         return False
     return hmac.compare_digest(supplied, PIPELINE_TOKEN)
+
+
+def _origin_allowed(origin: str | None) -> bool:
+    """True when a state-changing request may come from this Origin.
+
+    A browser always attaches Origin to a cross-origin POST, so a hostile page is
+    rejected here even though its request looks otherwise identical to the real
+    UI's. A missing Origin (curl, the Flask test client, a non-browser caller)
+    cannot be a cross-site browser attack and is allowed — DNS rebinding is
+    covered too, because a rebound request still carries the attacker's Origin.
+
+    The Host header is deliberately not second-guessed: the server binds
+    loopback by default, and rejecting a Host that is not loopback would break
+    the documented LAN demo (JALNETRA_HOST=0.0.0.0) without blocking anything the
+    Origin check does not already stop.
+    """
+    if not origin:
+        return True
+    host = (urlsplit(origin).hostname or "").lower()
+    return host in LOOPBACK_HOSTS
+
+
+def _state_change_error() -> str:
+    """Empty string when a state-changing request is allowed, else the reason."""
+    if not _origin_allowed(request.headers.get("Origin")):
+        return "Forbidden: cross-origin requests are not allowed."
+    if not _token_ok():
+        return "Forbidden: missing or invalid pipeline token."
+    return ""
 
 
 @app.route("/api/runs", methods=["POST"])
@@ -776,11 +832,9 @@ def api_start_run():
     stack) multi-minute download jobs. The request returns immediately and the
     UI polls /api/run-status, so the page never freezes during a live demo.
     """
-    if not _token_ok():
-        return jsonify({
-            "success": False,
-            "error": "Forbidden: missing or invalid pipeline token.",
-        }), 403
+    error = _state_change_error()
+    if error:
+        return jsonify({"success": False, "error": error}), 403
 
     global _active_job
     with _job_lock:
@@ -823,11 +877,9 @@ def api_run_status():
 @app.route("/api/cancel", methods=["POST"])
 def api_cancel_run():
     """Kill switch: stop the active job (and the children it spawned)."""
-    if not _token_ok():
-        return jsonify({
-            "success": False,
-            "error": "Forbidden: missing or invalid pipeline token.",
-        }), 403
+    error = _state_change_error()
+    if error:
+        return jsonify({"success": False, "error": error}), 403
 
     global _active_job, _active_proc
     with _job_lock:
@@ -869,4 +921,8 @@ if __name__ == "__main__":
 Jalnetra Dashboard — Open: http://{host}:{port}  (debug={debug})\
 Features: flood map, OSM damage, cut-offs, report, flood path\
 ')
+    if TOKEN_IS_GENERATED:
+        # Printed exactly once, here, and never logged: this is the operator's
+        # copy for curl/CLI use. The served page already carries it for the UI.
+        print("Pipeline token: " + PIPELINE_TOKEN)
     app.run(host=host, port=port, debug=debug)
