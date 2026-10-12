@@ -30,7 +30,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from flask import Flask, jsonify, render_template, request, send_from_directory
-from flask_cors import CORS
 
 from config.presets import (  # noqa: E402  (path set up above)
     AREA as CASE_STUDY_AREA,
@@ -46,7 +45,10 @@ from config.presets import (  # noqa: E402  (path set up above)
 from config.run_meta import load_run_meta  # noqa: E402
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
-CORS(app)
+# No CORS: the dashboard page and its API are served from the same origin, so the
+# browser never needs cross-origin permission. `CORS(app)` reflected any Origin
+# back as Access-Control-Allow-Origin, which let any page you happened to visit
+# read every result while the dashboard was running.
 
 # results/ is the one directory the whole pipeline writes to; importing it from
 # config keeps the dashboard and run_pipeline.py from drifting apart.
@@ -498,12 +500,18 @@ if __name__ == "__main__":
         # Windows ships with PORT=0 in some environments, which makes Flask bind
         # a random port and the printed URL useless. Fall back to 5000.
         port = 5000
-    # Debug (and with it the interactive Werkzeug debugger and the auto-reloader)
-    # is OFF unless explicitly asked for: it must never be on for a demo a judge
-    # can reach. FLASK_DEBUG=1 opts in.
-    debug = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes", "on")
-    # Bind loopback by default. Set HOST=0.0.0.0 explicitly for a LAN demo.
-    host = os.environ.get("HOST", "127.0.0.1")
+    # Bind loopback by default: the dashboard has no login, so binding 0.0.0.0
+    # puts every result on whatever Wi-Fi the demo box is attached to.
+    # JALNETRA_HOST=0.0.0.0 opts in explicitly (HOST is the older name, still
+    # honoured so existing commands keep working).
+    host = os.environ.get("JALNETRA_HOST") or os.environ.get("HOST") or "127.0.0.1"
+    # The Werkzeug debugger is a live Python REPL: anyone who can reach a
+    # traceback gets code execution on this machine. So debug is enabled only
+    # when it is explicitly asked for AND the server is bound to loopback.
+    _wants_debug = (
+        os.environ.get("JALNETRA_DEBUG") or os.environ.get("FLASK_DEBUG") or "0"
+    ).lower() in ("1", "true", "yes", "on")
+    debug = _wants_debug and host in ("127.0.0.1", "localhost", "::1")
     print(f'\
 Jalnetra Dashboard — Open: http://{host}:{port}  (debug={debug})\
 Features: flood map, OSM damage, cut-offs, report, flood path\

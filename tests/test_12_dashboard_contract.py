@@ -4,6 +4,7 @@ Three things must hold before the pipeline has ever run:
   * every GET route answers 200 on an empty results directory (a 500 or a 404
     turns the demo into an error page the moment a judge opens it);
   * the server binds loopback with the debugger off by default;
+  * the API hands out no cross-origin read access (the dashboard is same-origin);
   * POST /api/run-pipeline refuses without the shared token (it starts a
     multi-minute download job; a public port must not be able to trigger it).
 """
@@ -103,6 +104,26 @@ def test_run_pipeline_rejects_a_wrong_token(empty_dashboard, monkeypatch):
     assert response.status_code == 403, (
         f"a wrong token must be rejected, got {response.status_code}"
     )
+
+
+def test_api_grants_no_cross_origin_read_access(empty_dashboard):
+    """A same-origin dashboard must not reflect an Origin back to the caller.
+
+    With flask_cors' ``CORS(app)`` the requesting origin is echoed into
+    Access-Control-Allow-Origin, so any website the user visits while the
+    dashboard is running could read the flood extent and damage numbers. The
+    dashboard page and its API share an origin, so no such header may appear.
+    """
+    app_module, _ = empty_dashboard
+    client = app_module.app.test_client()
+
+    for route in ("/api/status", "/api/cutoffs", "/api/damage", "/api/flood-mask"):
+        response = client.get(route, headers={"Origin": "http://evil.example"})
+        allowed = response.headers.get("Access-Control-Allow-Origin")
+        assert allowed is None, (
+            f"GET {route} answered Access-Control-Allow-Origin: {allowed!r}; the "
+            "dashboard is same-origin and must not grant cross-origin reads."
+        )
 
 
 def _free_port() -> int:
