@@ -49,6 +49,9 @@ if str(_ROOT) not in sys.path:
 from config.presets import DEFAULT_EXTENT  # noqa: E402
 from config.run_meta import resolve_bbox  # noqa: E402
 
+# HTTPS-only fetch wrapper (T36).
+from net_safe import urlopen  # noqa: E402
+
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -118,7 +121,7 @@ def fetch_tile(tile: str, dest_dir: Path) -> Path:
     print(f"  GET {url}")
 
     try:
-        with urllib.request.urlopen(url, timeout=120) as resp:
+        with urlopen(url, timeout=120) as resp:
             data = resp.read()
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"HTTP {exc.code} — tile {tile} does not exist in the bucket") from exc

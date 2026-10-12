@@ -49,6 +49,9 @@ if str(_ROOT) not in sys.path:
 from config.presets import DEFAULT_EXTENT, EVENT_DATE  # noqa: E402
 from config.run_meta import resolve_bbox  # noqa: E402
 
+# Every outbound fetch goes through the HTTPS-only wrapper (T36).
+from net_safe import urlopen  # noqa: E402
+
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -91,7 +94,7 @@ def overpass_ql(
                 OVERPASS_API, data=data,
                 headers={"Accept": "application/json", "User-Agent": USER_AGENT},
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urlopen(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8")
                 ct = resp.headers.get("Content-Type", "")
                 if "json" not in ct:
@@ -185,7 +188,7 @@ def ohsome_count(
     url = f"{OHSOME_API}/elements/count?{urllib.parse.urlencode(params)}"
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urlopen(req, timeout=90) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         value = int(payload["result"][0]["value"])
         print(f"  ℹ️ ohsome official count [{label}]: {value:,}")
@@ -203,7 +206,7 @@ def ohsome_query(endpoint: str, params: dict[str, Any], timeout: int = 60) -> di
     print(f"  GET {full_url[:120]}{'...' if len(full_url) > 120 else ''}")
     try:
         req = urllib.request.Request(full_url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as e:
         return {"error": str(e)}

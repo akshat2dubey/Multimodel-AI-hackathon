@@ -1,5 +1,8 @@
 # Jalnetra — runtime dependencies
-# Verified working on Python 3.14 (Windows), cp314 wheels available for all of these.
+# Verified on Python 3.14.2 (Windows, this project's development machine): the full
+# test suite passes and every wheel resolves from PyPI. Python 3.10-3.12 should work
+# (nothing here is 3.13+ only) but was NOT tested for this submission — treat the
+# 3.14 statement as the verified one.
 #
 #   python -m pip install -r requirements.txt
 #
@@ -19,12 +22,19 @@ numpy>=1.24
 networkx>=3.0          # cut-off settlement reachability (BFS over road graph)
 
 # --- Deep learning (flood segmentation) ------------------------------------
+# scripts/inference.py imports torch unconditionally (the flood mask comes from
+# either the U-Net or the log-ratio baseline computed with torch tensors), so
+# this is a required dependency, not an extra. It is by far the heaviest one:
+# ~250 MB of CPU wheels. If a machine cannot take it, the honest alternative is
+# not to run inference there — there is no torch-free mask path today.
 torch>=2.0             # CPU wheels are the default on Windows
 torchvision>=0.15      # ResNet-34 encoder for ResNetUNet
 
 # --- Dashboard -------------------------------------------------------------
+# Flask only: the dashboard and its API share one origin, so no CORS package is
+# installed (or imported). flask-cors was a declared dependency that nothing
+# used; it was removed in T36.
 flask>=3.0
-flask-cors>=6.0
 
 # --- Progress + CLI --------------------------------------------------------
 tqdm>=4.65

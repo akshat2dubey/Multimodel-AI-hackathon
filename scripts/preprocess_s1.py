@@ -33,6 +33,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -324,6 +326,7 @@ def preprocess_product(
 
     import requests as _requests
 
+    # nosec B105 — this is the public Sentinel Hub OAuth endpoint, not a secret.
     token_url = "https://services.sentinel-hub.com/api/v1/auth/token"
     try:
         token_r = _requests.post(
@@ -398,9 +401,8 @@ def preprocess_product(
             vv = src.read(1)
             vh = src.read(2)
             crs_epsg = src.crs.to_epsg() or 4326
-            t = src.transform
-            w2, s2, e2, n2 = t * (0, 0, src.width, src.height)
-            bbox = (float(w2), float(s2), float(e2), float(n2))
+            b = src.bounds
+            bbox = (float(b.left), float(b.bottom), float(b.right), float(b.top))
             width = src.width
             height = src.height
     finally:
