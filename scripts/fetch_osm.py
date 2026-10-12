@@ -3,8 +3,9 @@
 Fetch pre-event OpenStreetMap data via the ohsome API.
 
 The ohsome API (https://api.ohsome.org/v1) provides access to OSM history data
-with time-based queries. We need a snapshot BEFORE the flood event (26 Aug 2026).
-The latest available snapshot as of the hackathon is 27 July 2026.
+with time-based queries. We need a snapshot BEFORE the flood event; the event
+and snapshot dates are arguments (--event-date / --snapshot-date), and a
+run_pipeline.py run resolves them into results/run_meta.json.
 
 Data to fetch (all as of snapshot date):
   - Buildings (osm_type=building)
@@ -15,12 +16,17 @@ Data to fetch (all as of snapshot date):
 
 Usage:
     python fetch_osm.py \
-        --center-lat 28.3 --center-lon 85.7 \
-        --snapshot-date 2026-07-27 \
+        --bbox <min_lon,min_lat,max_lon,max_lat>   # PRIMARY AOI input \
+        --snapshot-date <YYYY-MM-DD>               # pre-event snapshot \
+        --event-date <YYYY-MM-DD>                  # the flood event \
         --output ./data/osm
 
-⚠️ CRITICAL RULE: Do NOT use OSM data edited AFTER 26 August 2026.
-Only pre-event snapshot data may be used as input.
+    --bbox is the PRIMARY area-of-interest input; --center-lat/--center-lon with
+    an optional --extent is only a fallback.
+
+⚠️ CRITICAL RULE: the snapshot must be BEFORE the event date. OSM edits made
+after the event are prohibited as input (checked below and centrally in
+config/run_meta.py).
 """
 
 import argparse
@@ -34,6 +40,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# Project root on sys.path so `config.*` resolves whether this is run as
+# `python scripts/fetch_osm.py` or from anywhere else.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.presets import DEFAULT_EXTENT, EVENT_DATE  # noqa: E402
+from config.run_meta import resolve_bbox  # noqa: E402
+
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -44,7 +59,8 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 
 # Overpass API endpoint with historical (attic) data.
 # [date:"..."] selects the OSM state AS OF that timestamp — the pre-event snapshot
-# required by the hackathon rules (no post-2026-08-26 edits may be used as input).
+# required by the hackathon rules (no post-event edits may be used as input).
+# The event date itself is an argument (--event-date), never a literal here.
 #
 # Why not ohsome for geometry? Verified live 2026-10-09:
 #   - /elements/geometry returns HTTP 403 (Apache-level block on the public host)
@@ -199,6 +215,7 @@ def fetch_osm_features(
     bbox: tuple[float, float, float, float],
     output_dir: Path,
     timeout: int = 120,
+    event_date: str | None = None,
 ) -> dict[str, Path]:
     """
     Fetch all required OSM feature types for the study area.
@@ -206,6 +223,7 @@ def fetch_osm_features(
     Returns dict mapping feature type → path to saved GeoJSON file.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    event_date = event_date or EVENT_DATE
 
     results: dict[str, Path] = {}
     counts: dict[str, int | None] = {}
@@ -247,6 +265,7 @@ def fetch_osm_features(
     # Write a combined metadata file
     meta = {
         "snapshot_date": snapshot_date,
+        "event_date": event_date,
         "area_center": [center_lat, center_lon],
         "bbox": list(bbox),
         "feature_counts": counts,
@@ -255,7 +274,10 @@ def fetch_osm_features(
         "overpass_url": OVERPASS_API,
         "ohsome_url": OHSOME_API,
         "attribution": "© OpenStreetMap contributors (ODbL)",
-        "note": "Pre-event OSM snapshot — data edits after 2026-08-26 are NOT included",
+        "note": (
+            f"Pre-event OSM snapshot — data edits after {event_date} are NOT "
+            "included"
+        ),
     }
     meta_path = output_dir / "osm_metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -266,32 +288,40 @@ def fetch_osm_features(
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch pre-event OSM data via ohsome API")
-    parser.add_argument("--center-lat", type=float, required=True, help="Center latitude")
-    parser.add_argument("--center-lon", type=float, required=True, help="Center longitude")
+    parser.add_argument(
+        "--bbox",
+        help=(
+            "PRIMARY area of interest: min_lon,min_lat,max_lon,max_lat. "
+            "Falls back to --center-lat/--center-lon/--extent when omitted."
+        ),
+    )
+    parser.add_argument("--center-lat", type=float, default=None,
+                        help="Fallback AOI centre latitude (prefer --bbox)")
+    parser.add_argument("--center-lon", type=float, default=None,
+                        help="Fallback AOI centre longitude (prefer --bbox)")
+    parser.add_argument("--extent", type=float, default=DEFAULT_EXTENT,
+                        help=f"Fallback half-width in degrees (default {DEFAULT_EXTENT})")
     parser.add_argument("--snapshot-date", required=True, help="OSM snapshot date (YYYY-MM-DD)")
+    parser.add_argument("--event-date", default=EVENT_DATE,
+                        help="Flood event date (YYYY-MM-DD); the snapshot must precede it")
     parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--bbox", help="Bounding box: min_lon,min_lat,max_lon,max_lat")
     args = parser.parse_args()
 
-    center_lat, center_lon = args.center_lat, args.center_lon
-    half_extent = 0.3  # ~30km buffer
-
-    if args.bbox:
-        parts = [float(x) for x in args.bbox.split(",")]
-        min_lon, min_lat, max_lon, max_lat = parts
-    else:
-        min_lon = center_lon - half_extent
-        min_lat = center_lat - half_extent
-        max_lon = center_lon + half_extent
-        max_lat = center_lat + half_extent
-
+    try:
+        bbox = resolve_bbox(args.bbox, args.center_lat, args.center_lon, args.extent)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    min_lon, min_lat, max_lon, max_lat = bbox
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
     output_dir = Path(args.output)
 
     # Validate snapshot date is before the event
     snapshot_dt = datetime.strptime(args.snapshot_date, "%Y-%m-%d")
-    event_dt = datetime(2026, 8, 26)
+    event_dt = datetime.strptime(args.event_date, "%Y-%m-%d")
     if snapshot_dt >= event_dt:
-        print(f"❌ Snapshot date {args.snapshot_date} is NOT before the event date (2026-08-26)!")
+        print(f"❌ Snapshot date {args.snapshot_date} is NOT before the event date ({args.event_date})!")
         print(f"   Using OSM data after the event as INPUT is prohibited and leads to disqualification.")
         sys.exit(1)
 
@@ -302,7 +332,7 @@ def main():
 ║     Center:        ({center_lat:.4f}, {center_lon:.4f})          ║
 ║     Bounding box:  [{min_lon:.3f}, {min_lat:.3f},             ║
 ║                      {max_lon:.3f}, {max_lat:.3f}]             ║
-║     Snapshot date: {args.snapshot_date}  (must be < 2026-08-26)    ║
+║     Snapshot date: {args.snapshot_date}  (must be < {args.event_date})    ║
 ║     API:           {OHSOME_API}                 ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
@@ -313,6 +343,7 @@ def main():
         snapshot_date=args.snapshot_date,
         bbox=(min_lon, min_lat, max_lon, max_lat),
         output_dir=output_dir,
+        event_date=args.event_date,
     )
 
     print(f"""

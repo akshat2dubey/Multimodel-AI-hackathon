@@ -15,8 +15,12 @@ area of interest is downloaded and mosaicked into a single GeoTIFF.
 
 Usage:
     python download_dem.py \
-        --center-lat 28.3 --center-lon 85.7 \
+        --bbox <min_lon,min_lat,max_lon,max_lat> \
         --output ./data/dem
+
+    --bbox is the PRIMARY area-of-interest input; --center-lat/--center-lon with
+    an optional --half-extent is only a fallback. Case-study values live in
+    config/presets.py and, for a resolved run, in results/run_meta.json.
 
 Attribution (required in any published output):
     "Produced using Copernicus WorldDEM-30 - DLR e.V. 2010-2014 and
@@ -35,6 +39,15 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# Project root on sys.path so `config.*` resolves whether this is run as
+# `python scripts/download_dem.py` or from anywhere else.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.presets import DEFAULT_EXTENT  # noqa: E402
+from config.run_meta import resolve_bbox  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
@@ -154,24 +167,28 @@ def mosaic(tiles: list[Path], output: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download Copernicus DEM tiles")
-    parser.add_argument("--center-lat", type=float, required=True)
-    parser.add_argument("--center-lon", type=float, required=True)
+    parser.add_argument(
+        "--bbox",
+        help=(
+            "PRIMARY area of interest: min_lon,min_lat,max_lon,max_lat. "
+            "Falls back to --center-lat/--center-lon/--half-extent when omitted."
+        ),
+    )
+    parser.add_argument("--center-lat", type=float, default=None,
+                        help="Fallback AOI centre latitude (prefer --bbox)")
+    parser.add_argument("--center-lon", type=float, default=None,
+                        help="Fallback AOI centre longitude (prefer --bbox)")
     parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--half-extent", type=float, default=0.3, help="Half extent in degrees")
-    parser.add_argument("--bbox", help="Bounding box: min_lon,min_lat,max_lon,max_lat")
+    parser.add_argument("--half-extent", type=float, default=DEFAULT_EXTENT,
+                        help=f"Fallback half-width in degrees (default {DEFAULT_EXTENT})")
     args = parser.parse_args()
 
-    if args.bbox:
-        parts = [float(x) for x in args.bbox.split(",")]
-        if len(parts) != 4:
-            print("❌ --bbox must be min_lon,min_lat,max_lon,max_lat", file=sys.stderr)
-            return 1
-        min_lon, min_lat, max_lon, max_lat = parts
-    else:
-        min_lon = args.center_lon - args.half_extent
-        min_lat = args.center_lat - args.half_extent
-        max_lon = args.center_lon + args.half_extent
-        max_lat = args.center_lat + args.half_extent
+    try:
+        bbox = resolve_bbox(args.bbox, args.center_lat, args.center_lon, args.half_extent)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    min_lon, min_lat, max_lon, max_lat = bbox
 
     output_dir = Path(args.output)
     tiles = tile_names(min_lon, min_lat, max_lon, max_lat)

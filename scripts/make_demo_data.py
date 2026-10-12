@@ -12,14 +12,20 @@ situation report and the dashboard all stay empty.
 This script fabricates a *geometrically realistic but entirely synthetic*
 scene over the Bhote Koshi - Trishuli corridor:
 
-  data/dem/dem.tif                         valley DEM (WorldDEM-30 stand-in)
-  data/sentinel1/before/*_VV.tif *_VH.tif  pre-event radar (dB)
-  data/sentinel1/after/*_VV.tif  *_VH.tif  post-event radar (dB)
-  data/sentinel2/before|after/s2_*_B0x.tif optical bands + SCL
-  data/osm/*.geojson                       buildings/roads/bridges/hospitals/settlements
-  results/flood_mask.tif                   reference flood extent (soft probability)
-  results/flood_mask_before.tif            reference pre-event water extent
-  results/change_detection.json            change-detection statistics
+  data_demo/dem/dem.tif                        valley DEM (WorldDEM-30 stand-in)
+  data_demo/sentinel1/before/*_VV.tif *_VH.tif pre-event radar (dB)
+  data_demo/sentinel1/after/*_VV.tif  *_VH.tif post-event radar (dB)
+  data_demo/sentinel2/before|after/s2_*_B0x.tif optical bands + SCL
+  data_demo/osm/*.geojson                      buildings/roads/bridges/hospitals/settlements
+  results_demo/flood_mask.tif                  newly flooded only (reference mask)
+  results_demo/water_after.tif                 all post-event water (soft probability)
+  results_demo/flood_mask_before.tif           pre-event water = permanent-water mask
+  results_demo/valid_mask.tif                  pixels the scene actually observed
+  results_demo/change_detection.json           change-detection statistics
+
+Neither directory is data/ or results/. Those hold the real downloads and the
+real pipeline output, and this script refuses to write into them (or to overwrite
+any input file it did not create itself) unless --force is passed.
 
 THE OUTPUT IS NOT REAL EARTH OBSERVATION DATA. It must never be presented as
 measurements of the August 2026 Nepal event, and none of it belongs in the
@@ -46,8 +52,30 @@ import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+# The same speckle rule the real inference applies, so flood_mask.tif from the
+# fixture and from a real run are the same kind of object.
+from mask_postprocess import MIN_COMPONENT_PIXELS, remove_small_components
 from shapely import affinity
 from shapely.geometry import LineString, Point, box, mapping
+
+# The project root must be importable so config.presets resolves whether this is
+# run as `python scripts/make_demo_data.py` or imported by run_offline.py.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.presets import (  # noqa: E402  (path set up above)
+    CENTER_LAT,
+    CENTER_LON,
+    DATA_DEMO_NAME,
+    DEMO_NOTICE_FILENAME,
+    FIXTURE_EXTENT as DEFAULT_EXTENT_DEG,
+    EVENT_DATE,
+    OSM_SNAPSHOT_DATE,
+    RESULTS_DEMO_NAME,
+    RESULTS_NAME,
+)
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
@@ -60,10 +88,16 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 # Scene definition
 # ----------------------------------------------------------------------------
 
-DEFAULT_CENTER = (28.30, 85.70)  # Bhote Koshi -> Trishuli corridor
-DEFAULT_EXTENT = 0.50            # degrees, square scene
+# Case-study geometry lives in config/presets.py — this module fabricates a
+# synthetic scene for it, and must not fork the coordinates.
+DEFAULT_CENTER = (CENTER_LAT, CENTER_LON)  # Bhote Koshi -> Trishuli corridor
+DEFAULT_EXTENT = DEFAULT_EXTENT_DEG        # degrees, square scene
 DEFAULT_SIZE = 640               # pixels per side
-DEFAULT_SEED = 20260826          # deterministic: same event date every run
+DEFAULT_SEED = 20260826          # deterministic: same scene every run
+
+# Written into a generated data directory to record that this script owns its
+# contents. Its absence is what stops a demo run from clobbering real downloads.
+GENERATOR_MARKER = ".generated_by_make_demo_data"
 
 # Villages, ordered upstream (Tibet border) -> downstream (Trishuli/Dhading).
 # `progress` is position along the river, 0 = source, 1 = outlet.
@@ -471,6 +505,48 @@ def write_geojson(path: Path, features, metadata):
 
 
 # ----------------------------------------------------------------------------
+# Clobber protection
+# ----------------------------------------------------------------------------
+
+def unmarked_contents(directory: Path) -> list[Path]:
+    """Files in `directory` that this script did not write.
+
+    A directory is considered ours only when it carries GENERATOR_MARKER, which
+    is dropped after a successful run. Anything else — the 258 MB Copernicus DEM
+    already in data/, a real Sentinel scene, an OSM snapshot — counts as foreign
+    evidence, and overwriting it would destroy the only real input in the repo.
+    """
+    if not directory.is_dir():
+        return []
+    if (directory / GENERATOR_MARKER).is_file():
+        return []
+    return sorted(p for p in directory.rglob("*") if p.is_file())
+
+
+def refuse_if_occupied(directory: Path, flag: str, force: bool) -> bool:
+    """Return True when it is safe to write into `directory`."""
+    if force:
+        return True
+    foreign = unmarked_contents(directory)
+    if not foreign:
+        return True
+    shown = "\n".join(f"    {p}" for p in foreign[:8])
+    more = f"\n    ... and {len(foreign) - 8} more" if len(foreign) > 8 else ""
+    print(
+        f"\n  ✋ refusing to write into {directory}: it already holds "
+        f"{len(foreign)} file(s) this script did not generate.\n"
+        f"{shown}{more}\n\n"
+        f"  Those may be real downloads. Overwriting them would destroy evidence\n"
+        f"  that cannot be re-downloaded without a Copernicus account.\n\n"
+        f"  Pick one:\n"
+        f"    {flag} <empty-dir>   build the demo somewhere else\n"
+        f"    --force          overwrite anyway (only if you are certain)\n",
+        file=sys.stderr,
+    )
+    return False
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -484,13 +560,42 @@ def main():
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--root", type=Path, default=None,
                         help="Project root (default: scripts/..)")
+    parser.add_argument("--data-dir", type=Path, default=None,
+                        help="Where the synthetic inputs go. Default: "
+                             f"<root>/{DATA_DEMO_NAME}, NOT data/ — that tree holds "
+                             "real downloads, and this script will not overwrite "
+                             "files it did not create")
+    parser.add_argument("--results-dir", type=Path, default=None,
+                        help="Where the synthetic results go. Default: "
+                             f"<root>/{RESULTS_DEMO_NAME} (kept OUT of results/ so a "
+                             "demo run can never be mistaken for a real one)")
+    parser.add_argument("--force", action="store_true",
+                        help="Allow writing into a non-empty directory this script "
+                             "did not generate, or into results/")
     parser.add_argument("--after-cloud-cover", type=float, default=38.0,
                         help="Simulated cloud cover %% in the post-event S2 scene")
     args = parser.parse_args()
 
     root = args.root or Path(__file__).resolve().parent.parent
-    data = root / "data"
-    results = root / "results"
+    # Demo inputs go to data_demo/, NOT data/: data/ holds the real Copernicus DEM
+    # and the real satellite/OSM downloads, and this script's output is fabricated.
+    data = args.data_dir or (root / DATA_DEMO_NAME)
+    # Demo output goes to results_demo/, NOT results/. Keeping them apart is what
+    # lets the dashboard tell a fabricated fixture from a real run.
+    results = args.results_dir or (root / RESULTS_DEMO_NAME)
+
+    if results.name == RESULTS_NAME and not args.force:
+        print(
+            f"\n  ✋ refusing to write into {results}: that is the real results "
+            f"directory.\n     A demo must not be able to overwrite a real run's "
+            f"artifacts.\n     Use --results-dir {RESULTS_DEMO_NAME} (the default) "
+            f"or pass --force.\n",
+            file=sys.stderr,
+        )
+        return 1
+    if not refuse_if_occupied(data, "--data-dir", args.force):
+        return 1
+
     rng = np.random.default_rng(args.seed)
     random.seed(args.seed)
 
@@ -551,9 +656,12 @@ def main():
     print(f"  Sentinel-1:     2 scenes x VV+VH (dB)")
 
     # --- Sentinel-2 ---------------------------------------------------------
+    after_scl = None
     for label, prob, cc in (("before", prob_before, 14.0),
                             ("after", prob_after, args.after_cloud_cover)):
         bands, scl = build_sentinel2(size, prob, dem, rng, cc)
+        if label == "after":
+            after_scl = scl
         for bname, arr in bands.items():
             write_raster(data / "sentinel2" / label / f"s2_{label}_{bname}.tif",
                          arr, transform, dtype="float32")
@@ -574,8 +682,8 @@ def main():
     meta = {
         "source": "SYNTHETIC — structurally mimics an ohsome/OSM pre-event snapshot",
         "synthetic": True,
-        "snapshot_date": "2026-07-27",
-        "event_date": "2026-08-26",
+        "snapshot_date": OSM_SNAPSHOT_DATE,
+        "event_date": EVENT_DATE,
         "attribution": "© OpenStreetMap contributors. (synthetic stand-in)",
     }
     write_geojson(osm / "buildings.geojson", buildings, meta)
@@ -592,17 +700,39 @@ def main():
           f"{len(bridges)} bridges, {len(hospitals)} hospitals")
 
     # --- reference flood masks + change statistics --------------------------
+    # Mirror of the artifact contract scripts/inference.py writes, so this fixture
+    # is a faithful stand-in for a real run:
+    #   flood_mask.tif        newly flooded only (after AND NOT before), speckle removed
+    #   water_after.tif       all post-event water, permanent water included
+    #   flood_mask_before.tif pre-event water = the permanent-water mask
+    #   valid_mask.tif        pixels the scene actually observed (no cloud/shadow)
     results.mkdir(parents=True, exist_ok=True)
-    write_raster(results / "flood_mask_before.tif", prob_before.astype("float32"),
-                 transform, nodata=-9999.0,
-                 cmap_description="SYNTHETIC pre-event water probability")
-    write_raster(results / "flood_mask.tif", prob_after.astype("float32"),
-                 transform, nodata=-9999.0,
-                 cmap_description="SYNTHETIC flood probability (reference mask)")
 
     before_bin = prob_before > 0.5
     after_bin = prob_after > 0.5
     newly = after_bin & ~before_bin
+    # Same speckle rule as inference.py: isolated dark pixels are not a flood.
+    delivered_bin, removed_blobs = remove_small_components(newly, MIN_COMPONENT_PIXELS)
+    # Deliver a probability that thresholds to exactly the delivered binary mask.
+    flood_prob = np.where(delivered_bin > 0.5, prob_after, 0.0).astype("float32")
+
+    write_raster(results / "flood_mask_before.tif", prob_before.astype("float32"),
+                 transform, nodata=-9999.0,
+                 cmap_description="SYNTHETIC pre-event water (permanent water)")
+    write_raster(results / "water_after.tif", prob_after.astype("float32"),
+                 transform, nodata=-9999.0,
+                 cmap_description="SYNTHETIC post-event water (permanent included)")
+    write_raster(results / "flood_mask.tif", flood_prob,
+                 transform, nodata=-9999.0,
+                 cmap_description="SYNTHETIC newly-flooded probability (reference mask)")
+
+    if after_scl is not None:
+        # SCL 0 = no data, 1 = saturated/defective, 3 = cloud shadow, 8/9/10 = cloud.
+        valid = ~np.isin(after_scl, [0, 1, 3, 8, 9, 10])
+        write_raster(results / "valid_mask.tif", valid.astype("float32"),
+                     transform, nodata=None,
+                     cmap_description="SYNTHETIC observed-pixel mask (1 = observed)")
+
     # area per pixel in metres, from the geographic transform at scene centre
     m_per_deg = 111320.0
     px_h_m = abs(transform.e) * m_per_deg
@@ -610,52 +740,88 @@ def main():
     pixel_ha = (px_h_m * px_w_m) / 10000.0
     total_ha = size * size * pixel_ha
 
+    delivered_px = int(delivered_bin.sum())
     change = {
-        "flood_extent_pixels": int(newly.sum()),
-        "flood_extent_ha": round(newly.sum() * pixel_ha, 2),
+        "flood_extent_pixels": delivered_px,
+        "flood_extent_ha": round(delivered_px * pixel_ha, 2),
         "persistent_water_pixels": int((after_bin & before_bin).sum()),
         "persistent_water_ha": round((after_bin & before_bin).sum() * pixel_ha, 2),
         "total_water_after_pixels": int(after_bin.sum()),
         "total_water_after_ha": round(after_bin.sum() * pixel_ha, 2),
         "disappeared_pixels": int((~after_bin & before_bin).sum()),
-        "flood_percentage": round(newly.sum() / max(after_bin.sum(), 1) * 100, 1),
+        "flood_percentage": round(delivered_px / max(after_bin.sum(), 1) * 100, 1),
+        # What the delivered flood_mask.tif actually is.
+        "flood_extent_raw_pixels": int(newly.sum()),
+        "small_components_removed_pixels": int(newly.sum()) - delivered_px,
+        "small_components_removed": removed_blobs,
+        "min_component_pixels": int(MIN_COMPONENT_PIXELS),
+        "newly_flooded_pixels": delivered_px,
+        "newly_flooded_ha": round(delivered_px * pixel_ha, 2),
+        "permanent_water_pixels": int((after_bin & before_bin).sum()),
+        "water_after_pixels": int(after_bin.sum()),
+        "delivered_mask": "flood_mask.tif",
+        "water_after_mask": "water_after.tif",
+        "permanent_water_mask": "flood_mask_before.tif",
+        "valid_mask": "valid_mask.tif",
+        "method": "synthetic_fixture",
         # keys consumed by dashboard/app.py + index.html
-        "flood_pixels": int(newly.sum()),
+        "flood_pixels": delivered_px,
         "total_pixels": int(size * size),
-        "flood_area_ha": round(newly.sum() * pixel_ha, 2),
+        "flood_area_ha": round(delivered_px * pixel_ha, 2),
         "total_area_ha": round(total_ha, 1),
         "resolution_m": round(px_w_m, 2),
-        "mean_flood_probability": round(float(prob_after[after_bin].mean()), 3),
+        "mean_flood_probability": round(float(flood_prob[delivered_bin > 0.5].mean()), 3),
         "shape": [size, size],
         "crs": "EPSG:4326",
         "data_source": "SYNTHETIC demo dataset (scripts/make_demo_data.py)",
         "synthetic": True,
     }
+    if after_scl is not None:
+        valid = ~np.isin(after_scl, [0, 1, 3, 8, 9, 10])
+        change["valid_pixels"] = int(valid.sum())
+        change["invalid_pixels"] = int(valid.size - valid.sum())
+        change["valid_percentage"] = round(valid.sum() / max(valid.size, 1) * 100, 1)
     (results / "change_detection.json").write_text(json.dumps(change, indent=2), encoding="utf-8")
-    print(f"  Flood mask:     {results / 'flood_mask.tif'}")
+    print(f"  Flood mask:     {results / 'flood_mask.tif'}  (newly flooded only)")
+    print(f"  Water after:    {results / 'water_after.tif'}")
     print(f"  Newly flooded:  {change['flood_extent_ha']:,} ha "
-          f"({change['flood_extent_pixels']:,} px)")
+          f"({change['flood_extent_pixels']:,} px; "
+          f"{change['small_components_removed_pixels']:,} px dropped as speckle)")
 
-    (results / "DEMO_DATA_NOTICE.txt").write_text(
+    (results / DEMO_NOTICE_FILENAME).write_text(
         "*** SYNTHETIC DEMO DATA — DO NOT SUBMIT AS EVIDENCE ***\n\n"
-        "Everything in data/ and results/ produced by scripts/make_demo_data.py is\n"
-        "fabricated geometry. It exists so that damage_assessment.py,\n"
-        "cutoff_analysis.py, flood_path.py, generate_report.py and the dashboard can\n"
-        "be developed, demoed and regression-tested before the real Copernicus\n"
-        "Data Space downloads land.\n\n"
+        f"Everything in {data.name}/ written by scripts/make_demo_data.py, and every\n"
+        f"result in {results.name}/, is fabricated geometry. It exists so that\n"
+        "damage_assessment.py, cutoff_analysis.py, flood_path.py,\n"
+        "generate_report.py and the dashboard can be developed, demoed and\n"
+        "regression-tested before the real Copernicus Data Space downloads land.\n\n"
+        "These results are deliberately NOT written to results/: the dashboard only\n"
+        "reads demo data when it is pointed at it, and shows a banner when it does.\n\n"
         "Replace with real inputs before any submission:\n"
         "  data/sentinel1/  <- Copernicus Sentinel-1 GRD, same orbit track\n"
         "  data/sentinel2/  <- Copernicus Sentinel-2 L2A\n"
         "  data/dem/        <- Copernicus WorldDEM-30\n"
-        "  data/osm/        <- OSM snapshot dated on/before 2026-07-27\n"
+        f"  data/osm/        <- OSM snapshot dated on/before {OSM_SNAPSHOT_DATE}\n"
         "  results/flood_mask.tif <- output of scripts/inference.py\n",
         encoding="utf-8",
     )
 
+    # Mark the input tree as generated: a later run (e.g. `run_offline.py
+    # --skip-data-generation` then a re-generate) may overwrite its own output,
+    # while a real download dropped in here is still protected by --force.
+    (data / GENERATOR_MARKER).write_text(
+        "This directory was generated by scripts/make_demo_data.py.\n"
+        "Its contents are SYNTHETIC and may be overwritten by the next run.\n",
+        encoding="utf-8",
+    )
+
     print("\n" + "=" * 72)
-    print(" Synthetic dataset written. Next:  python scripts/run_offline.py")
+    print(f" Synthetic inputs written to  {data}")
+    print(f" Synthetic results written to {results}")
+    print(" Next:  python scripts/run_offline.py")
     print("=" * 72)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

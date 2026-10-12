@@ -15,10 +15,14 @@ Authentication (OAuth2 client credentials):
 
 Usage:
     python download_sentinel2.py \
-        --center-lat 28.3 --center-lon 85.7 \
-        --before-date 2026-08-14 --after-date 2026-08-28 \
+        --bbox <min_lon,min_lat,max_lon,max_lat> \
+        --before-date <YYYY-MM-DD> --after-date <YYYY-MM-DD> \
         --output ./data/sentinel2 \
         --max-cloud 30
+
+    --bbox is the PRIMARY area-of-interest input; --center-lat/--center-lon with
+    an optional --extent is only a fallback. Case-study values live in
+    config/presets.py and, for a resolved run, in results/run_meta.json.
 
 Sentinel-2 bands used for flood mapping:
   B02 (Blue, 10m)  — water absorbs blue light → good for water index (NDWI)
@@ -38,6 +42,15 @@ import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Project root on sys.path so `config.*` resolves whether this is run as
+# `python scripts/download_sentinel2.py` or from anywhere else.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.presets import DEFAULT_EXTENT  # noqa: E402
+from config.run_meta import resolve_bbox  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
@@ -171,34 +184,36 @@ def download_product(client: CDSEClient, product: Product, output_dir: Path) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download Sentinel-2 L2A products")
-    parser.add_argument("--center-lat", type=float, required=True)
-    parser.add_argument("--center-lon", type=float, required=True)
+    parser.add_argument(
+        "--bbox",
+        help=(
+            "PRIMARY area of interest: min_lon,min_lat,max_lon,max_lat. "
+            "Falls back to --center-lat/--center-lon/--extent when omitted."
+        ),
+    )
+    parser.add_argument("--center-lat", type=float, default=None,
+                        help="Fallback AOI centre latitude (prefer --bbox)")
+    parser.add_argument("--center-lon", type=float, default=None,
+                        help="Fallback AOI centre longitude (prefer --bbox)")
+    parser.add_argument("--extent", type=float, default=DEFAULT_EXTENT,
+                        help=f"Fallback half-width in degrees (default {DEFAULT_EXTENT})")
     parser.add_argument("--before-date", required=True, help="Before-event date (YYYY-MM-DD)")
     parser.add_argument("--after-date", required=True, help="After-event date (YYYY-MM-DD)")
     parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--bbox", help="Bounding box: min_lon,min_lat,max_lon,max_lat")
     parser.add_argument(
         "--max-cloud", type=float, default=30.0, help="Maximum cloud cover (percent)"
     )
     parser.add_argument("--margin-days", type=int, default=7, help="Search window each side")
     args = parser.parse_args()
 
-    center_lat, center_lon = args.center_lat, args.center_lon
-    half_extent = 0.3
-
-    if args.bbox:
-        parts = [float(x) for x in args.bbox.split(",")]
-        if len(parts) != 4:
-            print("❌ --bbox must be min_lon,min_lat,max_lon,max_lat", file=sys.stderr)
-            return 1
-        min_lon, min_lat, max_lon, max_lat = parts
-    else:
-        min_lon = center_lon - half_extent
-        min_lat = center_lat - half_extent
-        max_lon = center_lon + half_extent
-        max_lat = center_lat + half_extent
-
-    bbox = (min_lon, min_lat, max_lon, max_lat)
+    try:
+        bbox = resolve_bbox(args.bbox, args.center_lat, args.center_lon, args.extent)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    min_lon, min_lat, max_lon, max_lat = bbox
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
     output_dir = Path(args.output)
 
     print(f"\n{'=' * 70}")

@@ -8,12 +8,6 @@ Jalnetra is a flood-damage mapping tool for the Himalayas. It takes **an area** 
 
 It is built for the Multimodal AI Hackathon 2026, Track B (Mapping Flood Damage from Space), and uses Sentinel-1 radar (which sees through monsoon clouds), Sentinel-2 optical when the sky is clear, a Copernicus digital elevation model for flood-path tracing, and a pre-event OpenStreetMap snapshot. There is also a bonus flood-path tracer that, given any upstream point, traces the likely flow down the valley and lists the settlements along it.
 
-## The real event behind the project
-
-On **26 August 2026**, a partial collapse of a high-altitude glacier in northern Nepal sent a flood of water, mud, and debris down the **Bhote Koshi–Trishuli river corridor**. Nepal's National Disaster Risk Reduction and Management Authority reported **1,342 deaths** by 6 September, with almost **4,900 people** still missing or out of contact (as reported by the Copernicus Emergency Management Service). Jalnetra's case study is that event.
-
-## What Jalnetra actually does
-
 Jalnetra is a pipeline with a live web dashboard and a generated one-page situation report. The pipeline runs end-to-end from raw satellite data for any area and date — the idea is that a judge can point it at a corridor and a date on the day, and it produces the map, the damage numbers, the cut-off list, and the report from that data.
 
 - **Sentinel-1 radar** is the backbone: it sees through monsoon clouds, and for change detection it is compared against a before image from the **same orbit track** — different tracks view the terrain from different angles and cannot be compared pixel by pixel.
@@ -22,7 +16,7 @@ Jalnetra is a pipeline with a live web dashboard and a generated one-page situat
 - **Copernicus DEM** is used for the flood-path bonus. It comes from a public AWS Open Data bucket with no account needed.
 - The **AI component** is a flood segmentation model (U-Net with a ResNet-34 encoder) trained on the listed training data, or a situation-report copilot — choose one. In either case, every number in a generated report must come from the system's maps, never invented by the language model.
 
-## What's real right now
+The case study is the **26 August 2026 Bhote Koshi–Trishuli flood** in Nepal: a partial collapse of a high-altitude glacier sent a flood of water, mud, and debris down that corridor. Nepal's National Disaster Risk Reduction and Management Authority reported **1,342 deaths** by 6 September, with almost **4,900 people** still missing or out of contact (as reported by the Copernicus Emergency Management Service).
 
 The code, the dashboard, the report generator, and the pipeline orchestration all exist and run. The terrain pipeline is fully real: a **258 MB Copernicus digital elevation model** of the Trishuli corridor was downloaded from the public AWS Open Data bucket (6 tiles, 38–45 MB each, covering 84–87°E × 27–29°N), and a **flood-flow trace** was computed from it — about **251 km** of channel, **5,961 m** of descent, written as a verified GeoJSON the dashboard serves.
 
@@ -44,16 +38,72 @@ Then open the dashboard in a browser. That is the live, visual face of Jalnetra:
 To run the full pipeline from raw satellite data:
 
 ```bash
-python scripts/run_pipeline.py \
-  --area "Bhote Koshi corridor" \
-  --center-lat 28.3 \
-  --center-lon 85.7 \
-  --before-date 2026-08-24 \
-  --after-date 2026-08-31 \
-  --osm-snapshot 2026-07-27
+python scripts/run_pipeline.py --preset trishuli
 ```
 
 That one command runs the whole chain: satellite ingestion → terrain analysis → infrastructure overlay → damage and cut-off analysis → report generation → the dashboard.
+
+To point it at a **different** area, give the bounding box — the primary AOI input — and the dates:
+
+```bash
+python scripts/run_pipeline.py \
+  --area "Some Other Corridor" \
+  --bbox <min_lon>,<min_lat>,<max_lon>,<max_lat> \
+  --before-date <YYYY-MM-DD> \
+  --after-date <YYYY-MM-DD> \
+  --event-date <YYYY-MM-DD> \
+  --osm-snapshot <YYYY-MM-DD>
+```
+
+`--center-lat`/`--center-lon` with `--extent` is a fallback for when no bounding box is known; every download stage takes `--bbox` first.
+
+### The run's metadata is resolved once
+
+Whatever the inputs, they are merged (CLI over preset) into **one file, `results/run_meta.json`**, holding the area name, the bbox, the acquisition dates, the event date and the OSM snapshot date:
+
+```json
+{
+  "area": "...",
+  "bbox": [min_lon, min_lat, max_lon, max_lat],
+  "bbox_source": "cli | preset | center_extent_fallback",
+  "aoi_confirmed": false,
+  "before_date": "...", "after_date": "...",
+  "event_date": "...", "osm_snapshot_date": "..."
+}
+```
+
+Every downstream stage — damage assessment, cut-off analysis, the situation report, the dashboard — reads *that* file, so the mask, the damage numbers and the report header cannot disagree about the area or the dates. Before this existed, the preset said `2026-08-14/08-28`, the README said `2026-08-24/08-31`, and the Sentinel-1 pair actually on disk is `2026-08-24/09-05`.
+
+`aoi_confirmed` is `false` whenever the AOI came from the center+extent fallback rather than a real `--bbox`; a report from such a run prints an "AREA OF INTEREST NOT CONFIRMED" banner instead of presenting a provisional extent as settled.
+
+`run_pipeline.py` **never trains.** Training needs real labelled data, so it is a separate, explicit step. If `models/flood_unet.pt` is missing the pipeline says so and falls back to the **log-ratio change-detection baseline** (a VV backscatter drop between the two acquisitions), which still produces a real flood mask from the real imagery. It is a physical threshold, not a segmentation model — to use the network, train it first:
+
+```bash
+python scripts/train_segmentation.py --dataset ./data/kuro_siwo --epochs 50
+```
+
+### Training and the flood mask
+
+The model is a U-Net (optionally with a ResNet-34 encoder). Three things about it are easy to get wrong, so they are pinned down:
+
+- **One input scaling, shared.** [`scripts/s1_normalization.py`](scripts/s1_normalization.py) is the only place that maps Sentinel-1 dB to the network's 0..1 input range. Training and inference both call it, and the window it used is written into the checkpoint's config, so inference re-applies the *same* scaling the weights were trained against instead of re-deriving one.
+- **The mask is the change, not the river.** `flood_mask.tif` is `after AND NOT before` — newly flooded water only. The permanent river and lakes are subtracted using the pre-event water extent, so a riverside building is not reported as destroyed merely for being next to a river. `water_after.tif` holds all post-event water (river included) for comparison, and `flood_mask_before.tif` holds the permanent-water mask.
+- **Speckle is not a flood.** Small connected blobs are dropped from the delivered mask, because a couple of dark radar pixels would otherwise become a "flooded" building or a severed road downstream.
+
+Every run therefore writes four rasters. `damage_assessment.py` and `cutoff_analysis.py` read `flood_mask.tif` and need no change.
+
+**To point it at another corridor or date, add a preset to [`config/presets.py`](config/presets.py), or pass `--bbox` and the dates directly.** Configuration lives in [`config/`](config/): `presets.py` holds the case-study values and the paths, and [`config/run_meta.py`](config/run_meta.py) resolves them (CLI over preset), writes `results/run_meta.json` and reads it back in any stage. `scripts/` and `dashboard/` must not restate the coordinates, dates or snapshot date — a test scans both trees, docstrings included, for stray case-study literals.
+
+## Tests
+
+```bash
+python -m pytest -q              # all 81 logic tests, ~5 min (torch import dominates)
+python -m pytest -q -m "not slow"  # skip the full-scene-sized performance test
+```
+
+`tests/` holds **logic tests on generated toy data**: a 200×200 raster on a ~20 m grid and a handful of OSM-style features, all built in `tmp_path`. They check that the code consuming the data behaves as documented — that the delivered flood mask is *new* water and not the permanent river, that tiling covers every pixel, that hectares come from the raster transform, that a partly flooded road does not sever a whole valley, that empty inputs produce empty (not crashed) outputs, and that the dashboard degrades gracefully. They also pin down the training contract (an empty dataset fails, `--smoke-test` is opt-in and names its checkpoint `*_smoke.pt`), that training and inference scale inputs with the same dB → 0..1 window, that inference with no checkpoint still writes a real mask via the log-ratio baseline, and that the case-study values are resolved into one `results/run_meta.json` that every stage reads (including that no coordinate or date is hardcoded in `scripts/` or `dashboard/`).
+
+They are not science tests: a green run does **not** show the flood map is correct. No network, no Copernicus account, no GPU, and nothing is written into `results/` or `data/` (a test asserts that).
 
 ## Copernicus credentials
 
@@ -70,23 +120,27 @@ The helper `scripts/cdse_env.py` reads that file so the secret never appears on 
 
 | Flag | Meaning |
 |---|---|
+| `--preset` | Named case-study preset (available: `trishuli`). Supplies defaults; any explicit flag overrides it |
+| `--bbox` | **Primary** area of interest: `min_lon,min_lat,max_lon,max_lat` |
+| `--center-lat` / `--center-lon` / `--extent` | Fallback AOI, used only when no `--bbox` is given |
 | `--area` | Human-readable area description |
-| `--center-lat` / `--center-lon` | Center of the area of interest |
-| `--before-date` | Pre-event date (YYYY-MM-DD) |
-| `--after-date` | Post-event date (YYYY-MM-DD) |
+| `--before-date` / `--after-date` | The two Sentinel-1 acquisition dates (YYYY-MM-DD) |
+| `--event-date` | The flood event date (YYYY-MM-DD) |
 | `--osm-snapshot` | OpenStreetMap snapshot date (YYYY-MM-DD), before the event |
 
-For the Trishuli case study:
+### The `trishuli` preset
 
 | Item | Value |
 |---|---|
-| Center latitude | **28.3°N** |
-| Center longitude | **85.7°E** |
-| Before-date | **2026-08-24** |
-| After-date | **2026-08-31** |
+| Before-date | **2026-08-24** — the pre-event acquisition actually downloaded (orbit 19) |
+| After-date | **2026-09-05** — the post-event acquisition actually downloaded |
+| Event date | **2026-08-26** |
 | OSM snapshot date | **2026-07-27** |
+| AOI (bbox) | **not yet confirmed** — see the TODO in `config/presets.py` |
 
-The OSM snapshot date must be before 26 August 2026. The latest available pre-event snapshot at the time of building this is 27 July 2026.
+The acquisition dates are the Sentinel-1 pair on disk (`data/sentinel1/*/PRODUCT_INFO.json`); the event itself is 26 August 2026 (GLIDE `FF-2026-000162-NPL`, EMSR927 activated 26/08/2026). The rules require the OSM snapshot to precede the event, which is enforced in `config/run_meta.py`.
+
+**The case-study AOI is not yet confirmed.** The authoritative area is the Copernicus EMSR927 AOI01 footprint (Syabru Bensi, Rasuwa district) — note that the event is *not* at 85.7°E, which is merely the center the existing OSM snapshot was pulled at. Until the AOI01 bounds are entered in the preset, `--preset trishuli` runs on that unverified center+extent fallback and stamps everything it produces `aoi_confirmed: false`.
 
 ## Scripts
 
@@ -97,14 +151,40 @@ The OSM snapshot date must be before 26 August 2026. The latest available pre-ev
 | `scripts/download_sentinel2.py` | Sentinel-2 optical before/after download |
 | `scripts/fetch_osm.py` | Pre-event OSM snapshot via the ohsome API |
 | `scripts/download_dem.py` | Copernicus DEM download (no account needed) |
-| `scripts/train_segmentation.py` | Flood segmentation model training |
-| `scripts/inference.py` | Model inference → flood mask GeoTIFF |
+| `scripts/train_segmentation.py` | Trains the flood segmentation model on a **real** dataset (Kuro Siwo / Sen1Floods11 layout). Refuses to run on an empty dataset; `--smoke-test` generates synthetic tiles and writes a clearly named `*_smoke.pt` |
+| `scripts/inference.py` | Tiled inference → `flood_mask.tif` (newly flooded only) + `water_after.tif`, `flood_mask_before.tif` (permanent water), `valid_mask.tif`. Falls back to the log-ratio baseline automatically when no checkpoint exists |
+| `scripts/s1_normalization.py` | The one dB → 0..1 input scaling, shared by training and inference |
+| `scripts/mask_postprocess.py` | Speckle control — drops connected flood blobs below a pixel floor |
+| `scripts/preprocess_s1.py` | Sentinel-1 calibration / speckle filter → dB GeoTIFFs + sidecar |
 | `scripts/damage_assessment.py` | Flood mask + OSM → damage assessment |
 | `scripts/cutoff_analysis.py` | Road-network reachability → cut-off settlements |
 | `scripts/flood_path.py` | DEM-based flood-path tracing (bonus) |
 | `scripts/generate_report.py` | Generates the one-page situation report |
 | `scripts/cdse_env.py` | Loads Copernicus creds from git-ignored `.secrets/cdse.env` |
+| `scripts/run_offline.py` | Runs every stage on the synthetic fixture (no account needed) |
+| `config/presets.py` | **All paths + the case-study PRESETS — the one file to edit** |
+| `config/run_meta.py` | Resolves CLI + preset into the run's metadata and reads/writes `results/run_meta.json` |
 | `dashboard/app.py` | Live web dashboard (Flask) |
+| `tests/` | pytest logic tests on generated toy data (no network/GPU) |
+
+## The synthetic fixture (no account needed)
+
+```bash
+python scripts/run_offline.py                 # every stage, on fabricated data
+
+# look at it — the dashboard shows a DEMO DATA banner when it serves the fixture
+cd dashboard && JALNETRA_RESULTS_DIR=results_demo python app.py
+```
+
+A demo run keeps its own trees: generated inputs in `data_demo/`, generated
+artifacts in `results_demo/`, and the report it writes in `results_demo/` too.
+`data/`, `results/` and `report/` hold the real downloads, the real pipeline
+output and the published report — the generator refuses to write into them
+(and refuses to overwrite any file it did not create) unless `--force` is
+given, so a demo cannot quietly destroy the only real data in the repo. The
+dashboard tells the two apart by which directory it was pointed at, never by
+trusting a flag inside the data, and shows a banner when that directory is the
+fixture.
 
 ## Datasets and licenses
 

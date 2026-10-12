@@ -3,6 +3,9 @@
 .env
 data/
 results/
+# synthetic fixture trees (scripts/make_demo_data.py + run_offline.py)
+data_demo/
+results_demo/
 models/
 *.tif
 *.tiff

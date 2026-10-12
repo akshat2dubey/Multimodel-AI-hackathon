@@ -13,6 +13,7 @@ Run:  cd dashboard && python app.py
 Open: http://localhost:5000
 """
 
+import hmac
 import json
 import math
 import os
@@ -20,16 +21,54 @@ import subprocess
 import sys
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, send_from_directory
+# The dashboard is normally started as `cd dashboard && python app.py`, so the
+# project root is NOT on sys.path. Add it before importing config.presets — the
+# single source of truth for paths and case-study constants shared with
+# scripts/run_pipeline.py.
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from flask import Flask, jsonify, render_template, request, send_from_directory
 from flask_cors import CORS
+
+from config.presets import (  # noqa: E402  (path set up above)
+    AREA as CASE_STUDY_AREA,
+    CENTER_LAT,
+    CENTER_LON,
+    DATA_DIR,
+    DEFAULT_PRESET,
+    EVENT_DATE,
+    REPORT_DIR,
+    RESULTS_DIR,
+    is_demo_dir,
+)
+from config.run_meta import load_run_meta  # noqa: E402
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 CORS(app)
 
-# Project root (one level up from dashboard/)
-ROOT = Path(__file__).parent.parent
-RESULTS = ROOT / "results"
-DATA = ROOT / "data"
+# results/ is the one directory the whole pipeline writes to; importing it from
+# config keeps the dashboard and run_pipeline.py from drifting apart.
+#
+# JALNETRA_RESULTS_DIR points the dashboard at a different directory (e.g.
+# results_demo) without touching code — a relative value resolves against the
+# project root, so `JALNETRA_RESULTS_DIR=results_demo` is the documented demo
+# command. Either way the directory must be inside the project.
+_env_results = os.environ.get("JALNETRA_RESULTS_DIR", "").strip()
+if _env_results:
+    RESULTS = Path(_env_results)
+    if not RESULTS.is_absolute():
+        RESULTS = (ROOT / RESULTS).resolve()
+else:
+    RESULTS = RESULTS_DIR
+DATA = DATA_DIR
+
+# POST /api/run-pipeline spawns a long download+compute job, so it must not be
+# callable by anyone who can reach the port. Without a configured token the
+# endpoint refuses every request (fail closed).
+PIPELINE_TOKEN = os.environ.get("JALNETRA_PIPELINE_TOKEN", "")
+PIPELINE_TOKEN_HEADER = "X-Pipeline-Token"
 
 
 def json_safe(value):
@@ -56,6 +95,37 @@ def json_safe(value):
         return str(value)
 
 
+def serving_demo_data() -> bool:
+    """True when the directory being served is the synthetic fixture.
+
+    Decided by the directory the operator pointed at (results_demo, or a
+    directory carrying the demo notice), never by trusting a flag inside the
+    data — a banner that depends on the data it is warning about is not a
+    warning.
+    """
+    return is_demo_dir(RESULTS)
+
+
+REPORT_FILENAME = "situation_report.html"
+
+
+def situation_report_path() -> Path | None:
+    """The report belonging to the results directory currently being served.
+
+    A run writes its report next to the numbers it states: results/situation_
+    report.html for a real run, results_demo/situation_report.html for the
+    synthetic fixture. REPORT_DIR (report/) holds the published handout copy and
+    is only a fallback — otherwise pointing the dashboard at results_demo would
+    show a real report above synthetic layers, or a real run would inherit the
+    demo's report.
+    """
+    for base in (RESULTS, REPORT_DIR):
+        candidate = base / REPORT_FILENAME
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def load_geojson(path_name: str) -> dict | None:
     """Load a GeoJSON file from results or data directory."""
     for base in [RESULTS, DATA]:
@@ -66,6 +136,18 @@ def load_geojson(path_name: str) -> dict | None:
             except Exception as e:
                 print(f"  ⚠ Could not parse {path}: {e}")
     return None
+
+
+def current_run_meta() -> dict:
+    """The metadata of the run whose artifacts this dashboard is serving.
+
+    ``<results>/run_meta.json`` is written by run_pipeline.py (or run_offline.py)
+    and names the area, the bbox and the dates that run actually used. Serving
+    those instead of the config defaults is what keeps the header and the map
+    centre describing the same run as the numbers below them. Empty when no run
+    has been executed into this directory yet.
+    """
+    return load_run_meta(RESULTS) or {}
 
 
 def load_flood_mask_info() -> dict | None:
@@ -114,13 +196,32 @@ def api_status():
     cutoff_features = cutoffs.get("cutoff_settlements", [])
     summary = cutoffs.get("summary", {})
 
+    demo = serving_demo_data()
+    run_meta = current_run_meta()
     return jsonify({
         "status": "complete" if flood_mask_info else "in_progress",
-        "area": "Bhote Koshi – Trishuli River Corridor, Nepal",
-        "event_date": "2026-08-26",
+        # The served run's own metadata, falling back to the configured preset
+        # before any run has written into this directory.
+        "area": run_meta.get("area") or CASE_STUDY_AREA,
+        "event_date": run_meta.get("event_date") or EVENT_DATE,
+        "before_date": run_meta.get("before_date"),
+        "after_date": run_meta.get("after_date"),
+        "osm_snapshot_date": run_meta.get("osm_snapshot_date"),
+        # The map centres on the run's own AOI, not on a coordinate pair
+        # copy-pasted into the template.
+        "center_lat": run_meta.get("center_lat", CENTER_LAT),
+        "center_lon": run_meta.get("center_lon", CENTER_LON),
+        "bbox": run_meta.get("bbox"),
+        "aoi_confirmed": bool(run_meta.get("aoi_confirmed", False)),
+        "bbox_source": run_meta.get("bbox_source"),
         # True whenever the current results came from the synthetic fixture, so
         # the UI can label them instead of presenting them as real measurements.
-        "synthetic": bool(flood_mask_info.get("synthetic")),
+        "synthetic": bool(flood_mask_info.get("synthetic")) or demo,
+        # Which directory is being served, and whether it is the demo fixture.
+        # The dashboard banner is driven by this, so a demo run is never
+        # presented as a real one.
+        "results_dir": Path(RESULTS).name,
+        "demo_data": demo,
         "data_source": flood_mask_info.get("data_source", ""),
         "flood_stats": flood_mask_info,
         "damage_summary": {
@@ -310,18 +411,29 @@ def api_flood_path():
 
 @app.route("/api/situation-report")
 def api_situation_report():
-    """Serve the situation report HTML."""
-    report_path = ROOT / "report" / "situation_report.html"
-    if report_path.exists():
-        return send_from_directory(ROOT / "report", "situation_report.html")
-    return jsonify({"error": "Situation report not yet generated"}), 404
+    """Serve the situation report HTML.
+
+    An absent report is an empty state, not an error: the dashboard must render
+    gracefully before the pipeline has ever run. Returns 200 with an explicit
+    `available: false` flag so the UI can show a "not generated yet" message
+    without treating a 404 as a crash.
+    """
+    report_path = situation_report_path()
+    if report_path is not None:
+        return send_from_directory(report_path.parent, REPORT_FILENAME)
+    return jsonify({
+        "available": False,
+        "type": "situation-report",
+        "html": "",
+        "note": "Situation report not generated yet — run the pipeline first.",
+    })
 
 
 @app.route("/report")
 def report_page():
     """Render the situation report in a browser-friendly wrapper."""
-    report_path = ROOT / "report" / "situation_report.html"
-    if report_path.exists():
+    report_path = situation_report_path()
+    if report_path is not None:
         # Read the report and embed it
         report_html = report_path.read_text(encoding="utf-8")
         # Extract the body content
@@ -343,17 +455,27 @@ def demo_mode():
 
 @app.route("/api/run-pipeline", methods=["POST"])
 def api_run_pipeline():
-    """Trigger the full pipeline (for demo/UI trigger)."""
+    """Trigger the full pipeline (for demo/UI trigger).
+
+    Runs the same case-study preset the CLI documents (``--preset``), so the
+    dashboard cannot drift from the pipeline: the area, bbox and dates are
+    resolved by run_pipeline.py into results/run_meta.json, not restated here.
+
+    Gated by a shared token (header ``X-Pipeline-Token``) so a public port cannot
+    be made to start a multi-minute download job. Fails closed: with no
+    JALNETRA_PIPELINE_TOKEN configured, every request is rejected.
+    """
+    supplied = request.headers.get(PIPELINE_TOKEN_HEADER, "")
+    if not PIPELINE_TOKEN or not hmac.compare_digest(supplied, PIPELINE_TOKEN):
+        return jsonify({
+            "success": False,
+            "error": "Forbidden: missing or invalid pipeline token.",
+        }), 403
+
     try:
         result = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "run_pipeline.py"),
-             "--area", "Bhote Koshi – Trishuli Corridor",
-             "--center-lat", "28.3",
-             "--center-lon", "85.7",
-             "--before-date", "2026-08-14",
-             "--after-date", "2026-08-28",
-             "--osm-snapshot", "2026-07-27",
-             "--skip-training"],
+             "--preset", DEFAULT_PRESET],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -376,11 +498,14 @@ if __name__ == "__main__":
         # Windows ships with PORT=0 in some environments, which makes Flask bind
         # a random port and the printed URL useless. Fall back to 5000.
         port = 5000
-    # FLASK_DEBUG=0 runs a single process (no auto-reloader). Handy for demos and
-    # for anything that tracks the server PID.
-    debug = os.environ.get("FLASK_DEBUG", "1").lower() not in ("0", "false", "no")
+    # Debug (and with it the interactive Werkzeug debugger and the auto-reloader)
+    # is OFF unless explicitly asked for: it must never be on for a demo a judge
+    # can reach. FLASK_DEBUG=1 opts in.
+    debug = os.environ.get("FLASK_DEBUG", "0").lower() in ("1", "true", "yes", "on")
+    # Bind loopback by default. Set HOST=0.0.0.0 explicitly for a LAN demo.
+    host = os.environ.get("HOST", "127.0.0.1")
     print(f'\
-Jalnetra Dashboard — Open: http://localhost:{port}  (debug={debug})\
+Jalnetra Dashboard — Open: http://{host}:{port}  (debug={debug})\
 Features: flood map, OSM damage, cut-offs, report, flood path\
 ')
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host=host, port=port, debug=debug)

@@ -2,6 +2,10 @@
 """
 Offline pipeline runner — exercise the whole backend chain on synthetic data.
 
+Generated inputs land in data_demo/ and outputs in results_demo/ (see
+config.presets), so a demo run can neither read nor overwrite the real data/ and
+results/ trees.
+
 Runs every downstream stage in order using the reference flood mask produced by
 make_demo_data.py, so damage assessment, cut-off analysis, flood-path tracing,
 the situation report and the dashboard all get real artifacts without needing a
@@ -34,7 +38,24 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
-sys.path.insert(0, str(SCRIPTS))
+for _p in (str(SCRIPTS), str(ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from config.presets import (  # noqa: E402  (path set up above)
+    AFTER_DATE,
+    AREA,
+    BEFORE_DATE,
+    CENTER_LAT,
+    CENTER_LON,
+    DATA_DEMO_DIR,
+    DEFAULT_PRESET,
+    FIXTURE_EXTENT,
+    OSM_SNAPSHOT_DATE,
+    RESULTS_DEMO_DIR,
+    RESULTS_NAME,
+)
+from config.run_meta import resolve_run_meta, write_run_meta  # noqa: E402
 
 BANNER = "*** SYNTHETIC DEMO DATA — NOT REAL EARTH OBSERVATION DATA ***"
 
@@ -52,23 +73,29 @@ def run(label: str, cmd: list[str]) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the offline (synthetic) pipeline")
-    parser.add_argument("--area", default="Bhote Koshi – Trishuli Corridor, Nepal")
-    parser.add_argument("--before-date", default="2026-08-14")
-    parser.add_argument("--after-date", default="2026-08-28")
-    parser.add_argument("--center-lat", type=float, default=28.30)
-    parser.add_argument("--center-lon", type=float, default=85.70)
-    parser.add_argument("--extent", type=float, default=0.50)
+    parser.add_argument("--area", default=AREA)
+    parser.add_argument("--before-date", default=BEFORE_DATE)
+    parser.add_argument("--after-date", default=AFTER_DATE)
+    parser.add_argument("--center-lat", type=float, default=CENTER_LAT)
+    parser.add_argument("--center-lon", type=float, default=CENTER_LON)
+    parser.add_argument("--extent", type=float, default=FIXTURE_EXTENT)
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--skip-data-generation", action="store_true",
-                        help="Reuse the existing data/ and results/flood_mask.tif")
+                        help=f"Reuse the fixture already in {DATA_DEMO_DIR.name}/ and "
+                             f"{RESULTS_DEMO_DIR.name}/")
     args = parser.parse_args()
 
     py = sys.executable
-    results = ROOT / "results"
-    data = ROOT / "data"
+    # Every artifact of an offline run lands in results_demo/ and every generated
+    # input in data_demo/ (both imported from config.presets), never in results/
+    # or data/ — the real runs write there, and the dashboard reads results/ for
+    # them and shows a banner when it is pointed at the demo directory instead.
+    results = RESULTS_DEMO_DIR
+    data = DATA_DEMO_DIR
     ok = True
 
-    print(f"\n{'#' * 72}\n#  {BANNER}\n#  Offline run: validates plumbing, not scientific results.\n{'#' * 72}")
+    print(f"\n{'#' * 72}\n#  {BANNER}\n#  Offline run: validates plumbing, not scientific results.\n"
+          f"#  Outputs -> {results}\n{'#' * 72}")
 
     # 1. synthetic scene + reference flood mask
     if not args.skip_data_generation:
@@ -78,7 +105,9 @@ def main() -> int:
                    "--center-lon", str(args.center_lon),
                    "--extent", str(args.extent),
                    "--size", str(args.size),
-                   "--root", str(ROOT)])
+                   "--root", str(ROOT),
+                   "--data-dir", str(data),
+                   "--results-dir", str(results)])
         if not ok:
             return 1
 
@@ -86,6 +115,29 @@ def main() -> int:
     if not mask.exists():
         print(f"\nMissing {mask} — run without --skip-data-generation first.")
         return 1
+    if not (data / "osm" / "buildings.geojson").exists():
+        print(f"\nMissing generated inputs in {data} — run without "
+              f"--skip-data-generation first.")
+        return 1
+    if Path(mask).parent.name == RESULTS_NAME:
+        print("\n  ✋ refusing to run: the fixture mask is inside results/. Real runs "
+              "write there; a demo must not overwrite them.")
+        return 1
+
+    # 0. publish this demo run's metadata next to its artifacts, exactly as a
+    # real run does, so damage/cutoff/report describe the same area and dates
+    # instead of falling back to the preset. This writes to results_demo/.
+    run_meta = resolve_run_meta(
+        preset=DEFAULT_PRESET,
+        area=args.area,
+        center_lat=args.center_lat,
+        center_lon=args.center_lon,
+        extent=args.extent,
+        before_date=args.before_date,
+        after_date=args.after_date,
+    )
+    meta_path = write_run_meta(results, run_meta)
+    print(f"\n  Run metadata -> {meta_path}")
 
     # 2. damage assessment (buildings / roads / bridges)
     ok &= run("2/5  Damage assessment — flood mask x OSM features",
@@ -94,6 +146,7 @@ def main() -> int:
                "--osm-buildings", str(data / "osm" / "buildings.geojson"),
                "--osm-roads", str(data / "osm" / "roads.geojson"),
                "--osm-bridges", str(data / "osm" / "bridges.geojson"),
+               "--run-meta", str(meta_path),
                "--output", str(results / "damage_assessment.geojson")])
 
     # 3. cut-off settlement analysis
@@ -103,6 +156,7 @@ def main() -> int:
                "--buildings", str(data / "osm" / "buildings.geojson"),
                "--flood-mask", str(mask),
                "--hospitals", str(data / "osm" / "hospitals.geojson"),
+               "--run-meta", str(meta_path),
                "--output", str(results / "cutoff_settlements.geojson")])
 
     # 4. bonus: flood path tracing down the valley
@@ -122,25 +176,34 @@ def main() -> int:
     # 5. one-page situation report
     ok &= run("5/5  Situation report",
               [py, str(SCRIPTS / "generate_report.py"),
+               "--run-meta", str(meta_path),
                "--area", args.area,
                "--before-date", args.before_date,
                "--after-date", args.after_date,
                "--flood-mask", str(mask),
                "--damage", str(results / "damage_assessment.geojson"),
                "--cutoffs", str(results / "cutoff_settlements.geojson"),
-               "--output", str(ROOT / "report" / "situation_report.html")])
+               # The report states THIS run's numbers, so it belongs to this run's
+               # results directory. report/ is the published handout copy and must
+               # not be overwritten with synthetic figures.
+               "--output", str(results / "situation_report.html")])
 
     print(f"\n{'=' * 72}")
     print(f" {'Offline pipeline complete.' if ok else ' Offline pipeline finished with errors.'}")
     print(f"{'=' * 72}")
     print(f"  Reminder: {BANNER}")
     print("\n  Artifacts:")
-    for rel in ("results/flood_mask.tif", "results/damage_assessment.geojson",
-                "results/cutoff_settlements.geojson", "results/flood_path.geojson",
-                "report/situation_report.html"):
-        p = ROOT / rel
+    for p in (results / "flood_mask.tif", results / "damage_assessment.geojson",
+              results / "cutoff_settlements.geojson", results / "flood_path.geojson",
+              results / "situation_report.html"):
+        try:
+            rel = p.relative_to(ROOT)
+        except ValueError:
+            rel = p
         print(f"    {'OK ' if p.exists() else 'MISS'}  {rel}")
-    print("\n  Dashboard:  cd dashboard && python app.py   ->  http://localhost:5000")
+    print("\n  Dashboard:   cd dashboard && python app.py")
+    print("  Dashboard (these results):  "
+          "JALNETRA_RESULTS_DIR=results_demo python app.py   -> a DEMO banner is shown")
     return 0 if ok else 1
 
 

@@ -56,6 +56,37 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.models import ResNet34_Weights, resnet34
 
+# The single dB -> 0..1 input mapping, shared with inference.py. The exact
+# window used here is written into the checkpoint config (and read back by
+# inference.load_model), so the two can never silently disagree.
+try:
+    from s1_normalization import (
+        describe_normalization, normalize_bands, normalization_config,
+    )
+except ImportError:
+    # Smock fallback when the real normalization module is not installed: the
+    # smoke-test run only needs the synthetic tile generators and a placeholder
+    # normalization window so the checkpoint carries something serializable.
+    def describe_normalization() -> str:
+        return "smoke-test fallback: dB -> 0..1 with window (-25, 5)"
+
+    def normalize_bands(vv: np.ndarray, vh: np.ndarray) -> np.ndarray:
+        vv = np.asarray(vv, dtype=np.float32)
+        vh = np.asarray(vh, dtype=np.float32)
+        lo, hi = -25.0, 5.0
+        def _scale(x: np.ndarray) -> np.ndarray:
+            y = (x - lo) / (hi - lo)
+            return np.clip(y, 0.0, 1.0).astype(np.float32)
+        return np.stack([_scale(vv), _scale(vh)], axis=0)
+
+    def normalization_config() -> dict:
+        return {
+            "dB_window": [-25.0, 5.0],
+            "bands": ["VV", "VH"],
+            "clip": [0.0, 1.0],
+            "source": "smoke_test_fallback",
+        }
+
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -122,54 +153,64 @@ class UNet(nn.Module):
         self.depth = depth
         self.in_channels = in_channels
 
-        # Encoder (contracting)
+        # Encoder (contracting): `depth` ConvBlocks, pooled between them.
         self.encoders = nn.ModuleList()
+        enc_channels: list[int] = []
         ch = in_channels
         for i in range(depth):
             out_ch = base_channels * (2**i)
             self.encoders.append(ConvBlock(ch, out_ch))
             ch = out_ch
+            enc_channels.append(out_ch)
             if i < depth - 1:
                 self.encoders.append(nn.MaxPool2d(2))
+        self.enc_channels = enc_channels
 
-        # Bottleneck
+        # Bottleneck. No extra pooling: the last encoder level is already the
+        # smallest one, so the decoder must NOT upsample before its first skip.
         bottleneck_ch = base_channels * (2**depth)
         self.bottleneck = ConvBlock(ch, bottleneck_ch)
 
-        # Decoder (expanding)
-        self.decoders = nn.ModuleList()
+        # Decoder (expanding), one level per encoder level, in reverse:
+        # concatenate the skip, convolve back to the skip's width, then upsample
+        # (except at the last level, which is already at full resolution).
+        # The previous revision upsampled first and then ADDED a skip of a
+        # different width and resolution, so the model crashed on its first
+        # forward pass for every input size — the `--model unet` option had never
+        # actually run.
+        self.dec_convs = nn.ModuleList()
+        self.ups = nn.ModuleList()
         ch = bottleneck_ch
         for i in range(depth - 1, -1, -1):
-            out_ch = base_channels * (2**i)
-            self.decoders.append(nn.ConvTranspose2d(ch, out_ch // 2, 2, stride=2))
-            self.decoders.append(ConvBlock(ch, out_ch))
-            ch = out_ch
+            skip_ch = enc_channels[i]
+            self.dec_convs.append(ConvBlock(ch + skip_ch, skip_ch))
+            if i > 0:
+                # Upsample to the next (shallower) encoder level's width, which is
+                # what the next concatenation expects.
+                self.ups.append(nn.ConvTranspose2d(skip_ch, enc_channels[i - 1], 2, stride=2))
+                ch = enc_channels[i - 1]
+            else:
+                self.ups.append(nn.Identity())
+                ch = skip_ch
 
         # Final output
         self.final_conv = nn.Conv2d(base_channels, num_classes, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Encoder pass with skip connections
+        # Encoder pass: keep the map produced by every ConvBlock as a skip.
         skips = []
-        for i, layer in enumerate(self.encoders):
+        for layer in self.encoders:
             x = layer(x)
-            # After a ConvBlock + MaxPool, save for skip connection
-            if isinstance(layer, ConvBlock) and i % 2 == 0:
+            if isinstance(layer, ConvBlock):
                 skips.append(x)
-            # After MaxPool, x is downsampled
 
         # Bottleneck
         x = self.bottleneck(x)
 
-        # Decoder pass
-        skips = list(reversed(skips))
-        for i, layer in enumerate(self.decoders):
-            if isinstance(layer, nn.ConvTranspose2d):
-                x = layer(x)
-                # Add skip connection from encoder
-                x = x + skips[i // 2]  # element-wise add (or concat)
-            else:
-                x = layer(x)
+        # Decoder pass: deepest skip first.
+        for skip, conv, up in zip(reversed(skips), self.dec_convs, self.ups):
+            x = conv(torch.cat([x, skip], dim=1))
+            x = up(x)
 
         return self.final_conv(x)
 
@@ -307,10 +348,18 @@ class BCEDiceLoss(nn.Module):
 
 
 class FloodAugmentation:
-    """Data augmentation for satellite imagery flood training."""
+    """Data augmentation for satellite imagery flood training.
 
-    def __init__(self, img_size: int = 256):
+    Scaling is NOT done here: `augment` calls `s1_normalization.normalize_bands`,
+    the same function inference.py uses, so a checkpoint's train-time inputs and
+    run-time inputs are mapped identically. The old `/ 255.0` was an 8-bit-image
+    leftover that shrank dB backscatter (~-20..0) to ~0.0 and starved the model.
+    """
+
+    def __init__(self, img_size: int = 256, band_names=None, normalization=None):
         self.img_size = img_size
+        self.band_names = band_names or SENTINEL1_BANDS
+        self.normalization = normalization or normalization_config()
         self.base_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.0], std=[1.0]),  # Already normalized
@@ -347,8 +396,8 @@ class FloodAugmentation:
             image = np.pad(image, ((0, 0), (pad_h, pad_h), (pad_w, pad_w)), mode="edge")
             mask = np.pad(mask, ((0, 0), (pad_h, pad_h), (pad_w, pad_w)), mode="constant", constant_values=0)
 
-        # Normalize image (assume already in reasonable range)
-        image = image.astype(np.float32) / 255.0
+        # Normalise with the shared mapping (dB -> 0..1 per band).
+        image = normalize_bands(image, self.band_names, self.normalization)
 
         return image, mask
 
@@ -376,11 +425,13 @@ class FloodDataset(Dataset):
         split_file: Path,
         img_size: int = 256,
         bands: list[str] | None = None,
+        normalization: dict | None = None,
     ):
         self.images_dir = images_dir
         self.masks_dir = masks_dir
         self.img_size = img_size
         self.bands = bands or SENTINEL1_BANDS
+        self.normalization = normalization or normalization_config()
 
         # Read split
         if split_file.exists():
@@ -417,8 +468,8 @@ class FloodDataset(Dataset):
             # If we have more bands than needed, take first N
             image = image[: len(self.bands)]
 
-        # Augment
-        aug = FloodAugmentation(self.img_size)
+        # Augment (and normalise) with the band-aware mapping.
+        aug = FloodAugmentation(self.img_size, self.bands, self.normalization)
         image, mask = aug.augment(image, mask)
 
         return (
@@ -441,8 +492,12 @@ def train(
     epochs: int,
     output_path: Path,
     start_epoch: int = 0,
+    normalization: dict | None = None,
+    bands: list[str] | None = None,
+    log_name: str = "training_log.json",
 ):
     """Train the model with early stopping on validation Dice score."""
+    normalization = normalization or normalization_config()
 
     best_val_dice = 0.0
     patience = 5
@@ -456,6 +511,7 @@ def train(
     print(f"  Epochs:       {epochs}")
     print(f"  Batch size:   {train_loader.batch_size}")
     print(f"  Learning rate:{optimizer.param_groups[0]['lr']}")
+    print(f"  Input norm:   {describe_normalization(normalization)}")
     print(f"  Output:       {output_path}")
     print(f"  Starting at:  epoch {start_epoch}")
     print(f"{'='*70}\n")
@@ -549,6 +605,11 @@ def train(
                     "in_channels": model.in_channels if hasattr(model, "in_channels") else 2,
                     "num_classes": 1,
                     "model_type": model.__class__.__name__,
+                    # What scaling these weights were trained against.
+                    # inference.load_model reads this block and applies the same
+                    # mapping, so train-time and run-time inputs cannot drift.
+                    "bands": list(bands or SENTINEL1_BANDS),
+                    "normalization": normalization,
                 },
             }, output_path)
             print(f"  ✅ Best model saved! (Dice: {best_val_dice:.4f})")
@@ -564,7 +625,7 @@ def train(
     print(f"{'='*70}")
 
     # Save training log
-    log_path = output_path.parent / "training_log.json"
+    log_path = output_path.parent / log_name
     log_path.write_text(json.dumps(training_log, indent=2), encoding="utf-8")
     print(f"Training log: {log_path}")
 
@@ -596,12 +657,45 @@ def main():
     parser.add_argument("--model", choices=["unet", "resnet_unet"], default="resnet_unet")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--resume", type=Path, help="Resume from checkpoint")
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help=(
+            "Explicitly allow training on generated SYNTHETIC tiles when the "
+            "dataset directory is empty. For pipeline validation only — a "
+            "checkpoint trained this way is not a flood detector and must not be "
+            "presented as one."
+        ),
+    )
     args = parser.parse_args()
+
+    # ── Never let a smoke-test checkpoint pass as a trained model ────────────
+    # A `--smoke-test` run trains on tiles this script fabricated. That is fine
+    # for plumbing, but the file it writes must say so: the output is renamed to
+    # `<stem>_smoke.pt` (and its logs get a matching `_smoke` suffix) so nothing
+    # downstream can mistake it for `models/flood_unet.pt`.
+    log_name = "training_log.json"
+    info_name = "model_info.json"
+    if args.smoke_test:
+        if not args.output.stem.endswith("_smoke"):
+            args.output = args.output.with_name(args.output.stem + "_smoke" + args.output.suffix)
+        log_name = "training_log_smoke.json"
+        info_name = "model_info_smoke.json"
+        print(
+            "\n" + "!" * 70 + "\n"
+            "  SMOKE TEST — the checkpoint below is trained on SYNTHETIC tiles\n"
+            "  generated by this script. It validates plumbing only and is NOT a\n"
+            f"  flood detector.  Output: {args.output.name}\n" + "!" * 70
+        )
+
+    # The scaling used for every batch, stored in the checkpoint config below.
+    normalization = normalization_config()
 
     # Set seeds
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    rng = np.random.default_rng(args.seed)
     random.seed(args.seed)
+    np.random.seed(args.seed)  # legacy callers still reach for the global state
 
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -613,10 +707,26 @@ def main():
     masks_dir = dataset_dir / "masks"
     splits_dir = dataset_dir / "splits"
 
-    # Create synthetic dataset if none exists (for demo purposes)
+    # NO silent synthetic fallback. Previously an empty --dataset made this script
+    # fabricate 240 tiles, train on them and drop a checkpoint that looks like a
+    # real model — the single fastest way for a demo to become a false claim.
+    # Now: fail loudly, unless the operator explicitly opts in with --smoke-test.
     if not images_dir.exists() or not list(images_dir.glob("*.npy")):
-        print("\n⚠️ No training images found. Creating synthetic dataset for demonstration.")
-        create_synthetic_dataset(dataset_dir, args.img_size, len(args.bands))
+        if not args.smoke_test:
+            print(
+                f"❌ No training images found in {images_dir}\n"
+                "   Provide a real dataset (--dataset <dir> containing images/ and\n"
+                "   masks/), or pass --smoke-test to generate synthetic tiles for\n"
+                "   pipeline validation only.\n"
+                "   Refusing to train on fabricated data by default.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "\n⚠️ --smoke-test: dataset is empty — generating SYNTHETIC tiles.\n"
+            "   The resulting checkpoint is a plumbing fixture, NOT a flood detector."
+        )
+        create_synthetic_dataset(dataset_dir, args.img_size, len(args.bands), rng)
 
     train_split = splits_dir / "train.txt" if splits_dir.exists() else None
     val_split = splits_dir / "val.txt" if splits_dir.exists() else None
@@ -628,6 +738,7 @@ def main():
         train_split or (dataset_dir / "train.txt"),
         img_size=args.img_size,
         bands=args.bands,
+        normalization=normalization,
     )
     val_ds = FloodDataset(
         images_dir,
@@ -635,6 +746,7 @@ def main():
         val_split or (dataset_dir / "val.txt"),
         img_size=args.img_size,
         bands=args.bands,
+        normalization=normalization,
     )
 
     # DataLoaders
@@ -684,6 +796,7 @@ def main():
     best_dice = train(
         model, train_loader, val_loader, optimizer, criterion,
         device, args.epochs, args.output, start_epoch,
+        normalization=normalization, bands=args.bands, log_name=log_name,
     )
 
     # Save final model info
@@ -694,18 +807,27 @@ def main():
         "input_resolution": args.img_size,
         "best_val_dice": round(best_dice, 4),
         "total_epochs": args.epochs,
-        "training_log": (args.output.parent / "training_log.json").exists(),
+        "training_log": (args.output.parent / log_name).exists(),
+        # The exact dB -> 0..1 window these weights were trained with.
+        "normalization": normalization,
+        # A smoke checkpoint is a plumbing fixture, and says so in its own file.
+        "smoke_test": bool(args.smoke_test),
+        "synthetic_training_data": bool(args.smoke_test),
         "citation": (
             "If using Kuro Siwo: Bountos, N., et al. (2024). Kuro Siwo: A Large-Scale "
             "Dataset for Flood Segmentation in Satellite Imagery. NeurIPS 2024. (MIT/CC BY)"
         ),
     }
-    (args.output.parent / "model_info.json").write_text(json.dumps(model_info, indent=2), encoding="utf-8")
-    print(f"  Model info: {args.output.parent / 'model_info.json'}")
+    (args.output.parent / info_name).write_text(json.dumps(model_info, indent=2), encoding="utf-8")
+    print(f"  Model info: {args.output.parent / info_name}")
+
+    return 0
 
 
-def create_synthetic_dataset(dataset_dir: Path, img_size: int, num_bands: int):
-    """Create a small synthetic dataset for demonstration/testing."""
+def create_synthetic_dataset(
+    dataset_dir: Path, img_size: int, num_bands: int, rng: np.random.Generator
+) -> None:
+    """Create a small synthetic dataset for demonstration/testing (deterministic)."""
     dataset_dir.mkdir(parents=True, exist_ok=True)
     images_dir = dataset_dir / "images"
     masks_dir = dataset_dir / "masks"
@@ -714,14 +836,14 @@ def create_synthetic_dataset(dataset_dir: Path, img_size: int, num_bands: int):
     masks_dir.mkdir(exist_ok=True)
     splits_dir.mkdir(exist_ok=True)
 
-    # Generate realistic flood-like patterns
+    # Generate realistic flood-like patterns (deterministic per sample index).
     flood_shapes = [
         # "river" flood
-        lambda h, w: _synthetic_flood_river(h, w),
+        _synthetic_flood_river,
         # "flash flood" patch
-        lambda h, w: _synthetic_flood_patch(h, w),
+        _synthetic_flood_patch,
         # "coastal flood"
-        lambda h, w: _synthetic_flood_coastal(h, w),
+        _synthetic_flood_coastal,
     ]
 
     n_train = 200
@@ -735,14 +857,17 @@ def create_synthetic_dataset(dataset_dir: Path, img_size: int, num_bands: int):
         shape_func = flood_shapes[i % len(flood_shapes)]
 
         # Satellite-like image (random terrain + noise)
-        image = np.random.randn(num_bands, img_size, img_size).astype(np.float32) * 0.1
+        image = rng.standard_normal((num_bands, img_size, img_size)).astype(np.float32) * 0.1
+
         # Add terrain gradient
         y, x = np.ogrid[:img_size, :img_size]
         terrain = np.sin(x / img_size * 4 * np.pi) * 0.2 + np.cos(y / img_size * 3 * np.pi) * 0.2
         image[0] += terrain
 
-        # Flood mask
-        mask = shape_func(img_size, img_size).astype(np.float32)
+        # Flood mask (uses the dataset-wide rng; every tile is deterministic given
+        # the seed, and the smoke-test file name encodes that seed so it cannot be
+        # mistaken for a trained model checkpoint).
+        mask = shape_func(img_size, img_size, rng).astype(np.float32)
         mask = mask[np.newaxis, ...]  # (1, H, W)
 
         # Save
@@ -760,48 +885,48 @@ def create_synthetic_dataset(dataset_dir: Path, img_size: int, num_bands: int):
     print(f"  Created synthetic dataset: {n_train} train + {n_val} val tiles")
 
 
-def _synthetic_flood_river(h: int, w: int) -> np.ndarray:
-    """Synthesize a river-like flood pattern."""
+def _synthetic_flood_river(h: int, w: int, rng: np.random.Generator) -> np.ndarray:
+    """Synthesize a river-like flood pattern (deterministic from ``rng``)."""
     mask = np.zeros((h, w), dtype=np.float32)
     y, x = np.ogrid[:h, :w]
     # Sine-wave river path
-    x1 = np.arange(w)  # column indices,
+    x1 = np.arange(w)  # column indices
     river_y = (h // 2 + (np.sin((x1 / w) * 6 * np.pi) * h * 0.2).astype(int)).astype(int)
     for i in range(w):
         ry = int(min(max(int(river_y[i]), 0), h - 1))
         mask[max(0, ry - 3):ry + 4, i] = 1.0
     # Add noise to mask edges
-    noise = np.random.rand(h, w) * 0.3
+    noise = rng.random((h, w)) * 0.3
     mask = np.clip(mask + noise, 0, 1)
     return mask
 
 
-def _synthetic_flood_patch(h: int, w: int) -> np.ndarray:
-    """Synthesize a flood patch (flash flood area)."""
+def _synthetic_flood_patch(h: int, w: int, rng: np.random.Generator) -> np.ndarray:
+    """Synthesize a flood patch (flash flood area) (deterministic from ``rng``)."""
     mask = np.zeros((h, w), dtype=np.float32)
-    cy, cx = h // 2 + np.random.randint(-20, 20), w // 2 + np.random.randint(-20, 20)
-    ry, rx = np.random.randint(15, 40), np.random.randint(15, 40)
+    cy, cx = h // 2 + rng.integers(-20, 20), w // 2 + rng.integers(-20, 20)
+    ry, rx = rng.integers(15, 40), rng.integers(15, 40)
     y, x = np.ogrid[:h, :w]
     ellipse = ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2
     mask[ellipse < 1] = 1.0
     return mask
 
 
-def _synthetic_flood_coastal(h: int, w: int) -> np.ndarray:
-    """Synthesize coastal flooding."""
+def _synthetic_flood_coastal(h: int, w: int, rng: np.random.Generator) -> np.ndarray:
+    """Synthesize coastal flooding (deterministic from ``rng``)."""
     mask = np.zeros((h, w), dtype=np.float32)
     y, x = np.ogrid[:h, :w]
     # Flood from bottom (coast)
-    flood_line = h * 0.6 + np.random.randint(-10, 10)
-    flood_height = np.random.randint(10, 30)
+    flood_line = h * 0.6 + rng.integers(-10, 10)
+    flood_height = rng.integers(10, 30)
     mask[int(flood_line):int(flood_line) + flood_height, :] = 1.0
     # Add some random inundation patches
     for _ in range(5):
-        px, py = np.random.randint(0, w), np.random.randint(0, h)
-        PR = np.random.randint(5, 15)
+        px, py = rng.integers(0, w), rng.integers(0, h)
+        PR = rng.integers(5, 15)
         mask[max(0, py - PR):py + PR, max(0, px - PR):px + PR] = 1.0
     return mask
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

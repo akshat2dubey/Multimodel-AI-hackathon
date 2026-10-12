@@ -14,8 +14,11 @@ Uses steepest-descent flow routing on the DEM:
 Usage:
     python flood_path.py \
         --dem ./data/dem/dem.tif \
-        --start-lat 28.4 --start-lon 78.6 \
+        --start-lat <lat> --start-lon <lon>   # upstream point to trace from \
         --output ./results/flood_path.geojson
+
+    run_pipeline.py derives the start point from the resolved run metadata
+    (results/run_meta.json), so it always matches the run's own bbox.
 """
 
 import argparse
@@ -573,7 +576,9 @@ def main():
     px_m = abs(transform.a)
     if crs is not None and getattr(crs, "is_geographic", False):
         # degrees, not metres — convert at the path's mean latitude
-        mean_lat = float(np.mean([lat for _, lat in path_lonlats])) if path_lonlats else 28.3
+        # 0.0 as the fallback, not a case-study latitude: an empty path has no
+        # location, and borrowing one from config/ would be a hidden assumption.
+        mean_lat = float(np.mean([lat for _, lat in path_lonlats])) if path_lonlats else 0.0
         px_m = abs(transform.a) * 111320.0 * math.cos(math.radians(mean_lat))
     print(f"  Path length:     {len(path)} pixels (~{len(path) * px_m / 1000:.1f} km)")
     print(f"  Settlements hit: {len(settlements_along)}")

@@ -9,7 +9,8 @@
 rasterio>=1.3          # GeoTIFF I/O, rasterization, mask vectorisation
 geopandas>=0.14        # OSM GeoJSON handling (pulls in pandas + pyproj + pyogrio)
 shapely>=2.0           # Geometry operations
-scipy>=1.10            # distance transforms, Gaussian smoothing (DEM, demo data)
+scipy>=1.10            # distance transforms, Gaussian smoothing (DEM, demo data),
+                          # 3x3 median speckle filter for Sentinel-1 tifs
 
 # --- Core numerics ---------------------------------------------------------
 numpy>=1.24
@@ -43,6 +44,8 @@ tqdm>=4.65
 cdse-client>=1.2
 
 # --- Development (not required to run anything) ----------------------------
+pytest>=8.0           # tests/ — logic tests on generated toy data (no network,
+                        # no credentials, no GPU; `python -m pytest -q`)
 # black>=23.0
 # flake8>=6.0
 
@@ -52,4 +55,5 @@ cdse-client>=1.2
 #   matplotlib / contextily / folium — the dashboard renders with Leaflet, no
 #                       server-side plotting is done
 #   scikit-learn / scikit-image — no classical-ML or image-processing step remains
+#   Keep scipy for the 3x3 sentinel-1 speckle filter only; do not add scikit-image.
 #   flatpak — NOT a Python package and NOT the CDSE client; do not add it

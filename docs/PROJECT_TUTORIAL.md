@@ -87,20 +87,24 @@ Invoke-RestMethod http://localhost:5000/api/flood-path | Select-Object -First 1
 ### 1.5 Re‑run the pipeline from the terminal
 
 ```powershell
-python scripts/run_pipeline.py `
-  --area "Bhote Koshi - Trishuli Corridor" `
-  --center-lat 28.3 `
-  --center-lon 85.7 `
-  --before-date 2026-08-14 `
-  --after-date 2026-08-28 `
-  --osm-snapshot 2026-07-27 `
-  --skip-training
+python scripts/run_pipeline.py --preset trishuli
 ```
 
-> **Note:** the longitude must be **85.7**, not 78.7. 78.7°E is the Indo‑Gangetic plain
-> (~150–250 m elevation, no glacier, no valley) and was an early documentation error that
-> has been corrected everywhere. The dashboard's own pipeline trigger was still using
-> 78.7 and was fixed during this audit.
+That resolves the preset into `results/run_meta.json` and every stage reads it. To
+run a different area, pass `--bbox <min_lon,min_lat,max_lon,max_lat>` (the primary
+AOI input) plus `--before-date` / `--after-date` / `--event-date` / `--osm-snapshot`;
+`--center-lat`/`--center-lon`/`--extent` is only a fallback.
+
+> **No `--skip-training` flag:** the orchestrator never trains. If
+> `models/flood_unet.pt` is missing it falls back to the log‑ratio change‑detection
+> baseline, so the command above still yields a real mask from real imagery.
+
+> **The case‑study AOI is NOT confirmed.** The authoritative area is the Copernicus
+> EMSR927 AOI01 footprint (Syabru Bensi, Rasuwa district) — the event is **not** at
+> 85.7°E, which is only the center the existing OSM snapshot was pulled at. The
+> `trishuli` preset therefore carries a clearly marked TODO instead of a guessed
+> bbox, and any run without an explicit `--bbox` is stamped `aoi_confirmed: false`
+> (the report then prints an "AREA OF INTEREST NOT CONFIRMED" banner).
 
 ### 1.6 Regenerate just the flood path from the real DEM
 
@@ -127,7 +131,9 @@ download_sentinel.py    download_sentinel2.py        download_dem.py
    │  SYNTHETIC             │  SYNTHETIC                │  ✅ REAL (no account)
    ▼                        ▼                           ▼
 inference.py  ──► flood_mask.tif  ──┐                  flood_path.py
-   │  (needs trained model)         │                   │  ✅ REAL
+   │  (U-Net, or the log-ratio      │                   │  ✅ REAL
+   │   baseline when no checkpoint   │
+   │   exists: 4 rasters written)    │
    ▼                                ▼                   ▼
 change_detection.json      damage_assessment.py    flood_path.geojson
    │  SYNTHETIC              │  SYNTHETIC
@@ -141,6 +147,11 @@ generate_report.py ──► report/situation_report.html  (SYNTHETIC)
 dashboard/app.py ──► web UI  (serves all of the above)
 ```
 
+Paths in that diagram are relative to whichever run produced them. A real run
+writes `data/`, `results/` and `report/`; the synthetic fixture lives in
+`data_demo/` and `results_demo/` (its report included), and the dashboard shows
+a banner when it is pointed at the fixture.
+
 ### 2.1 Script inventory
 
 | Script | Purpose | Status |
@@ -150,8 +161,11 @@ dashboard/app.py ──► web UI  (serves all of the above)
 | `download_sentinel2.py` | Downloads Sentinel‑2 L2A bands B02/B03/B04/B08/B11/B12 + SCL | ⛔ Needs CDSE account |
 | `fetch_osm.py` | Pulls OSM roads/buildings/settlements/hospitals/bridges | ⚠️ Fixture on disk |
 | `make_demo_data.py` | Fabricates the synthetic GeoTIFFs & OSM | ✅ Works (that's the point) |
-| `train_segmentation.py` | U‑Net / ResNet‑U‑Net training on Kuro Siwo | ⛔ Needs dataset + layout decision |
-| `inference.py` | Tiled model inference → flood mask, change detection | ⛔ Needs trained model |
+| `train_segmentation.py` | U‑Net / ResNet‑U‑Net training on Kuro Siwo | ⚠️ Runs, but **needs a real dataset** — refuses an empty `--dataset`; `--smoke-test` fabricates tiles and writes `*_smoke.pt` |
+| `s1_normalization.py` | The single dB → 0..1 input scaling, shared by training + inference | ✅ Works |
+| `mask_postprocess.py` | Speckle control — drops tiny connected flood blobs | ✅ Works |
+| `preprocess_s1.py` | Sentinel‑1 calibration / speckle filter → dB + sidecar | ✅ Works |
+| `inference.py` | Tiled inference → `flood_mask.tif` (new water only) + `water_after.tif`, `flood_mask_before.tif`, `valid_mask.tif`; auto-falls back to the log‑ratio baseline | ⚠️ U‑Net path needs a trained model; baseline path needs only imagery |
 | `damage_assessment.py` | 3×3 building cluster rule vs flood mask | ✅ Works on synthetic |
 | `cutoff_analysis.py` | Road‑network reachability → cut‑off settlements | ✅ Works on synthetic |
 | `flood_path.py` | D8 steepest‑descent flow trace + sink breaching | ✅ **Works on real DEM** |
@@ -185,10 +199,13 @@ dashboard/app.py ──► web UI  (serves all of the above)
 | `data/sentinel1/{before,after}/` | ❌ | Demo fixture GeoTIFFs (VV/VH), not real SAFE products |
 | `data/sentinel2/{before,after}/` | ❌ | Demo fixture bands + SCL |
 | `data/osm/*.geojson` | ❌ | Fabricated geometry, not a real OSM snapshot |
-| `results/flood_mask.tif` | ❌ | From fixture, not real inference |
-| `results/flood_mask_before.tif` | ❌ | Same |
+| `results/flood_mask.tif` | ❌ | From fixture, not real inference (newly flooded only) |
+| `results/flood_mask_before.tif` | ❌ | Same (pre-event water = permanent water) |
+| `results/water_after.tif` | ❌ | Same (all post-event water, river included) |
+| `results/valid_mask.tif` | ❌ | Same (observed-pixel mask) |
 | `results/flood_mask.geojson` | ❌ | Derived from synthetic mask |
 | `results/change_detection.json` | ❌ | `"synthetic": true` asserted in the file itself |
+| `results/run_meta.json` | — | Not an artifact: the resolved area/bbox/dates every run publishes for its stages to read (see §1.5) |
 | `results/damage_assessment.geojson` | ❌ | Fixture ∩ fixture |
 | `results/cutoff_settlements.geojson` | ❌ | Fixture road graph |
 | `report/situation_report.html` | ❌ | Generated from all of the above |
@@ -250,7 +267,9 @@ means the moment real imagery lands, the system should light up.
 
 ### Your decisions
 2. Which Kuro Siwo source (GeoTIFF recommended — simplest mapping to the expected layout).
-3. Confirm 28.3 °N / 85.7 °E is genuinely your case‑study location.
+3. Supply the confirmed case‑study AOI (Copernicus EMSR927 AOI01 bounds) so the
+   `trishuli` preset's TODO can be filled in — `--bbox` is the primary input and
+   nothing is guessed in the meantime.
 4. Authorise the GB‑scale Kuro Siwo download.
 
 ### Work I can do once unblocked
@@ -349,12 +368,14 @@ the requirement pins. The attack surface is small — it's just wide open.
 | `flood_path.py` start‑coordinate unpacking bug | ✅ Fixed (`start_row, start_col = rowcol(...)`) |
 | Sink breaching (`--pit-radius`, `--max-breaches`) | ✅ Implemented |
 | Backward compatibility (`--pit-radius 0`) | ✅ Reproduces the original 53‑pixel trace |
-| Docs claiming 78.7 °E | ✅ Corrected to 85.7 °E |
-| **Dashboard pipeline trigger using 78.7 °E** | ✅ **Fixed during this audit** |
+| Case‑study values scattered across a dozen files and disagreeing (preset 08‑14/08‑28 vs README 08‑24/08‑31 vs the real pair 08‑24/09‑05) | ✅ **Fixed** — one `results/run_meta.json`, resolved in `config/run_meta.py`; a test scans for stray literals |
+| Stale 78.x coordinates in docstrings | ✅ Removed |
+| **Case‑study AOI (bbox) not confirmed** | ⚠️ TODO in `config/presets.py` — the EMSR927 AOI01 bounds go in there; until then runs stamp `aoi_confirmed: false` |
 | Flood path stops at the southern DEM edge, not a confluence | ⚠️ Documented limitation |
 | Flood path intersects no settlements | ⚠️ Expected — OSM layer is still the fixture |
 | 1,201 sink breaches required | ⚠️ Documented; it's a *least‑obstruction drainage route*, not a surveyed channel |
-| `train_segmentation.py` expects a dataset layout the repo loader doesn't produce | ⚠️ Needs the converter |
+| `train_segmentation.py` expects a dataset layout the repo loader doesn't produce | ⚠️ Needs the converter — and a real Kuro Siwo / Sen1Floods11 download; an empty `--dataset` now fails instead of fabricating tiles |
+| Trained checkpoint (`models/flood_unet.pt`) still absent | ⚠️ `inference.py` and `run_pipeline.py` fall back to the log-ratio baseline so a real mask is produced anyway |
 
 ---
 

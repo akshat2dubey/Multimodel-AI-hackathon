@@ -16,13 +16,16 @@ The report includes:
 
 Usage:
     python generate_report.py \
-        --area "Bhote Koshi – Trishuli River Corridor, Nepal" \
-        --before-date 2026-08-14 \
-        --after-date 2026-08-28 \
+        --run-meta ./results/run_meta.json \
         --flood-mask ./results/flood_mask.tif \
         --damage ./results/damage_assessment.geojson \
         --cutoffs ./results/cutoff_settlements.geojson \
         --output ./report/situation_report.html
+
+The report's area, event date and data label come from run_meta.json (written by
+run_pipeline.py), NOT from strings baked into this file — so the header can no
+longer name a corridor or a snapshot date the data does not support. --area,
+--before-date and --after-date override it for a one-off run.
 """
 
 import argparse
@@ -35,6 +38,14 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+
+# Project root on sys.path so `config.*` resolves whether this is run as
+# `python scripts/generate_report.py` or imported by a test.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.run_meta import run_meta_for_script  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
@@ -154,6 +165,12 @@ def load_cutoff_stats(cutoff_path: Path) -> dict:
         "cutoff_percentage": summary.get("cutoff_percentage", 0),
         "reachable_settlements": summary.get("reachable_settlements", 0),
         "flooded_road_segments": summary.get("flooded_road_segments", 0),
+        "already_isolated_settlements": summary.get("already_isolated_settlements", 0),
+        # Without a reference facility the cut-off analysis deliberately produced
+        # an empty list. Carrying the status through stops the report from
+        # presenting that as a reassuring "0% cut off".
+        "status": data.get("status", "ok"),
+        "reference_facility_note": data.get("reference_facility_note"),
         "cutoff_list": cutoff_list,
     }
 
@@ -167,11 +184,40 @@ def generate_html_report(
     cutoff_stats: dict,
     output_path: Path,
     synthetic: bool = False,
+    run_meta: dict | None = None,
 ):
-    """Generate the HTML situation report."""
+    """Generate the HTML situation report.
+
+    ``run_meta`` is the resolved run metadata (config/run_meta.py): when given,
+    the event date, the bbox in the header and the data label come from it, so
+    the report describes the run that actually produced its inputs.
+    """
 
     today = datetime.now().strftime("%d %B %Y")
-    event_date = after_date  # Approximate event date
+    meta = run_meta or {}
+    # The event date is the event, not the post-event acquisition date: those
+    # differ by design (the after scene may be days later), and using the
+    # acquisition date silently moved the reported event.
+    event_date = meta.get("event_date") or after_date
+
+    bbox = meta.get("bbox")
+    bbox_text = ", ".join(f"{v:.3f}" for v in bbox) if bbox else ""
+    meta_line = f"Flood Event Analysis • {event_date}" + (
+        f" • bbox {bbox_text}" if bbox_text else ""
+    )
+
+    # An unconfirmed AOI must be visible in the artifact itself, not only in a
+    # console warning nobody keeps.
+    if meta and not meta.get("aoi_confirmed", False):
+        aoi_banner = """
+  <div style="background:#fff8e1; border:1px solid #ffe082; border-left:4px solid #f9a825;
+              padding:12px 18px; margin:0 0 18px; border-radius:4px; font-size:12px; color:#5d4037;">
+    <strong>AREA OF INTEREST NOT CONFIRMED.</strong> This run used a fallback
+    bounding box (""" + str(meta.get("bbox_source", "unknown")) + """), not the
+    confirmed case-study AOI. Treat the area covered here as provisional.
+  </div>"""
+    else:
+        aoi_banner = ""
 
     if synthetic:
         data_label = "SYNTHETIC DEMO DATA — not real Earth observation data"
@@ -187,8 +233,23 @@ def generate_html_report(
     </div>
   </div>"""
     else:
-        data_label = "Sentinel-1 SAR + OSM pre-event snapshot (27 Jul 2026)"
+        snapshot = meta.get("osm_snapshot_date")
+        data_label = "Sentinel-1 SAR + OSM pre-event snapshot" + (
+            f" ({snapshot})" if snapshot else ""
+        )
         synthetic_banner = ""
+
+    # A cut-off analysis that had no reference facility must not read as "0%".
+    if cutoff_stats.get("status", "ok") != "ok" or cutoff_stats.get("reference_facility_note"):
+        note = (cutoff_stats.get("reference_facility_note")
+                or "Cut-off analysis did not run for this area.")
+        reference_note = (
+            '<div style="margin-top:10px; padding:8px 10px; background:#fff8e1; '
+            'border-left:3px solid #f9a825; font-size:12px; color:#5d4037;">'
+            f"{note}</div>"
+        )
+    else:
+        reference_note = ""
 
     # Format large numbers
     def fmt(n):
@@ -348,13 +409,14 @@ def generate_html_report(
     <span class="badge">Situation Report • Automated</span>
     <h1>{area}</h1>
     <div class="meta">
-      Flood Event Analysis • {event_date} • Bhote Koshi–Trishuli River Corridor, Nepal
+      {meta_line}
     </div>
     <div class="report-date">
       Generated: {today} • By Jalnetra System • Data: {data_label}
     </div>
   </div>
 {synthetic_banner}
+{aoi_banner}
 
   <div class="alert-box">
     <span class="alert-num">{cutoff_stats['cutoff_settlements']}</span>
@@ -472,8 +534,10 @@ def generate_html_report(
             <tr><td>Reachable</td><td><span class="rating low">{cutoff_stats['reachable_settlements']}</span></td></tr>
             <tr><td>Cut off</td><td><span class="rating critical">{cutoff_stats['cutoff_settlements']}</span></td></tr>
             <tr><td>Cut-off rate</td><td><strong>{cutoff_stats['cutoff_percentage']}%</strong></td></tr>
+            <tr><td>Already isolated before the event</td><td>{cutoff_stats['already_isolated_settlements']}</td></tr>
           </tbody>
         </table>
+{reference_note}
       </div>
     </div>
   </div>
@@ -501,9 +565,13 @@ def generate_html_report(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate situation report")
-    parser.add_argument("--area", required=True, help="Area name")
-    parser.add_argument("--before-date", required=True, help="Before-event date")
-    parser.add_argument("--after-date", required=True, help="After-event date")
+    # run_meta.json is the source of truth for area/dates; these flags are
+    # overrides for a one-off run that has no metadata file.
+    parser.add_argument("--run-meta", type=Path, default=None,
+                        help="run_meta.json written by run_pipeline.py (defaults to the one beside --flood-mask)")
+    parser.add_argument("--area", default=None, help="Area name (defaults to run_meta)")
+    parser.add_argument("--before-date", default=None, help="Before-event date (defaults to run_meta)")
+    parser.add_argument("--after-date", default=None, help="After-event date (defaults to run_meta)")
     parser.add_argument("--flood-mask", type=Path, required=True, help="Flood mask GeoTIFF")
     parser.add_argument("--damage", type=Path, required=True, help="Damage assessment GeoJSON")
     parser.add_argument("--cutoffs", type=Path, required=True, help="Cut-off analysis GeoJSON")
@@ -513,6 +581,23 @@ def main():
     print(f"\n{'='*70}")
     print("Generating Situation Report")
     print(f"{'='*70}")
+
+    # Area and dates: run_meta.json first, CLI override second.
+    run_meta, meta_source = run_meta_for_script(args.run_meta, args.flood_mask)
+    area = args.area or run_meta.get("area")
+    before_date = args.before_date or run_meta.get("before_date")
+    after_date = args.after_date or run_meta.get("after_date")
+    missing = [n for n, v in (("area", area), ("before-date", before_date),
+                              ("after-date", after_date)) if not v]
+    if missing:
+        print(
+            f"❌ no {', '.join(missing)}: pass --run-meta (results/run_meta.json) "
+            "or the matching flag. The report must not invent an area or a date.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    where = f"from {meta_source}" if meta_source else "(preset fallback)"
+    print(f"  Run metadata {where}: {area} | {before_date} → {after_date}")
 
     print("\n📊 Loading flood mask statistics...")
     flood_stats = load_flood_mask_stats(args.flood_mask)
@@ -545,10 +630,11 @@ def main():
 
     print("\n📝 Generating HTML report...")
     generate_html_report(
-        args.area, args.before_date, args.after_date,
+        area, before_date, after_date,
         flood_stats, damage_stats, cutoff_stats,
         args.output,
         synthetic=synthetic,
+        run_meta=run_meta,
     )
 
     print(f"\n✅ Situation report complete!")

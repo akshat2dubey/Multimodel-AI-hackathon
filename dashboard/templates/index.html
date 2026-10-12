@@ -146,9 +146,32 @@
     padding: 4px 8px;
     border-radius: 4px;
   }
+
+  /* Visible only when the dashboard is serving the synthetic fixture. */
+  #demo-banner {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 3000;
+    background: repeating-linear-gradient(45deg, #b8860b, #b8860b 12px,
+                #a9790a 12px, #a9790a 24px);
+    color: #1a1200;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: center;
+    padding: 8px 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  }
+  body.demo #demo-banner { display: block; }
+  body.demo .app { padding-top: 34px; }
 </style>
 </head>
 <body>
+<div id="demo-banner" role="alert">
+  ⚠ DEMO DATA — this dashboard is serving the SYNTHETIC fixture
+  (<span id="demo-dir">results_demo</span>), not a real pipeline run.
+  Nothing here is a measurement of the 2026 Nepal flood.
+</div>
 <div class="app">
   <div class="sidebar">
     <div>
@@ -224,7 +247,8 @@
          background:#3a2a00; border:1px solid #b8860b; color:#ffd479;
          padding:8px 10px; border-radius:4px; margin-bottom:8px;">
       <strong>SYNTHETIC DEMO DATA</strong><br>
-      These figures come from a fabricated test fixture, not from Copernicus
+      These figures come from a fabricated test fixture
+      (<span id="synthetic-dir">results_demo</span>), not from Copernicus
       Sentinel imagery. For pipeline validation only.
     </div>
 
@@ -253,14 +277,17 @@
 
 <script>
 // ─── Map Initialization ────────────────────────────────
+// The centre comes from /api/status (config/presets.py) on first load; this is
+// only the placeholder shown for the moment before that response lands.
 const map = L.map('map', {
-  center: [28.3, 85.7],
-  zoom: 11,
-  maxBounds: [
-    [27.5, 84.5],
-    [29.1, 86.9]
-  ]
+  // Neutral placeholder only: the real centre and usable bounds come from
+  // /api/status (the run's own metadata) as soon as it responds.
+  center: [20, 84],
+  zoom: 5
 });
+
+// The served run's AOI, filled in by applyRunBbox() from /api/status.
+let runBbox = null;
 
 // Dark basemap (CartoDB Dark Matter)
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -319,7 +346,41 @@ async function loadAllData() {
   }
 }
 
+function updateDemoBanner(status) {
+  // A banner that only appears when the data says so is not a warning; the
+  // server tells us which directory it is serving and this reflects that.
+  const isDemo = !!(status && (status.demo_data || status.synthetic));
+  document.body.classList.toggle('demo', isDemo);
+  const dirEl = document.getElementById('demo-dir');
+  if (dirEl && status && status.results_dir) dirEl.textContent = status.results_dir;
+}
+
+function centerOnCaseStudy(status) {
+  if (status && status.center_lat != null && status.center_lon != null) {
+    map.setView([status.center_lat, status.center_lon], 11);
+  }
+}
+
+function applyRunBbox(status) {
+  // The AOI comes from the run's own metadata via /api/status. It used to be a
+  // pair of literals in this file, which pinned the map — and the no-data
+  // placeholder below — to the wrong valley.
+  if (status && Array.isArray(status.bbox) && status.bbox.length === 4) {
+    const [minLon, minLat, maxLon, maxLat] = status.bbox;
+    runBbox = [minLon, minLat, maxLon, maxLat];
+    const padLat = Math.max((maxLat - minLat) * 0.5, 0.15);
+    const padLon = Math.max((maxLon - minLon) * 0.5, 0.15);
+    map.setMaxBounds([
+      [minLat - padLat, minLon - padLon],
+      [maxLat + padLat, maxLon + padLon]
+    ]);
+  }
+}
+
 function updateStats(status) {
+  updateDemoBanner(status);
+  centerOnCaseStudy(status);
+  applyRunBbox(status);
   const fs = status.flood_stats || {};
   const ds = status.damage_summary || {};
   const cs = status.cutoff_summary || {};
@@ -343,6 +404,8 @@ function updateStats(status) {
 
   const warn = document.getElementById('synthetic-warning');
   if (warn) warn.style.display = status.synthetic ? 'block' : 'none';
+  const warnDir = document.getElementById('synthetic-dir');
+  if (warnDir && status.results_dir) warnDir.textContent = status.results_dir;
   const attrib = document.getElementById('data-attrib');
   if (attrib && status.synthetic) {
     attrib.textContent = 'SYNTHETIC DEMO FIXTURE — not Copernicus Sentinel data';
@@ -356,7 +419,11 @@ function addFloodLayer(data) {
   
   const features = data.features || [];
   if (features.length === 0) {
-    // Show placeholder area
+    // No flood features yet: outline the run's AOI, so the placeholder is where
+    // the run actually looks. With no known AOI we draw nothing rather than
+    // invent a location.
+    if (!runBbox) return;
+    const [minLon, minLat, maxLon, maxLat] = runBbox;
     const geojson = {
       type: 'FeatureCollection',
       features: [{
@@ -364,7 +431,7 @@ function addFloodLayer(data) {
         properties: { note: 'Flood mask GeoTIFF — run pipeline to generate' },
         geometry: {
           type: 'Polygon',
-          coordinates: [[[78.55, 28.15], [78.85, 28.15], [78.85, 28.45], [78.55, 28.45], [78.55, 28.15]]]
+          coordinates: [[[minLon, minLat], [maxLon, minLat], [maxLon, maxLat], [minLon, maxLat], [minLon, minLat]]]
         }
       }]
     };
@@ -632,10 +699,26 @@ document.querySelectorAll('[data-layer]').forEach(btn => {
 
 // ─── Buttons ────────────────────────────────────────────
 document.getElementById('btn-run-pipeline').addEventListener('click', async function() {
+  // POST /api/run-pipeline is token-gated server-side (it spawns the full
+  // download+compute job). Ask the operator once, then keep it for this browser.
+  let token = window.localStorage.getItem('jalnetra_pipeline_token');
+  if (!token) {
+    token = window.prompt('Pipeline token (JALNETRA_PIPELINE_TOKEN on the server):') || '';
+    if (!token) { return; }
+    window.localStorage.setItem('jalnetra_pipeline_token', token);
+  }
   this.textContent = '⏳ Running...';
   this.disabled = true;
   try {
-    const resp = await fetch('/api/run-pipeline', { method: 'POST' });
+    const resp = await fetch('/api/run-pipeline', {
+      method: 'POST',
+      headers: { 'X-Pipeline-Token': token }
+    });
+    if (resp.status === 403) {
+      window.localStorage.removeItem('jalnetra_pipeline_token');
+      this.textContent = '🔒 Token rejected';
+      return;
+    }
     const data = await resp.json();
     if (data.success) {
       this.textContent = '✅ Pipeline Complete';

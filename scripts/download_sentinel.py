@@ -16,9 +16,14 @@ Authentication (OAuth2 client credentials):
 
 Usage:
     python download_sentinel.py \
-        --center-lat 28.3 --center-lon 85.7 \
-        --before-date 2026-08-24 --after-date 2026-08-31 \
+        --bbox <min_lon,min_lat,max_lon,max_lat> \
+        --before-date <YYYY-MM-DD> --after-date <YYYY-MM-DD> \
         --output ./data/sentinel1
+
+    --bbox is the PRIMARY area-of-interest input. --center-lat/--center-lon
+    (plus an optional --extent) is only a fallback for when no box is known. The
+    case-study values live in config/presets.py and, for a resolved run, in
+    results/run_meta.json.
 
 Exit codes:
     0  both before/after GRD products downloaded (non-trivial file size)
@@ -30,6 +35,15 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Project root on sys.path so `config.*` resolves whether this is run as
+# `python scripts/download_sentinel.py` or from anywhere else.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.presets import DEFAULT_EXTENT  # noqa: E402
+from config.run_meta import resolve_bbox  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
@@ -229,7 +243,7 @@ def pick_same_track_pair(
     return before, after, orbit, warning
 
 
-def download_product(client: CDSEClient, product: Product, output_dir: Path) -> Path:
+def download_product(client: CDSEClient, product: Product, output_dir: Path, label: str, bbox: tuple[float, float, float, float]) -> Path:
     """
     Download one product and verify a real file landed.
 
@@ -270,38 +284,79 @@ def download_product(client: CDSEClient, product: Product, output_dir: Path) -> 
     (output_dir / "PRODUCT_INFO.json").write_text(
         json.dumps(sidecar, indent=2), encoding="utf-8"
     )
+
+    # Convert the freshly downloaded SAFE into the preprocessed GeoTIFF layout
+    # the rest of the pipeline already reads (data/sentinel1/{before,after}/
+    # s1_{label}_VV.tif, s1_{label}_VH.tif) plus a units sidecar. Do not process
+    # the full scene here — preprocess_s1 requests a bbox-only Process API crop.
+    # Keep the old full-SAFE path behind a CLI flag; this call keeps the default
+    # behaviour faster, smaller, and quota-friendly.
+    try:
+        from preprocess_s1 import preprocess_product as _preprocess_product
+    except Exception as exc:  # pylint: disable=broad-except
+        print(
+            f"\n⚠ preprocessing skipped — cannot import preprocess_s1: {exc}\n"
+            "   The downloaded SAFE is on disk, but the pipeline cannot run until\n"
+            "   scripts/preprocess_s1.py is present and the Process API quota allows\n"
+            "   a bbox crop.\n",
+            file=sys.stderr,
+        )
+    else:
+        acq = product.datetime if product.datetime is not None else None
+        try:
+            _preprocess_product(
+                safe_zip=path,
+                output_dir=output_dir,
+                label=label,
+                bbox=bbox,
+                acquisition=acq,
+                orbit=_relative_orbit(product),
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            print(
+                f"\n⚠ preprocessing failed for {label}: {exc}\n"
+                "   The SAFE is on disk under data/sentinel1/. The pipeline cannot\n"
+                "   run until preprocessing succeeds or a synthetic/offline fixture is\n"
+                "   provided.\n",
+                file=sys.stderr,
+            )
+
     return path
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Download Sentinel-1 GRD products")
-    parser.add_argument("--center-lat", type=float, required=True)
-    parser.add_argument("--center-lon", type=float, required=True)
+    parser.add_argument(
+        "--bbox",
+        help=(
+            "PRIMARY area of interest: min_lon,min_lat,max_lon,max_lat. "
+            "Falls back to --center-lat/--center-lon/--extent when omitted."
+        ),
+    )
+    parser.add_argument("--center-lat", type=float, default=None,
+                        help="Fallback AOI centre latitude (prefer --bbox)")
+    parser.add_argument("--center-lon", type=float, default=None,
+                        help="Fallback AOI centre longitude (prefer --bbox)")
+    parser.add_argument("--extent", type=float, default=DEFAULT_EXTENT,
+                        help=f"Fallback half-width in degrees (default {DEFAULT_EXTENT})")
     parser.add_argument("--before-date", required=True, help="Date of event (YYYY-MM-DD)")
     parser.add_argument("--after-date", required=True, help="Date after event (YYYY-MM-DD)")
     parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--bbox", help="Bounding box: min_lon,min_lat,max_lon,max_lat")
     parser.add_argument(
         "--margin-days", type=int, default=7, help="Search window each side of target date"
     )
     args = parser.parse_args()
 
-    center_lat, center_lon = args.center_lat, args.center_lon
-    half_extent = 0.3  # ~30km
-
-    if args.bbox:
-        parts = [float(x) for x in args.bbox.split(",")]
-        if len(parts) != 4:
-            print("❌ --bbox must be min_lon,min_lat,max_lon,max_lat", file=sys.stderr)
-            return 1
-        min_lon, min_lat, max_lon, max_lat = parts
-    else:
-        min_lon = center_lon - half_extent
-        min_lat = center_lat - half_extent
-        max_lon = center_lon + half_extent
-        max_lat = center_lat + half_extent
-
-    bbox = (min_lon, min_lat, max_lon, max_lat)
+    try:
+        bbox = resolve_bbox(args.bbox, args.center_lat, args.center_lon, args.extent)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    min_lon, min_lat, max_lon, max_lat = bbox
+    # The box's midpoint: logged below and used for the "did we get the right
+    # scene" sanity checks, so a stale centre cannot disagree with the AOI.
+    center_lat = (min_lat + max_lat) / 2
+    center_lon = (min_lon + max_lon) / 2
     output_dir = Path(args.output)
 
     print(f"\n{'=' * 70}")
