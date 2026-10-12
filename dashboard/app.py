@@ -13,6 +13,7 @@ Run:  cd dashboard && python app.py
 Open: http://localhost:5000
 """
 
+import gzip
 import hmac
 import json
 import math
@@ -80,6 +81,30 @@ CSP = (
 def _attach_csp_nonce():
     """One nonce per response, so only this page's own inline script may run."""
     g.csp_nonce = secrets.token_urlsafe(16)
+
+
+@app.after_request
+def _gzip_json(response):
+    """Compress JSON bodies when the client asked for it.
+
+    The damage and flood-path layers are hundreds of KB of coordinates; gzip cuts
+    the transfer and costs nothing on a laptop. Small bodies are left alone.
+    """
+    if "gzip" not in request.headers.get("Accept-Encoding", "").lower():
+        return response
+    if response.direct_passthrough or not response.is_json:
+        return response
+    data = response.get_data()
+    if len(data) < MIN_GZIP_BYTES:
+        return response
+    compressed = gzip.compress(data, compresslevel=6)
+    if len(compressed) >= len(data):
+        return response
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(compressed))
+    response.headers["Vary"] = "Accept-Encoding"
+    return response
 
 
 @app.after_request
@@ -214,6 +239,7 @@ def _write_status(status: dict) -> None:
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(status, indent=2), encoding="utf-8")
         tmp.replace(path)
+        _restrict_permissions(path)
     except OSError:
         pass  # a status file that cannot be written must not kill the run
 
@@ -720,8 +746,35 @@ def api_flood_mask():
 
 @app.route("/api/damage")
 def api_damage():
-    """Serve damage assessment data."""
-    return jsonify(load_geojson("damage_assessment.geojson") or {"features": []})
+    """Serve damage assessment data.
+
+    Default is affected-only without the raw OSM tag blob (~31 KB instead of
+    ~88 KB on the case study); ``?all=1`` returns every feature with its full
+    properties. Both are capped at MAX_FEATURES.
+    """
+    damage = load_geojson("damage_assessment.geojson") or {}
+    features = damage.get("features") or []
+    total = len(features)
+    include_all = request.args.get("all", "").lower() in ("1", "true", "yes")
+
+    if include_all:
+        selected = features
+    else:
+        selected = [_without_osm_tags(f) for f in features if _is_affected(f)]
+
+    capped = selected[:MAX_FEATURES]
+    return jsonify(json_safe({
+        "type": damage.get("type", "FeatureCollection"),
+        "features": capped,
+        "metadata": {
+            **(damage.get("metadata") or {}),
+            "features_total": total,
+            "features_returned": len(capped),
+            "affected_only": not include_all,
+            "osm_tags_omitted": not include_all,
+            "capped": len(selected) > MAX_FEATURES,
+        },
+    }))
 
 
 def _group_cutoffs_by_village(cutoff_list: list) -> list:
@@ -786,6 +839,8 @@ def api_situation_report():
     """
     report_path = situation_report_path()
     if report_path is not None:
+        if not _is_inside(report_path, RESULTS) and not _is_inside(report_path, REPORT_DIR):
+            return jsonify({"error": "internal error"}), 404
         return send_from_directory(report_path.parent, REPORT_FILENAME)
     return jsonify({
         "available": False,
@@ -817,6 +872,62 @@ def report_page():
 def demo_mode():
     """Run in demo mode with sample data (no real satellite data needed)."""
     return render_template("demo.html", csp_nonce=g.csp_nonce)
+
+
+# ─── Response size and file safety ──────────────────────────────────────────
+# A whole damage layer is mostly UNAFFECTED footprints, each carrying a copy of
+# every OSM tag, which made /api/damage ~88 KB to show 36 interesting features.
+# The default response is affected-only and drops the raw tag blob (nothing in
+# the UI renders it); ?all=1 returns everything, still capped.
+MAX_FEATURES = 5000            # hard cap: one huge layer must not hang a browser
+AFFECTED_EXCLUDED_LEVELS = {"UNAFFECTED"}   # UNKNOWN stays: "cannot assess" is a finding
+MIN_GZIP_BYTES = 1024
+
+
+def _is_affected(feature: dict) -> bool:
+    """True when this feature belongs on a damage map."""
+    props = feature.get("properties") or {}
+    level = str(props.get("damage_level") or "").upper()
+    if level and level not in AFFECTED_EXCLUDED_LEVELS:
+        return True
+    if props.get("flood_affected") or props.get("road_cut") or props.get("bridge_damaged"):
+        return True
+    try:
+        return float(props.get("damage_overlap_ratio") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _without_osm_tags(feature: dict) -> dict:
+    props = dict(feature.get("properties") or {})
+    props.pop("osm_tags", None)
+    return {**feature, "properties": props}
+
+
+def _is_inside(child: Path, parent: Path) -> bool:
+    """True when `child` really sits inside `parent`.
+
+    Used before serving any file, so a crafted name cannot walk out of the
+    results directory. The app never builds a path from a request today, and
+    this keeps it that way.
+    """
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _restrict_permissions(path: Path, is_dir: bool = False) -> None:
+    """Owner-only where the OS supports it; a silent no-op on Windows.
+
+    Applied only to files this app writes, never to the whole results directory,
+    so it cannot disturb anything else the user runs against it.
+    """
+    try:
+        os.chmod(path, 0o700 if is_dir else 0o600)
+    except OSError:
+        pass
 
 
 def _token_ok() -> bool:

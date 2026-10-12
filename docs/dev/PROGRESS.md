@@ -87,8 +87,8 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
 - [ ] **T17** Input validation allowlist
 - [ ] **T19** Safe errors + logging
 - [ ] **T20** Rate limiting + resource limits
-- [ ] **T21** XSS-safe rendering + security headers
-- [ ] **T22** Safe file handling + payload size
+- [x] **T21** XSS-safe rendering + security headers — done 2026-10-12. Every OSM-controlled value now goes through `escapeHtml()` before it reaches `innerHTML`/`bindPopup` (an OSM `name` tag is editable by anyone, so this was a real stored-XSS path). Added the missing headers: CSP (`default-src 'self'`, `frame-ancestors 'none'`, per-response `nonce`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on `/api/*`. A strict `script-src 'self'` was only possible after vendoring Leaflet 1.9.4 into `dashboard/static/vendor/leaflet/` — the CDN dependency is gone. Verified live: page loads under the CSP with **zero console messages**, tiles still load, and `escapeHtml('<img src=x onerror=alert(1)>')` returns escaped text.
+- [x] **T22** Safe file handling + payload size — done 2026-10-12. `/api/damage` is affected-only by default (36 of 117 features) and drops the unused `osm_tags` blob: **90.5 KB → 23.5 KB**, or **16.8 KB gzipped** for the full layer via `?all=1`. Responses are capped at `MAX_FEATURES`, JSON is gzipped when the client asks, `_is_inside()` refuses to serve anything outside the results/report directories, and the file this app writes is chmod'ed owner-only where the OS allows. Verified live plus 12 tests.
 - [ ] **T36** Dependency hygiene
 - [ ] **T34** Provenance manifest + rule checks
 - [ ] **T35** Safe deserialization / model supply chain

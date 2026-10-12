@@ -524,9 +524,10 @@ function addDamageLayers(data) {
       features: buildingFeatures.map(f => ({
         type: 'Feature',
         properties: {
+          // The server sends these two; the raw osm_tags blob is not rendered
+          // anywhere, so it is not shipped to the browser (T22).
           damage: f.properties.damage_level,
           ratio: f.properties.damage_overlap_ratio || 0,
-          osm_tags: f.properties.osm_tags || {},
         },
         geometry: f.geometry
       }))
