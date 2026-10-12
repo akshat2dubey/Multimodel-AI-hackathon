@@ -15,6 +15,17 @@ import pytest
 
 TOKEN_HEADER = {"X-Jalnetra-Token": "unit-test-token"}
 VALID_BBOX = [10.0, 20.0, 11.0, 21.0]
+# What a custom AOI must carry: run_pipeline.py cannot invent an area name or
+# acquisition dates, so the dashboard refuses a half-filled request (400)
+# instead of accepting it and letting the job die a second later.
+VALID_BODY = {
+    "bbox": VALID_BBOX,
+    "area": "toy area",
+    "event_date": "2026-08-26",
+    "osm_snapshot": "2026-07-27",
+    "before_date": "2026-08-14",
+    "after_date": "2026-08-26",
+}
 FAKE_RUN_ID = "11111111-1111-1111-1111-111111111111"
 
 
@@ -62,7 +73,7 @@ def test_post_run_returns_202_with_a_run_id(dashboard, monkeypatch):
 
     response = client.post(
         "/api/runs",
-        json={"bbox": VALID_BBOX, "event_date": "2026-08-26"},
+        json=VALID_BODY,
         headers=TOKEN_HEADER,
     )
 
@@ -80,10 +91,10 @@ def test_second_run_while_one_is_running_is_a_conflict(dashboard, monkeypatch):
     _stub_launch(dashboard, monkeypatch)
     client = dashboard.app.test_client()
 
-    first = client.post("/api/runs", json={"bbox": VALID_BBOX}, headers=TOKEN_HEADER)
+    first = client.post("/api/runs", json=VALID_BODY, headers=TOKEN_HEADER)
     assert first.status_code == 202
 
-    second = client.post("/api/runs", json={"bbox": VALID_BBOX}, headers=TOKEN_HEADER)
+    second = client.post("/api/runs", json=VALID_BODY, headers=TOKEN_HEADER)
     assert second.status_code == 409, (
         "a second POST while a job is running must be refused with 409 — two "
         "concurrent runs would fight over the same results/ directory"
@@ -102,7 +113,7 @@ def test_run_status_reports_idle_then_the_active_job(dashboard, monkeypatch):
     )
 
     _stub_launch(dashboard, monkeypatch)
-    client.post("/api/runs", json={"bbox": VALID_BBOX}, headers=TOKEN_HEADER)
+    client.post("/api/runs", json=VALID_BODY, headers=TOKEN_HEADER)
 
     running = client.get("/api/run-status").get_json()
     assert running["state"] == "running"
@@ -130,7 +141,7 @@ def test_cancel_without_an_active_job_is_a_conflict(dashboard):
 def test_cancel_marks_the_job_cancelled(dashboard, monkeypatch):
     _stub_launch(dashboard, monkeypatch)
     client = dashboard.app.test_client()
-    client.post("/api/runs", json={"bbox": VALID_BBOX}, headers=TOKEN_HEADER)
+    client.post("/api/runs", json=VALID_BODY, headers=TOKEN_HEADER)
 
     response = client.post("/api/cancel", headers=TOKEN_HEADER)
 
@@ -153,7 +164,7 @@ def test_foreign_origin_is_rejected_even_with_the_right_token(dashboard, monkeyp
 
     response = client.post(
         "/api/runs",
-        json={"bbox": VALID_BBOX},
+        json=VALID_BODY,
         headers={**TOKEN_HEADER, "Origin": "http://evil.example"},
     )
 
@@ -176,7 +187,7 @@ def test_loopback_origin_is_accepted(dashboard, monkeypatch):
         monkeypatch.setattr(dashboard, "_active_job", None)
         response = client.post(
             "/api/runs",
-            json={"bbox": VALID_BBOX},
+            json=VALID_BODY,
             headers={**TOKEN_HEADER, "Origin": origin},
         )
         assert response.status_code == 202, (
@@ -198,10 +209,37 @@ def test_bad_bbox_is_rejected_before_any_process_starts(dashboard, monkeypatch):
         assert response.get_json()["field"] == "bbox"
 
 
+def test_custom_area_without_dates_is_refused_with_the_missing_fields(dashboard, monkeypatch):
+    """A bbox alone cannot run, so it is refused with 400 rather than accepted.
+
+    The pipeline needs an area name, an OSM snapshot and the two acquisition
+    dates; accepting the request and letting the job exit 2 a second later reads
+    as a broken system instead of an incomplete form.
+    """
+    def _must_not_run(argv, params):  # pragma: no cover - must never be called
+        raise AssertionError("an incomplete request must not start a job")
+
+    monkeypatch.setattr(dashboard, "_launch_job", _must_not_run)
+    client = dashboard.app.test_client()
+
+    response = client.post("/api/runs", json={"bbox": VALID_BBOX}, headers=TOKEN_HEADER)
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload["field"] == "area"
+    assert "osm_snapshot" in payload["error"] and "before_date" in payload["error"]
+
+    # A preset supplies all of them, so the same bbox is accepted with one.
+    _stub_launch(dashboard, monkeypatch)
+    with_preset = client.post(
+        "/api/runs", json={"preset": "trishuli", "bbox": VALID_BBOX}, headers=TOKEN_HEADER
+    )
+    assert with_preset.status_code == 202
+
+
 def test_run_status_payload_carries_no_paths_or_secrets(dashboard, monkeypatch):
     _stub_launch(dashboard, monkeypatch)
     client = dashboard.app.test_client()
-    client.post("/api/runs", json={"bbox": VALID_BBOX}, headers=TOKEN_HEADER)
+    client.post("/api/runs", json=VALID_BODY, headers=TOKEN_HEADER)
 
     body = client.get("/api/run-status").get_data(as_text=True)
 

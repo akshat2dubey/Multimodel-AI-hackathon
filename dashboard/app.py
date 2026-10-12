@@ -437,6 +437,27 @@ def _parse_run_request(payload: dict) -> dict:
     # button still works. A judge-entered bbox always takes precedence.
     if not any(params.values()):
         params["preset"] = DEFAULT_PRESET
+        return params
+
+    # A custom AOI must carry everything run_meta needs, unless a preset supplies
+    # it. The dashboard cannot invent an area name or acquisition dates (choosing
+    # them from the archive is a separate feature), so a half-filled request is
+    # rejected here with the exact fields that are missing. Without this the
+    # request is accepted with 202 and the job dies a second later with exit 2,
+    # which reads to a judge as "the system is broken" rather than "you left a
+    # field empty".
+    custom_aoi = bool(params["bbox"]) or any(
+        params.get(key) is not None for key in ("center_lat", "center_lon", "extent")
+    )
+    if custom_aoi and not params.get("preset"):
+        needed = ("area", "event_date", "osm_snapshot", "before_date", "after_date")
+        missing = [name for name in needed if not params.get(name)]
+        if missing:
+            return (
+                "a custom area needs " + ", ".join(missing)
+                + " (or send preset=<name> to inherit them)",
+                missing[0],
+            )
     return params
 
 

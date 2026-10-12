@@ -19,7 +19,17 @@ sys.path.insert(0, str(REPO_ROOT))
 
 
 FAKE_RUN_ID = "22222222-2222-2222-2222-222222222222"
-VALID_BODY = {"bbox": "10,20,11,21", "event_date": "2026-08-26"}
+# A complete request: a custom AOI needs the area name, the OSM snapshot and the
+# two acquisition dates as well as the bbox, otherwise it is a 400 and never
+# reaches the launch (and so would never spend rate-limit budget).
+VALID_BODY = {
+    "bbox": "10,20,11,21",
+    "area": "toy area",
+    "event_date": "2026-08-26",
+    "osm_snapshot": "2026-07-27",
+    "before_date": "2026-08-14",
+    "after_date": "2026-08-26",
+}
 
 
 @pytest.fixture()
