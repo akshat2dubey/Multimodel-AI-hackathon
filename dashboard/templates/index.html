@@ -4,8 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Jalnetra — Track B Dashboard</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Leaflet is vendored under static/vendor so the dashboard works offline and a
+     strict Content-Security-Policy can forbid third-party scripts (T21). -->
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css" />
+<script src="/static/vendor/leaflet/leaflet.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; }
@@ -306,11 +308,24 @@
   </div>
 </div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 // The token for this server process, injected by the "/" route in
 // dashboard/app.py. Keeping it in the page means the operator never has to copy
 // a secret out of the console to run their own demo. It is never in a URL.
 const JALNETRA_TOKEN = "{{ pipeline_token }}";
+
+// ─── Escaping ───────────────────────────────────────────
+// OpenStreetMap tags (village and road names) can be edited by anyone, and they
+// are rendered into map popups and the sidebar list. Escaping them here means a
+// malicious or vandalised "name" tag cannot inject markup into the page.
+function escapeHtml(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ─── Map Initialization ────────────────────────────────
 // The centre comes from /api/status (config/presets.py) on first load; this is
@@ -547,7 +562,7 @@ function addDamageLayers(data) {
       const d = feature.properties.damage;
       const r = feature.properties.ratio;
       return `<b>Building</b><br>` +
-        `Damage: <span class="badge ${d === 'DESTROYED' ? 'critical' : d === 'SEVERELY_DAMAGED' ? 'high' : d === 'PARTIAL' ? 'moderate' : 'low'}">${d}</span><br>` +
+        `Damage: <span class="badge ${d === 'DESTROYED' ? 'critical' : d === 'SEVERELY_DAMAGED' ? 'high' : d === 'PARTIAL' ? 'moderate' : 'low'}">${escapeHtml(d)}</span><br>` +
         `Flood overlap: ${(r * 100).toFixed(1)}%`;
     });
   }
@@ -647,10 +662,10 @@ function addCutoffLayer(data) {
     }).addTo(map);
 
     marker.bindPopup(`
-      <b>🚫 Cut off: ${v.name}</b><br>
+      <b>🚫 Cut off: ${escapeHtml(v.name)}</b><br>
       <span class="meta">${lat.toFixed(4)}, ${lon.toFixed(4)}</span><br>
       Structures cut off: <b>${n}</b><br>
-      Nearest reachable town: ${nearest}<br>
+      Nearest reachable town: ${escapeHtml(nearest)}<br>
       Distance: ${dist} km<br>
       <span class="badge critical">NO ROAD ACCESS</span>
     `);
@@ -665,11 +680,11 @@ function addCutoffLayer(data) {
   const shown = villages.slice(0, 10);
   listEl.innerHTML = shown.map((v, i) => `
     <div class="cutoff-item">
-      <div class="name">#${i+1} ${v.name || 'Unnamed'}
+      <div class="name">#${i+1} ${escapeHtml(v.name || 'Unnamed')}
         <span style="color:#888; font-weight:400;">(${v.structures_cut_off || 1})</span></div>
       <div class="meta">
         ${v.coordinates ? v.coordinates.latitude.toFixed(4) + ', ' + v.coordinates.longitude.toFixed(4) : '—'}
-        &middot; Nearest: ${v.nearest_reachable_town_name || '—'}
+        &middot; Nearest: ${escapeHtml(v.nearest_reachable_town_name || '—')}
         &middot; ${(v.min_distance_km === null || v.min_distance_km === undefined) ? '—' : v.min_distance_km} km
       </div>
     </div>
@@ -700,7 +715,7 @@ function addFloodPathLayer(data) {
     const markers = settlementFeatures.map(f => {
       const coords = f.geometry.coordinates;
       return L.marker([coords[1], coords[0]])
-        .bindPopup(`<b>${f.properties.name}</b><br>Along flood path<br>${f.properties.distance_along_path_km} km from start`)
+        .bindPopup(`<b>${escapeHtml(f.properties.name)}</b><br>Along flood path<br>${escapeHtml(f.properties.distance_along_path_km)} km from start`)
         .addTo(map);
     });
     if (markers.length > 0) {

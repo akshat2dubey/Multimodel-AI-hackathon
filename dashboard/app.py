@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, g, jsonify, render_template, request, send_from_directory
 
 from config.presets import (  # noqa: E402  (path set up above)
     AREA as CASE_STUDY_AREA,
@@ -55,6 +55,45 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 # browser never needs cross-origin permission. `CORS(app)` reflected any Origin
 # back as Access-Control-Allow-Origin, which let any page you happened to visit
 # read every result while the dashboard was running.
+
+# ─── Security headers ───────────────────────────────────────────────────────
+# The dashboard renders OpenStreetMap tags, which anyone can edit, so the CSP is
+# the backstop behind the escaping in the templates. Leaflet is served from
+# /static/vendor (no CDN), so scripts are 'self' plus a per-response nonce for
+# the page's own inline block; styles stay inline because each page carries its
+# own small stylesheet. Map tiles are the only third-party resource allowed.
+TILE_HOSTS = "https://*.basemaps.cartocdn.com"
+CSP = (
+    "default-src 'self'; "
+    f"img-src 'self' data: {TILE_HOSTS}; "
+    "script-src 'self' 'nonce-{nonce}'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "font-src 'self' data:; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+
+@app.before_request
+def _attach_csp_nonce():
+    """One nonce per response, so only this page's own inline script may run."""
+    g.csp_nonce = secrets.token_urlsafe(16)
+
+
+@app.after_request
+def _security_headers(response):
+    response.headers["Content-Security-Policy"] = CSP.format(
+        nonce=getattr(g, "csp_nonce", "")
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    # Results change on every run: never let a browser or proxy reuse them.
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 # results/ is the one directory the whole pipeline writes to; importing it from
 # config keeps the dashboard and run_pipeline.py from drifting apart.
@@ -504,7 +543,9 @@ def index():
     without the operator copying it out of the console. It is never placed in a
     URL, and a foreign page cannot read this response (no CORS, T06).
     """
-    return render_template("index.html", pipeline_token=PIPELINE_TOKEN)
+    return render_template(
+        "index.html", pipeline_token=PIPELINE_TOKEN, csp_nonce=g.csp_nonce
+    )
 
 
 @app.route("/api/status")
@@ -775,7 +816,7 @@ def report_page():
 @app.route("/demo")
 def demo_mode():
     """Run in demo mode with sample data (no real satellite data needed)."""
-    return render_template("demo.html")
+    return render_template("demo.html", csp_nonce=g.csp_nonce)
 
 
 def _token_ok() -> bool:

@@ -26,6 +26,8 @@ models/*
 *.jpeg
 *.png
 *.gif
+# except the vendored front-end assets the dashboard ships with
+!dashboard/static/vendor/**
 *.pdf
 *.zip
 *.tar.gz
