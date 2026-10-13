@@ -58,6 +58,29 @@ def is_demo_dir(path) -> bool:
     p = _Path(path)
     return p.name == RESULTS_DEMO_NAME or (p / DEMO_NOTICE_FILENAME).is_file()
 
+
+def demo_notice_blocker(results_dir) -> str | None:
+    """Why a REAL run must not write into `results_dir`, or None when it may.
+
+    The notice file is what makes the dashboard warn a viewer that the numbers
+    on screen are fabricated. If a real run left it in place, the real flood
+    extent would be served under a "SYNTHETIC DEMO DATA" banner — a judge would
+    have no way to tell which claim is true — and if the notice were deleted
+    while the fixture's own artifacts stayed behind, the opposite error would
+    happen. Either way the directory is ambiguous, so the run stops and asks a
+    human to resolve it instead of guessing.
+    """
+    from pathlib import Path as _Path
+
+    notice = _Path(results_dir) / DEMO_NOTICE_FILENAME
+    if not notice.is_file():
+        return None
+    return (
+        f"{notice} marks this directory as the SYNTHETIC fixture, so a real run "
+        "would be served under a demo warning. Move the fixture aside first "
+        f"(e.g. move {notice.parent} to {RESULTS_DEMO_NAME}/), then re-run."
+    )
+
 # --- Case-study presets -----------------------------------------------------
 # A preset is what a judge flips when they want a different corridor:
 #

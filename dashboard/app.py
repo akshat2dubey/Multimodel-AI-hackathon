@@ -28,9 +28,9 @@ import secrets
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 # The dashboard is normally started as `cd dashboard && python app.py`, so the
 # project root is NOT on sys.path. Add it before importing config.presets — the
@@ -40,7 +40,16 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from flask import Flask, g, jsonify, render_template, request, send_from_directory
+from flask import (
+    Flask,
+    g,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+    session,
+)
 from werkzeug.exceptions import HTTPException
 
 from config.presets import (  # noqa: E402  (path set up above)
@@ -87,6 +96,27 @@ CSP = (
 def _attach_csp_nonce():
     """One nonce per response, so only this page's own inline script may run."""
     g.csp_nonce = secrets.token_urlsafe(16)
+
+
+@app.before_request
+def _require_login():
+    """Gate every route behind the login when a password is configured.
+
+    /static/* and /login stay reachable without a session (the sign-in page needs
+    its own stylesheet); a browser is sent to the form, an /api/* caller gets a
+    401 it can act on. A request carrying the pipeline token counts as an API
+    client, so scripts and the CLI never have to hold a browser session.
+    """
+    if not LOGIN_REQUIRED:
+        return None
+    path = request.path
+    if path.startswith("/static/") or path in ("/login", "/favicon.ico"):
+        return None
+    if session.get(AUTH_SESSION_KEY) or _token_ok():
+        return None
+    if path.startswith("/api/"):
+        return jsonify({"error": "authentication required", "status": 401}), 401
+    return redirect("/login?next=" + quote(request.full_path.rstrip("?") or "/", safe="/?=&"))
 
 
 @app.errorhandler(Exception)
@@ -181,6 +211,103 @@ PIPELINE_TOKEN_HEADER = "X-Jalnetra-Token"
 # Loopback covers `localhost`, `127.0.0.1` and IPv6 `::1`, on any port, so a dev
 # server on a free port is not blocked by its own allowlist.
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+# ─── Login (session auth) ───────────────────────────────────────────────────
+# Pages and API are gated behind a password when one is configured. Two ways to
+# configure it, because two different people start this server:
+#
+#   * JALNETRA_DASHBOARD_PASSWORD=<password>   — an explicit choice, or
+#   * `python app.py`                          — main() generates one and prints
+#     it once, so a server started for a demo asks for a login by default.
+#
+# JALNETRA_AUTH=off switches the gate off entirely: the loopback-only, no-login
+# mode is still the documented behaviour for a LAN demo, and it must be
+# deliberate rather than accidental.
+AUTH_SESSION_KEY = "jalnetra_authenticated"
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_MAX_ATTEMPTS = 5
+
+
+class _Auth:
+    """The login state, in one place so main() can turn it on at startup."""
+
+    def __init__(self) -> None:
+        self.password = os.environ.get("JALNETRA_DASHBOARD_PASSWORD", "").strip()
+        self.generated = False
+        requested = os.environ.get("JALNETRA_AUTH", "").strip().lower()
+        # Explicit opt-in, or a password that was supplied. `off` always wins.
+        self.enabled = bool(self.password) or requested in ("on", "1", "true", "yes")
+        if requested in ("off", "0", "false", "no"):
+            self.enabled = False
+
+    def enable(self, password: str | None = None) -> str:
+        """Turn the gate on, generating a password when none was configured."""
+        if password:
+            self.password, self.generated = password, False
+        elif not self.password:
+            self.password, self.generated = secrets.token_urlsafe(12), True
+        self.enabled = True
+        return self.password
+
+    def off_by_request(self) -> bool:
+        return os.environ.get("JALNETRA_AUTH", "").strip().lower() in ("off", "0", "false", "no")
+
+
+AUTH = _Auth()
+LOGIN_REQUIRED = AUTH.enabled
+
+# Sessions are signed with this key. A per-process key means a restart logs
+# everyone out, which is the safe default for a secret that would otherwise have
+# to be stored somewhere; JALNETRA_SECRET_KEY keeps sessions across restarts.
+app.secret_key = os.environ.get("JALNETRA_SECRET_KEY", "").strip() or secrets.token_hex(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # The documented deployment is plain http on loopback, where a Secure cookie
+    # would simply never be sent back.
+    SESSION_COOKIE_SECURE=False,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
+)
+
+_login_attempts: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _login_rate_limited() -> bool:
+    """A per-client sliding window over login attempts.
+
+    A login form is a password-guessing surface, so attempts are bounded per
+    client and the refusal is a 429 rather than a silent delay.
+    """
+    key = _client_key()
+    now = time.time()
+    with _login_lock:
+        recent = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+        if len(recent) >= LOGIN_MAX_ATTEMPTS:
+            _login_attempts[key] = recent
+            return True
+        recent.append(now)
+        _login_attempts[key] = recent
+    return False
+
+
+def _authenticated() -> bool:
+    """True when this request may see the dashboard."""
+    if not LOGIN_REQUIRED:
+        return True
+    return bool(session.get(AUTH_SESSION_KEY))
+
+
+def _safe_next(target: str | None) -> str:
+    """A post-login redirect that stays on this origin.
+
+    Only a single-slash absolute path is accepted: ``//evil.example`` is
+    protocol-relative and an absolute URL is off-site, so either would turn the
+    login page into an open redirect.
+    """
+    if not target or not target.startswith("/") or target.startswith("//"):
+        return "/"
+    return target
 
 
 # ─── Background pipeline job ────────────────────────────────────────────────
@@ -864,6 +991,139 @@ def load_flood_mask_info() -> dict | None:
     return None
 
 
+# ─── Provenance: what actually produced the numbers on screen ────────────────
+# The dashboard's claim is that the layers and counts it renders were computed
+# from real acquisitions by this code. When that cannot be shown, it has to say
+# so: a page of numbers with no traceable source is worse than an empty page,
+# because a reader cannot tell the two apart. Everything below exists to answer
+# "which scenes, processed by what, and when" — or to admit it does not know.
+BAND_SIDECAR = "S1_PROCESSED.json"
+RESULTS_MANIFEST = "manifest.json"
+
+
+def band_provenance(label: str) -> dict:
+    """One date's analysis bands, as preprocess_s1.py described them.
+
+    Empty when the bands carry no sidecar — which is the signal that matters
+    most here: nothing in the directory then proves which scene the numbers came
+    from, and the UI must not imply otherwise.
+    """
+    path = DATA / "sentinel1" / label / BAND_SIDECAR
+    try:
+        sidecar = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    stats = sidecar.get("band_stats") or {}
+    return {
+        "archive": sidecar.get("archive"),
+        "product_name": sidecar.get("product_name"),
+        "acquired_utc": sidecar.get("acquired_utc"),
+        "source": sidecar.get("source"),
+        "units": sidecar.get("units"),
+        "processing": sidecar.get("processing"),
+        "pixel_size_m": sidecar.get("pixel_size_m"),
+        "bbox_deg": sidecar.get("bbox_deg"),
+        "relative_orbit": sidecar.get("relative_orbit"),
+        "observed_fraction": {
+            band: value.get("observed_fraction")
+            for band, value in stats.items()
+            if isinstance(value, dict)
+        },
+    }
+
+
+def results_provenance() -> dict:
+    """Whether the served results were computed from real acquisitions — and when.
+
+    Three states, kept distinct because they call for different words on screen:
+
+      * ``live``  — a run wrote run_meta.json AND a manifest into this directory,
+        and both analysis dates carry their own band sidecar;
+      * ``stale`` — artifacts are present but that chain is incomplete, so they
+        may be an older run or a fixture whose inputs were since replaced;
+      * ``empty`` — no run has produced a flood mask here at all.
+
+    ``missing`` names exactly what broke the chain, so the answer is actionable
+    rather than a vague warning.
+    """
+    run_meta = current_run_meta()
+
+    manifest: dict = {}
+    manifest_path = RESULTS / RESULTS_MANIFEST
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+
+    bands = {label: band_provenance(label) for label in ("before", "after")}
+
+    newest_name = None
+    newest_mtime = 0.0
+    if RESULTS.is_dir():
+        for candidate in RESULTS.iterdir():
+            try:
+                if candidate.is_file():
+                    mtime = candidate.stat().st_mtime
+                else:
+                    continue
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest_mtime, newest_name = mtime, candidate.name
+
+    has_results = (RESULTS / "flood_mask.tif").is_file() or (RESULTS / "change_detection.json").is_file()
+    chain_complete = bool(run_meta) and bool(manifest) and all(bands.values())
+    if not has_results:
+        state = "empty"
+    elif chain_complete:
+        state = "live"
+    else:
+        state = "stale"
+
+    missing: list[str] = []
+    if not run_meta:
+        missing.append("run_meta.json")
+    if not manifest:
+        missing.append(f"{RESULTS_MANIFEST} (the provenance record written by the run)")
+    for label, band in bands.items():
+        if not band:
+            missing.append(f"the {label}-date band sidecar (data/sentinel1/{label}/{BAND_SIDECAR})")
+
+    notes = {
+        "live": (
+            "These layers were computed by a run in this directory from the "
+            "acquisitions named below."
+        ),
+        "stale": (
+            "These layers cannot be traced to a run in this directory. Treat them "
+            "as illustrative, not as measurements from the current code."
+        ),
+        "empty": "No run has produced a flood mask in this directory yet.",
+    }
+
+    return {
+        "state": state,
+        "note": notes[state],
+        "missing": missing,
+        "computed_at": manifest.get("created_utc") or run_meta.get("generated_at"),
+        "method": manifest.get("method") or (load_flood_mask_info() or {}).get("method"),
+        "rules_check": manifest.get("rules_check") or {},
+        "newest_artifact": newest_name,
+        "newest_artifact_age_hours": (
+            round((time.time() - newest_mtime) / 3600.0, 2) if newest_mtime else None
+        ),
+        "bbox": run_meta.get("bbox"),
+        "aoi_confirmed": bool(run_meta.get("aoi_confirmed", False)),
+        "demo": serving_demo_data(),
+        "bands": bands,
+        "attribution": (
+            "Contains modified Copernicus Sentinel data (2026), processed locally; "
+            "© OpenStreetMap contributors (ODbL)"
+        ),
+    }
+
+
 @app.route("/")
 def index():
     """Serve the main dashboard page.
@@ -873,7 +1133,11 @@ def index():
     URL, and a foreign page cannot read this response (no CORS, T06).
     """
     return render_template(
-        "index.html", pipeline_token=PIPELINE_TOKEN, csp_nonce=g.csp_nonce
+        "index.html",
+        pipeline_token=PIPELINE_TOKEN,
+        csp_nonce=g.csp_nonce,
+        authenticated=bool(session.get(AUTH_SESSION_KEY)),
+        auth_enabled=LOGIN_REQUIRED,
     )
 
 
@@ -895,6 +1159,10 @@ def api_status():
     run_meta = current_run_meta()
     return jsonify({
         "status": "complete" if flood_mask_info else "in_progress",
+        # Whether these numbers can be traced to a real run, from which scenes,
+        # and when they were computed. The UI's banner is driven by `state`, so a
+        # stale directory is never presented as a fresh measurement.
+        "provenance": results_provenance(),
         # The served run's own metadata, falling back to the configured preset
         # before any run has written into this directory.
         "area": run_meta.get("area") or CASE_STUDY_AREA,
@@ -1177,6 +1445,64 @@ def demo_mode():
     return render_template("demo.html", csp_nonce=g.csp_nonce)
 
 
+# ─── Login ──────────────────────────────────────────────────────────────────
+# The gate itself is the before_request hook above; these two routes are the
+# form and the sign-out. Nothing here is a token: a session cookie is the only
+# credential the browser holds, and it is HttpOnly + SameSite=Lax, so a script on
+# another origin can neither read it nor ride it on a cross-site POST.
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Sign in. GET renders the form, POST checks the password.
+
+    The comparison is constant-time, attempts are rate-limited per client, and a
+    POST must be same-origin, so a foreign page can use this neither as a
+    password oracle nor as a CSRF pivot.
+    """
+    if not LOGIN_REQUIRED:
+        return redirect("/")
+
+    target = _safe_next(request.values.get("next"))
+    error = None
+
+    if request.method == "POST":
+        if not _origin_allowed(request.headers.get("Origin"), allow_opaque=True):
+            log.warning("cross-origin login attempt rejected")
+            return jsonify({"error": "forbidden", "status": 403}), 403
+        if _login_rate_limited():
+            log.warning("login rate limit hit for %s", _client_key())
+            return (
+                render_template(
+                    "login.html", error="Too many attempts. Wait a few minutes.",
+                    csp_nonce=g.csp_nonce, next=target,
+                ),
+                429,
+            )
+        supplied = request.form.get("password") or ""
+        if hmac.compare_digest(supplied, AUTH.password):
+            session.clear()
+            session[AUTH_SESSION_KEY] = True
+            session.permanent = True
+            log.info("login succeeded for %s", _client_key())
+            return redirect(target)
+        log.warning("failed login attempt from %s", _client_key())
+        error = "Incorrect password."
+
+    return render_template(
+        "login.html", error=error, csp_nonce=g.csp_nonce, next=target
+    )
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    """End the session. POST-only: a GET sign-out is a CSRF-able link."""
+    if not _origin_allowed(request.headers.get("Origin"), allow_opaque=True):
+        return jsonify({"error": "forbidden", "status": 403}), 403
+    session.clear()
+    return redirect("/login")
+
+
 # ─── Response size and file safety ──────────────────────────────────────────
 # A whole damage layer is mostly UNAFFECTED footprints, each carrying a copy of
 # every OSM tag, which made /api/damage ~88 KB to show 36 interesting features.
@@ -1245,7 +1571,7 @@ def _token_ok() -> bool:
     return hmac.compare_digest(supplied, PIPELINE_TOKEN)
 
 
-def _origin_allowed(origin: str | None) -> bool:
+def _origin_allowed(origin: str | None, *, allow_opaque: bool = False) -> bool:
     """True when a state-changing request may come from this Origin.
 
     A browser always attaches Origin to a cross-origin POST, so a hostile page is
@@ -1254,6 +1580,18 @@ def _origin_allowed(origin: str | None) -> bool:
     cannot be a cross-site browser attack and is allowed — DNS rebinding is
     covered too, because a rebound request still carries the attacker's Origin.
 
+    ``Origin: null`` is the opaque origin: a sandboxed iframe, a file:// page, or
+    an embedded browser view. It names no site, so it is evidence of nothing
+    either way. It is rejected by default (the CSRF guidance for a state-changing
+    route), and accepted only for the cookie-session routes when the caller asks
+    (``allow_opaque=True``), where it was verified live on 2026-10-13 that
+    rejecting it made the sign-in form impossible to submit from an embedded
+    browser — a 403 with no way for the user to proceed. The trade-off is
+    logged, and those two routes cannot change any server state: they only set or
+    clear the browser's own session cookie, behind the same password and attempt
+    limit. Every route that starts or cancels a run keeps the strict check and
+    still requires the pipeline token.
+
     The Host header is deliberately not second-guessed: the server binds
     loopback by default, and rejecting a Host that is not loopback would break
     the documented LAN demo (JALNETRA_HOST=0.0.0.0) without blocking anything the
@@ -1261,6 +1599,12 @@ def _origin_allowed(origin: str | None) -> bool:
     """
     if not origin:
         return True
+    if (origin.strip() or "").lower() == "null":
+        if allow_opaque:
+            log.info("opaque Origin accepted on %s (cookie-session route)", request.path)
+            return True
+        log.warning("opaque Origin rejected on %s", request.path)
+        return False
     host = (urlsplit(origin).hostname or "").lower()
     return host in LOOPBACK_HOSTS
 
@@ -1369,8 +1713,9 @@ if __name__ == "__main__":
         # Windows ships with PORT=0 in some environments, which makes Flask bind
         # a random port and the printed URL useless. Fall back to 5000.
         port = 5000
-    # Bind loopback by default: the dashboard has no login, so binding 0.0.0.0
-    # puts every result on whatever Wi-Fi the demo box is attached to.
+    # Bind loopback by default. The login gate is the second line of defence, not
+    # a reason to widen the bind: a password protects the session, but the port
+    # itself still reaches the results directory and the pipeline start endpoint.
     # JALNETRA_HOST=0.0.0.0 opts in explicitly (HOST is the older name, still
     # honoured so existing commands keep working).
     host = os.environ.get("JALNETRA_HOST") or os.environ.get("HOST") or "127.0.0.1"
@@ -1381,10 +1726,25 @@ if __name__ == "__main__":
         os.environ.get("JALNETRA_DEBUG") or os.environ.get("FLASK_DEBUG") or "0"
     ).lower() in ("1", "true", "yes", "on")
     debug = _wants_debug and host in ("127.0.0.1", "localhost", "::1")
+    # A server started by a person requires a login unless the operator said
+    # otherwise. A password is generated when none was configured, and printed
+    # exactly once, here — the same contract as the pipeline token below.
+    if not AUTH.off_by_request() and not AUTH.enabled:
+        AUTH.enable()
+    LOGIN_REQUIRED = AUTH.enabled
+
     print(f'\
 Jalnetra Dashboard — Open: http://{host}:{port}  (debug={debug})\
 Features: flood map, OSM damage, cut-offs, report, flood path\
 ')
+    if LOGIN_REQUIRED:
+        print(f"Login:      http://{host}:{port}/login")
+        if AUTH.generated:
+            print("Dashboard password (shown once): " + AUTH.password)
+        else:
+            print("Dashboard password: from JALNETRA_DASHBOARD_PASSWORD")
+    else:
+        print("Login:      disabled (JALNETRA_AUTH=off) — anyone who can reach the port sees the results")
     if TOKEN_IS_GENERATED:
         # Printed exactly once, here, and never logged: this is the operator's
         # copy for curl/CLI use. The served page already carries it for the UI.

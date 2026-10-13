@@ -63,7 +63,12 @@ BANNER = "*** SYNTHETIC DEMO DATA — NOT REAL EARTH OBSERVATION DATA ***"
 def run(label: str, cmd: list[str]) -> bool:
     print(f"\n{'=' * 72}\n {label}\n{'=' * 72}")
     print("  $ " + " ".join(cmd))
-    result = subprocess.run(cmd, cwd=ROOT, text=True)
+    # Decode the child's output as UTF-8 with errors="replace" for the same
+    # reason run_pipeline.py does: these scripts print ✓/⚠/❌, and reading them
+    # through the console's cp1252 codec killed the run with UnicodeDecodeError.
+    result = subprocess.run(
+        cmd, cwd=ROOT, text=True, encoding="utf-8", errors="replace"
+    )
     if result.returncode != 0:
         print(f"\n  FAILED (exit {result.returncode}): {label}")
         return False

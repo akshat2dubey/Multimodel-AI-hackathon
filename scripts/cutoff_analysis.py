@@ -495,7 +495,11 @@ def _building_cluster_settlements(buildings_gdf: gpd.GeoDataFrame, crs, snap_jun
             if nm:
                 names.append(str(nm))
         rep_pt = Point(float(xs.mean()), float(ys.mean()))
-        node_id = f"cluster_{root}_{len(idxs)}"
+        if len(idxs) == 1 and tags_list[idxs[0]].get("id"):
+            node_id = str(tags_list[idxs[0]].get("id"))
+        else:
+            first_id = tags_list[idxs[0]].get("id", root)
+            node_id = f"cluster_{first_id}_{len(idxs)}"
         reps.append((node_id, rep_pt, {
             "cluster_size": len(idxs),
             "name": names[0] if names else f"Settlement_{root}",
@@ -674,11 +678,7 @@ def analyze_cutoffs(
             if node_id in {n for n in town_nodes}:
                 continue
             pos = (pt.x, pt.y)
-            nearest = _find_nearest_node(graph, node_positions, pos, node_type="road_junction")
-            if nearest is None:
-                continue
-            settlement_nodes.append(nearest)
-            settlement_node_ids.add(nearest)
+            nearest = _find_nearest_node(graph, node_positions, pos, max_dist_km=2.0, node_type="road_junction")
             graph.add_node(
                 node_id,
                 pos=pos,
@@ -688,7 +688,10 @@ def analyze_cutoffs(
             )
             node_positions[node_id] = pos
             node_types[node_id] = "settlement"
-            graph.add_edge(node_id, nearest, length=0.0, flooded=False, connector=True)
+            settlement_nodes.append(node_id)
+            settlement_node_ids.add(node_id)
+            if nearest is not None and nearest in graph:
+                graph.add_edge(node_id, nearest, length=0.0, flooded=False, connector=True)
     else:
         # No place nodes: use building clusters as settlements.
         clusters = _building_cluster_settlements(
@@ -698,15 +701,19 @@ def analyze_cutoffs(
         )
         for node_id, pt, tags in clusters:
             pos = (pt.x, pt.y)
-            nearest = _find_nearest_node(graph, node_positions, pos, node_type="road_junction")
-            if nearest is None:
-                continue
-            settlement_nodes.append(nearest)
-            settlement_node_ids.add(nearest)
-            graph.add_node(node_id, pos=pos, type="settlement", **_safe_node_attrs(tags))
+            nearest = _find_nearest_node(graph, node_positions, pos, max_dist_km=2.0, node_type="road_junction")
+            graph.add_node(
+                node_id,
+                pos=pos,
+                type="settlement",
+                name=tags.get("name", node_id),
+                **_safe_node_attrs(tags, reserve={"name"}),
+            )
             node_positions[node_id] = pos
             node_types[node_id] = "settlement"
-            if nearest in graph:
+            settlement_nodes.append(node_id)
+            settlement_node_ids.add(node_id)
+            if nearest is not None and nearest in graph:
                 graph.add_edge(node_id, nearest, length=0.0, flooded=False, connector=True)
 
     n_settlements = len(settlement_node_ids)

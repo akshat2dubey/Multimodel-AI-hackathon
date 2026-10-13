@@ -105,6 +105,14 @@ def test_run_pipeline_publishes_run_meta_and_hands_it_to_every_stage(tmp_path, m
     monkeypatch.setattr(run_pipeline, "REPORT_DIR", report)
     monkeypatch.setattr(run_pipeline.sys, "argv", ["run_pipeline.py", "--preset", "trishuli"])
 
+    # The preprocessing stage is mandatory and fail-closed: without the archive a
+    # label actually downloaded, run_pipeline stops (exit 4) instead of analysing
+    # stale rasters. run() is stubbed below, so these stand-ins are never opened.
+    import toydata
+
+    for label in ("before", "after"):
+        toydata.placeholder_safe_archive(data, label)
+
     commands: list[list[str]] = []
 
     def fake_run(cmd, cwd=None):  # noqa: ANN001 - mirrors run_pipeline.run

@@ -33,6 +33,14 @@ import torch.nn.functional as F
 from rasterio.windows import Window
 from tqdm import tqdm
 
+# Project root on sys.path so `config.run_meta` resolves whether this is run as
+# `python scripts/inference.py` or imported by the tests.
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.run_meta import load_run_meta  # noqa: E402
+
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -774,6 +782,23 @@ def main():
             f"(default {MIN_COMPONENT_PIXELS})"
         ),
     )
+    parser.add_argument(
+        "--require-provenance",
+        action="store_true",
+        help=(
+            "Refuse to run unless both before and after bands carry the "
+            "S1_PROCESSED.json sidecar preprocess_s1.py writes. run_pipeline.py "
+            "always passes this."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unprovenanced",
+        action="store_true",
+        help=(
+            "Permit bands with no provenance sidecar (a hand-built fixture only — "
+            "never a real run). Ignored when --require-provenance is given."
+        ),
+    )
     args = parser.parse_args()
 
     # Device
@@ -824,6 +849,65 @@ def main():
     after_dir = args.after_dir
     if not (after_dir / "s1_after_VV.tif").exists() and (after_dir / "after").is_dir():
         after_dir = after_dir / "after"
+
+    # ── Provenance gate ──────────────────────────────────────────────────────
+    # Only imagery this run produced may be analysed. preprocess_s1.py writes
+    # S1_PROCESSED.json beside the bands, naming the product, the acquisition and
+    # the grid; without it the tifs could be any age, any calibration and any
+    # place, and a mask computed from them is a number nobody can trace back to a
+    # scene. That is exactly how a dashboard ends up rendering results the
+    # current code would not produce, so the pipeline's runs are gated on it.
+    strict = args.require_provenance and not args.allow_unprovenanced
+    sidecars: dict = {}
+    for label, directory in (("before", before_dir), ("after", after_dir)):
+        sidecar = _load_s1_sidecar(directory)
+        if sidecar is None:
+            if strict:
+                print(
+                    f"❌ {directory} contains no S1_PROCESSED.json — these bands carry "
+                    "no provenance.\n   Run scripts/preprocess_s1.py (or "
+                    "run_pipeline.py) so the imagery is\n   derived from a named "
+                    "product, then run inference again.",
+                    file=sys.stderr,
+                )
+                sys.exit(4)
+            print(f"  ⚠️ {label} bands have no S1_PROCESSED.json sidecar")
+        else:
+            sidecars[label] = sidecar
+
+    if len(sidecars) == 2:
+        differences = []
+        for key in ("grid", "bbox_deg"):
+            if sidecars["before"].get(key) != sidecars["after"].get(key):
+                differences.append(key)
+        if differences:
+            print(
+                "❌ the before and after bands are not on the same grid "
+                f"({', '.join(differences)} differ).\n   A per-pixel change mask needs both "
+                "dates on one grid: preprocess both labels with the same --bbox.",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+        for label in ("before", "after"):
+            print(
+                f"  {label}: {sidecars[label].get('archive')} "
+                f"({sidecars[label].get('acquired_utc') or 'acquisition time unknown'})"
+            )
+        # If the run's own metadata is beside the output, the AOI the bands were
+        # warped onto must be the AOI the run claims to describe.
+        run_meta = load_run_meta(args.output)
+        if run_meta and run_meta.get("bbox"):
+            meta_bbox = [float(v) for v in run_meta["bbox"]]
+            side_bbox = [float(v) for v in (sidecars["before"].get("bbox_deg") or [])]
+            if side_bbox and any(abs(a - b) > 1e-6 for a, b in zip(meta_bbox, side_bbox)):
+                print(
+                    f"❌ the bands were warped onto {side_bbox} but run_meta.json says "
+                    f"{meta_bbox}.\n   The mask would describe an area the run does not "
+                    "claim — re-preprocess with the run's bbox.",
+                    file=sys.stderr,
+                )
+                sys.exit(4)
+
     # return_valid=True also yields the (H, W) observed-pixel mask: nodata collar
     # and radar shadow excluded, so the delivered valid_mask.tif is honest about
     # where the imagery can be trusted.

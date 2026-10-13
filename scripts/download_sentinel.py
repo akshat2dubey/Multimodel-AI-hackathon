@@ -31,8 +31,10 @@ Exit codes:
 """
 
 import argparse
+import hashlib
 import json
 import sys
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -243,34 +245,163 @@ def pick_same_track_pair(
     return before, after, orbit, warning
 
 
-def download_product(client: CDSEClient, product: Product, output_dir: Path, label: str, bbox: tuple[float, float, float, float]) -> Path:
-    """
-    Download one product and verify a real file landed.
+CATALOGUE_URL = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
 
-    Returns the downloaded path. Raises RuntimeError on a zero/truncated write.
+
+def catalogue_expectation(client: CDSEClient, product_name: str) -> dict:
+    """What the catalogue says this product should be: byte size and MD5.
+
+    The product name is looked up exactly (``Name eq``), which is the same query
+    the CDSE downloader itself uses, so no extra catalogue load is generated.
+
+    Returns an empty dict when the lookup fails: a missing expectation must not
+    block a download that is otherwise verifiable, since the archive's own zip
+    central directory is checked either way.
+    """
+    name = product_name if product_name.endswith((".SAFE", ".SEN3", ".nc")) else f"{product_name}.SAFE"
+    try:
+        session = client.downloader.session
+        response = session.get(
+            CATALOGUE_URL,
+            params={
+                "$filter": f"Name eq '{name}'",
+                "$select": "Id,Name,ContentLength,Checksum",
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        values = response.json().get("value") or []
+    except Exception as exc:  # pylint: disable=broad-except
+        print(
+            f"  ⚠ could not read the catalogue's size/checksum for {name}: {exc}",
+            file=sys.stderr,
+        )
+        return {}
+    if not values:
+        return {}
+    entry = values[0]
+    md5 = next(
+        (c.get("Value") for c in entry.get("Checksum", []) if c.get("Algorithm") == "MD5"),
+        None,
+    )
+    return {
+        "id": entry.get("Id"),
+        "name": entry.get("Name", name),
+        "bytes": int(entry["ContentLength"]) if entry.get("ContentLength") is not None else None,
+        "md5": md5.lower() if isinstance(md5, str) else None,
+    }
+
+
+def verify_safe_archive(path, *, expected_bytes=None, expected_md5=None) -> tuple[bool, str]:
+    """Is this file actually the complete product it claims to be?
+
+    Why this exists: the downloader skips a file that already exists, so a
+    transfer that ended early used to be trusted forever. A 622 MB prefix of a
+    1.26 GB product passed the old "bigger than 1 MB" check, was kept by
+    skip_existing, and every later run preprocessed it as if it were the scene.
+
+    Two layers, cheapest first:
+      * the zip central directory — a truncated archive cannot be opened, so
+        this catches a partial transfer with one seek;
+      * the catalogue's own ContentLength and MD5 — the strong check, and the
+        one that catches corruption rather than just truncation.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return False, "file is missing"
+    size = p.stat().st_size
+    if size < MIN_PRODUCT_BYTES:
+        return False, f"only {size:,} bytes (< {MIN_PRODUCT_BYTES:,}) — not a real product"
+    if expected_bytes is not None and size != int(expected_bytes):
+        return False, f"size {size:,} != catalogue {int(expected_bytes):,} (incomplete transfer)"
+    try:
+        with zipfile.ZipFile(p) as archive:
+            if not archive.namelist():
+                return False, "archive has no members"
+    except zipfile.BadZipFile as exc:
+        return False, f"not a readable SAFE archive ({exc})"
+    except OSError as exc:
+        return False, f"unreadable ({exc})"
+    if expected_md5:
+        digest = hashlib.md5()
+        with p.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != str(expected_md5).lower():
+            return False, "MD5 does not match the catalogue's checksum"
+    return True, f"verified ({size:,} bytes)"
+
+
+def download_product(client: CDSEClient, product: Product, output_dir: Path) -> Path:
+    """
+    Download one product and prove a complete one landed.
+
+    An existing file is verified before it is reused, and the download is
+    verified (zip structure, catalogue size, catalogue MD5) before it is kept —
+    the only outcomes are "a complete product" or a RuntimeError.
+
+    Preprocessing is deliberately NOT done here: it is an explicit step of
+    run_pipeline.py, so a download can never quietly decide which pixels the
+    analysis is allowed to see. (Taking the label and the bbox out of this
+    function is also what fixes the crash in main(): it called this with three
+    arguments while the signature demanded five, so the download step raised a
+    TypeError before it could ever fetch anything.)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    expected = catalogue_expectation(client, product.name)
+    if expected:
+        print(
+            f"  Catalogue says: {expected['bytes']:,} bytes, md5 {expected['md5']}"
+            if expected.get("bytes")
+            else f"  Catalogue entry found for {product.name}"
+        )
+
+    path = output_dir / f"{product.name}.zip"
+    if path.is_file():
+        ok, detail = verify_safe_archive(
+            path, expected_bytes=expected.get("bytes"), expected_md5=expected.get("md5")
+        )
+        if ok:
+            print(f"    OK  {path.name} already on disk and {detail}")
+            _write_product_info(output_dir, product, path, verified=expected, reused=True)
+            return path
+        print(
+            f"  ⚠ the file already on disk is not usable ({detail}) — re-downloading "
+            "instead of trusting it",
+            file=sys.stderr,
+        )
+        path.unlink(missing_ok=True)
+
     print(f"  Downloading {product.name} ...")
     try:
-        path = client.download(product, output_dir=str(output_dir))
+        downloaded = client.download(product, output_dir=str(output_dir), skip_existing=False)
     except CDSEError as exc:
         raise RuntimeError(f"CDSE download failed for {product.name}: {exc}") from exc
 
-    path = Path(path)
-    if not path.exists():
-        raise RuntimeError(f"CDSE reported success but {path} does not exist")
+    downloaded = Path(downloaded)
+    if not downloaded.exists():
+        raise RuntimeError(f"CDSE reported success but {downloaded} does not exist")
 
-    size = path.stat().st_size
-    if size < MIN_PRODUCT_BYTES:
+    ok, detail = verify_safe_archive(
+        downloaded, expected_bytes=expected.get("bytes"), expected_md5=expected.get("md5")
+    )
+    if not ok:
+        downloaded.unlink(missing_ok=True)
         raise RuntimeError(
-            f"downloaded file is only {size:,} bytes (< {MIN_PRODUCT_BYTES:,}) — "
-            "this is not a real GRD product"
+            f"the downloaded {downloaded.name} failed verification ({detail}) and was "
+            "deleted. A partial product must never reach the analysis: re-run to retry "
+            "the transfer."
         )
 
-    print(f"    OK  {path.name}  ({size / 1_048_576:.1f} MB)")
+    size = downloaded.stat().st_size
+    print(f"    OK  {downloaded.name}  ({size / 1_048_576:.1f} MB) — {detail}")
+    _write_product_info(output_dir, product, downloaded, verified=expected, reused=False)
+    return downloaded
 
-    # Metadata about a download that actually happened — not a stand-in for one.
+
+def _write_product_info(output_dir: Path, product: Product, path: Path, *, verified: dict, reused: bool) -> None:
+    """Record what was downloaded, and what it was checked against."""
     sidecar = {
         "product_name": product.name,
         "product_id": product.id,
@@ -278,50 +409,17 @@ def download_product(client: CDSEClient, product: Product, output_dir: Path, lab
         "acquired": product.datetime.isoformat() if product.datetime else None,
         "bbox": product.bbox,
         "downloaded_file": path.name,
-        "downloaded_bytes": size,
+        "downloaded_bytes": path.stat().st_size,
+        "relative_orbit": _relative_orbit(product),
+        "reused_existing_file": reused,
+        "verified_against_catalogue": bool(verified),
+        "catalogue_bytes": verified.get("bytes"),
+        "catalogue_md5": verified.get("md5"),
         "source": "Copernicus Data Space Ecosystem",
     }
     (output_dir / "PRODUCT_INFO.json").write_text(
         json.dumps(sidecar, indent=2), encoding="utf-8"
     )
-
-    # Convert the freshly downloaded SAFE into the preprocessed GeoTIFF layout
-    # the rest of the pipeline already reads (data/sentinel1/{before,after}/
-    # s1_{label}_VV.tif, s1_{label}_VH.tif) plus a units sidecar. Do not process
-    # the full scene here — preprocess_s1 requests a bbox-only Process API crop.
-    # Keep the old full-SAFE path behind a CLI flag; this call keeps the default
-    # behaviour faster, smaller, and quota-friendly.
-    try:
-        from preprocess_s1 import preprocess_product as _preprocess_product
-    except Exception as exc:  # pylint: disable=broad-except
-        print(
-            f"\n⚠ preprocessing skipped — cannot import preprocess_s1: {exc}\n"
-            "   The downloaded SAFE is on disk, but the pipeline cannot run until\n"
-            "   scripts/preprocess_s1.py is present and the Process API quota allows\n"
-            "   a bbox crop.\n",
-            file=sys.stderr,
-        )
-    else:
-        acq = product.datetime if product.datetime is not None else None
-        try:
-            _preprocess_product(
-                safe_zip=path,
-                output_dir=output_dir,
-                label=label,
-                bbox=bbox,
-                acquisition=acq,
-                orbit=_relative_orbit(product),
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            print(
-                f"\n⚠ preprocessing failed for {label}: {exc}\n"
-                "   The SAFE is on disk under data/sentinel1/. The pipeline cannot\n"
-                "   run until preprocessing succeeds or a synthetic/offline fixture is\n"
-                "   provided.\n",
-                file=sys.stderr,
-            )
-
-    return path
 
 
 def main() -> int:

@@ -61,7 +61,12 @@ def git_commit(repo_root: Path) -> str | None:
     try:
         out = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True, text=True,
+            # git can answer in the console's own encoding (a commit subject with
+            # an accent, a path with a non-ASCII character). Decoding that with
+            # cp1252 raises UnicodeDecodeError inside a reader thread and takes
+            # the manifest down with it, so decode defensively instead.
+            encoding="utf-8", errors="replace", timeout=10, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -182,6 +187,7 @@ def build_manifest(
     method: str | None = None,
     model: Path | None = None,
     sentinel_dir: Path | None = None,
+    stale_outputs: list[Path] | None = None,
 ) -> dict:
     checks = rules_check(run_meta, inputs, sentinel_dir)
     model_entry = None
@@ -205,6 +211,12 @@ def build_manifest(
         "model": model_entry,
         "inputs": _entries(inputs, repo_root),
         "outputs": _entries(outputs, repo_root),
+        # Present (as an honest, explicit list) only when the run was told to
+        # distinguish its own outputs from what was already on disk. A non-empty
+        # list is not a failure: it is the record that these files are NOT from
+        # this run, so nobody reads them as one.
+        **({"stale_outputs_not_from_this_run": sorted(p.name for p in stale_outputs)}
+           if stale_outputs is not None else {}),
         "versions": _versions(),
         "rules_check": checks,
     }
@@ -229,12 +241,42 @@ def input_paths_from(data_dir: Path) -> list[Path]:
     return candidates
 
 
-def output_paths_from(results_dir: Path) -> list[Path]:
+def output_paths_from(results_dir: Path, *, since: float | None = None) -> list[Path]:
+    """Every file in the results directory, optionally limited to this run.
+
+    ``since`` is the epoch second at which the run started. A file older than
+    that was not written by this run: it is a leftover from an earlier run, or a
+    synthetic fixture that was dropped into the same directory. Listing it as
+    this run's output would let an artifact the current code never produced —
+    including a fabricated one — pass as a result, so those files are excluded
+    here and reported by ``stale_outputs_from`` instead.
+
+    With ``since=None`` the whole directory is returned, which is what the
+    inventory callers and the tests want.
+    """
+    directory = Path(results_dir)
+    if not directory.is_dir():
+        return []
+    files = [p for p in directory.rglob("*")
+             if p.is_file() and p.name != "manifest.json"]
+    if since is None:
+        return files
+    return [p for p in files if p.stat().st_mtime >= since]
+
+
+def stale_outputs_from(results_dir: Path, since: float) -> list[Path]:
+    """Files sitting in the results directory that this run did not write.
+
+    Recorded rather than deleted: they are evidence of what an earlier run (or
+    the demo fixture) left behind, and silently removing another process's
+    artifacts is not this module's business. What matters is that they are not
+    mistaken for current output.
+    """
     directory = Path(results_dir)
     if not directory.is_dir():
         return []
     return [p for p in directory.rglob("*")
-            if p.is_file() and p.name != "manifest.json"]
+            if p.is_file() and p.name != "manifest.json" and p.stat().st_mtime < since]
 
 
 if __name__ == "__main__":      # a small inspector, useful in the Q&A

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in — Jalnetra</title>
+<!-- No script, no third-party asset: this page must work under the dashboard's
+     own strict Content-Security-Policy (script-src 'self' + nonce), so it is a
+     plain form. The password never reaches a URL, and the server checks it in
+     constant time with a per-client attempt limit. -->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Arial, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 380px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 10px;
+    padding: 26px 24px 22px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  }
+  h1 { font-size: 22px; color: #e94560; display: flex; align-items: center; gap: 8px; }
+  .subtitle { font-size: 12px; color: #888; margin: 4px 0 20px; line-height: 1.5; }
+  label { display: block; font-size: 11px; text-transform: uppercase;
+          letter-spacing: 0.5px; color: #8899aa; margin-bottom: 6px; }
+  input[type=password] {
+    width: 100%;
+    background: #1a1a2e;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    color: #fff;
+    font-size: 15px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+  }
+  input[type=password]:focus { outline: none; border-color: #e94560; }
+  button {
+    width: 100%;
+    background: #e94560;
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 11px 12px;
+    cursor: pointer;
+  }
+  button:hover { background: #d63a53; }
+  .error {
+    background: #3a1b22;
+    border: 1px solid #e94560;
+    color: #ffb3c0;
+    font-size: 12.5px;
+    border-radius: 6px;
+    padding: 9px 11px;
+    margin-bottom: 14px;
+  }
+  .note {
+    font-size: 11px;
+    color: #8899aa;
+    line-height: 1.55;
+    margin-top: 16px;
+    border-top: 1px solid #0f3460;
+    padding-top: 12px;
+  }
+</style>
+</head>
+<body>
+  <form class="card" method="post" action="/login">
+    <h1>🌊 Jalnetra</h1>
+    <div class="subtitle">
+      Flood damage mapping from Sentinel-1 — sign in to view results and start a run.
+    </div>
+
+    {% if error %}
+    <div class="error" role="alert">{{ error }}</div>
+    {% endif %}
+
+    <label for="password">Dashboard password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password"
+           autofocus required>
+    <!-- Where to go after signing in. The server accepts only a single-slash
+         path on this origin, so this cannot be used as an open redirect. -->
+    <input type="hidden" name="next" value="{{ next }}">
+    <button type="submit">Sign in</button>
+
+    <div class="note">
+      The password is set with <code>JALNETRA_DASHBOARD_PASSWORD</code>, or generated
+      once at startup and printed in the terminal that started the dashboard.
+      Sessions are signed with this server process's key: restarting it signs
+      everyone out.
+    </div>
+  </form>
+</body>
+</html>

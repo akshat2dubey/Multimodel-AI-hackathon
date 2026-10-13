@@ -55,6 +55,11 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
         pass
 
 
+# How far apart inference may write change_detection.json and flood_mask.tif and
+# still be considered one pass (they are written moments apart, in either order).
+SIDECAR_SAME_PASS_SECONDS = 5.0
+
+
 def load_flood_mask_stats(mask_path: Path) -> dict:
     """Compute statistics from flood mask GeoTIFF."""
     with rasterio.open(mask_path) as src:
@@ -90,13 +95,43 @@ def load_flood_mask_stats(mask_path: Path) -> dict:
     # Compute flood intensity (average probability in flooded areas)
     mean_prob = float(mask[flooded].mean()) if flood_pixels > 0 else 0
 
+    # Prefer the flood area the run itself recorded. This report used to estimate
+    # a pixel's area at the scene-centre latitude with a spherical approximation
+    # while inference recorded its own figure, so the report and the dashboard
+    # disagreed on the same flood (1,934.0 ha vs 1,928.5 ha on the 2026-10-13
+    # run) — two numbers for one measurement, in the two places a judge compares.
+    # change_detection.json is written by inference from the very mask above, so
+    # it is authoritative; the local estimate stays as the fallback for a mask
+    # that has no sidecar. The sibling is trusted only when it is at least as new
+    # as the mask, so a leftover from an earlier run cannot speak for this one.
+    flood_area_ha = round(flood_ha, 1)
+    area_source = "computed"
+    sidecar = Path(mask_path).parent / "change_detection.json"
+    try:
+        # Seconds apart, either way round: inference writes the sidecar and the
+        # mask in the same pass (measured 0.26 s apart on the real run), while a
+        # sidecar left by an earlier run is at least an inference apart — minutes.
+        # The pixel count must also agree, which is what actually ties the two
+        # artifacts to the same mask.
+        same_pass = sidecar.is_file() and (
+            sidecar.stat().st_mtime
+            >= Path(mask_path).stat().st_mtime - SIDECAR_SAME_PASS_SECONDS
+        )
+        recorded = json.loads(sidecar.read_text(encoding="utf-8")) if same_pass else {}
+        if recorded.get("flood_pixels") == flood_pixels and recorded.get("flood_area_ha"):
+            flood_area_ha = round(float(recorded["flood_area_ha"]), 1)
+            area_source = "change_detection.json"
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+
     return {
         "width_px": width,
         "height_px": height,
         "resolution_m": resolution,
         "total_area_ha": round(total_area_ha, 1),
         "flood_pixels": flood_pixels,
-        "flood_area_ha": round(flood_ha, 1),
+        "flood_area_ha": flood_area_ha,
+        "flood_area_source": area_source,
         "flood_percentage": round(flood_pct, 2),
         "mean_flood_probability": round(mean_prob, 3),
         "crs": str(crs),

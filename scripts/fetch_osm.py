@@ -69,29 +69,65 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 #   - /elements/geometry returns HTTP 403 (Apache-level block on the public host)
 #   - aggregation endpoints (e.g. /elements/count) work and are used below to
 #     cross-check our extract against the official OSH statistics.
-OVERPASS_API = "https://overpass-api.de/api/interpreter"
+# Endpoints are tried in order, and a failure moves to the next one. Verified
+# live 2026-10-13: overpass-api.de answers the building extract for this AOI
+# with HTTP 504 while overpass.kumi.systems returns 3745 elements (3738 ways)
+# for the SAME attic query, and ohsome's official count for `building=*` in the
+# same bbox is 3755. A single endpoint is therefore not just a reliability
+# risk, it is the difference between a real building layer and an empty one.
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
+# Kept for compatibility with anything that imported the old name.
+OVERPASS_API = OVERPASS_ENDPOINTS[0]
 OHSOME_API = "https://api.ohsome.org/v1"          # used only for aggregate counts
+
+# ohsome filter syntax is `type:node`, NOT `type=node`. The wrong form does not
+# error — it returns 0 — which silently disabled this cross-check until it was
+# verified live on 2026-10-13 (type=node or type=way → 0, type:node or
+# type:way → 8124).
+OHSOME_ALL_TAGGED_FILTER = "type:node or type:way"
 # Identifies this tool to Overpass/ohsome, as the tile/API etiquette asks.
 USER_AGENT = "Jalnetra/0.1 (Multimodal AI Hackathon 2026, Track B)"
+
+
+def _endpoint_host(endpoint: str) -> str:
+    """Just the host, for a log line that stays short."""
+    return endpoint.split("//")[-1].split("/")[0]
 
 
 def overpass_ql(
     query: str,
     timeout: int = 180,
-    retries: int = 3,
-) -> dict[str, Any] | None:
-    """POST an Overpass QL query (with attic date) and return parsed JSON.
+    rounds: int = 1,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """POST an Overpass QL query and return (parsed JSON, endpoint used).
 
-    The main endpoint occasionally returns transient 504s under attic load;
-    backing off and retrying a couple of times has proven reliable for the
-    small per-category queries we run here.
+    Every mirror is tried across `rounds` passes before giving up, and the
+    failure case returns (None, None) — distinct from a successful query that
+    found nothing. That distinction is the point: a busy server that answers
+    HTTP 504 is not evidence that the study area has no buildings, and treating
+    it as such is how this pipeline reported 0 affected buildings for a corridor
+    that has 3755 of them.
+
+    `rounds` defaults to 1 — one attempt per mirror — because the retry loop is
+    wall-clock bounded only by the client timeout: with more rounds, a slow or
+    rate-limited Overpass can hold the whole pipeline for tens of minutes before
+    it admits failure. The caller stops asking after the first category that
+    exhausts every endpoint (see fetch_osm_features).
     """
     import time
     data = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    for attempt in range(1, retries + 1):
+    endpoints = OVERPASS_ENDPOINTS
+    total_attempts = max(1, rounds) * len(endpoints)
+    for attempt in range(1, total_attempts + 1):
+        endpoint = endpoints[(attempt - 1) % len(endpoints)]
+        host = _endpoint_host(endpoint)
         try:
             req = urllib.request.Request(
-                OVERPASS_API, data=data,
+                endpoint, data=data,
                 headers={"Accept": "application/json", "User-Agent": USER_AGENT},
             )
             with urlopen(req, timeout=timeout) as resp:
@@ -99,16 +135,15 @@ def overpass_ql(
                 ct = resp.headers.get("Content-Type", "")
                 if "json" not in ct:
                     raise ValueError(f"server returned {ct} (likely rate-limit page)")
-                return json.loads(body)
+                return json.loads(body), endpoint
         except urllib.error.HTTPError as e:
-            print(f"  ⚠ Overpass HTTP {e.code} (attempt {attempt}/{retries})")
+            print(f"  ⚠ Overpass HTTP {e.code} from {host} (attempt {attempt}/{total_attempts})")
             if e.code == 429:
                 print("  ℹ️ Rate limited — backing off")
-            time.sleep(10 * attempt)
-        except (urllib.error.URLError, ValueError, json.JSONDecodeError) as e:
-            print(f"  ⚠ Overpass error ({attempt}/{retries}): {e}")
-            time.sleep(10 * attempt)
-    return None
+        except (urllib.error.URLError, ValueError, json.JSONDecodeError, OSError) as e:
+            print(f"  ⚠ Overpass error from {host} (attempt {attempt}/{total_attempts}): {e}")
+        time.sleep(min(5 * attempt, 20))
+    return None, None
 
 
 def run_attic_query(
@@ -116,8 +151,13 @@ def run_attic_query(
     bbox: tuple[float, float, float, float],
     snapshot_date: str,
     timeout: int = 180,
-) -> list[dict]:
-    """Run one attic Overpass query and return the raw OSM elements list."""
+) -> list[dict] | None:
+    """Run one attic Overpass query.
+
+    Returns the raw element list — possibly empty, which is a real answer ("the
+    snapshot has none of these here") — or None when every endpoint failed, which
+    is not an answer at all and must never be written out as an empty layer.
+    """
     min_lon, min_lat, max_lon, max_lat = bbox
     q = (
         f'[out:json][timeout:{timeout}]'
@@ -126,9 +166,10 @@ def run_attic_query(
         f'way{selector}({min_lat},{min_lon},{max_lat},{max_lon}););'
         f'out geom tags;'
     )
-    payload = overpass_ql(q, timeout=timeout + 30)
+    payload, endpoint = overpass_ql(q, timeout=timeout + 30)
     if payload is None:
-        return []
+        return None
+    print(f"  ℹ️ answered by {_endpoint_host(endpoint or OVERPASS_API)}")
     return payload.get("elements", [])
 
 
@@ -212,6 +253,22 @@ def ohsome_query(endpoint: str, params: dict[str, Any], timeout: int = 60) -> di
         return {"error": str(e)}
 
 
+# Layers the rest of the pipeline cannot be honest without: the damage assessment
+# and the cut-off analysis describe buildings and roads. If one of these cannot
+# be fetched, the run must stop rather than report "0 buildings affected", which
+# is indistinguishable from a real count of zero.
+REQUIRED_CATEGORIES = ("buildings", "roads")
+
+
+def _feature_count(path: Path) -> int:
+    """Features in an existing GeoJSON file, or 0 when it is missing/unreadable."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    return len(payload.get("features") or [])
+
+
 def fetch_osm_features(
     center_lat: float,
     center_lon: float,
@@ -220,17 +277,21 @@ def fetch_osm_features(
     output_dir: Path,
     timeout: int = 120,
     event_date: str | None = None,
-) -> dict[str, Path]:
+) -> tuple[dict[str, Path], list[str]]:
     """
     Fetch all required OSM feature types for the study area.
 
-    Returns dict mapping feature type → path to saved GeoJSON file.
+    Returns (paths by feature type, required categories that could not be
+    fetched). A non-empty second element means the run must not continue.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     event_date = event_date or EVENT_DATE
 
     results: dict[str, Path] = {}
     counts: dict[str, int | None] = {}
+    statuses: dict[str, str] = {}
+    ohsome_counts: dict[str, int | None] = {}
+    failed_required: list[str] = []
 
     # Each category = one attic Overpass query (nodes+ways as of snapshot_date)
     # plus one official ohsome count cross-check. Categories are independent:
@@ -247,24 +308,73 @@ def fetch_osm_features(
         ("settlements", '[place~"village|hamlet|town|city"]', "place in (village,hamlet,town,city)", output_dir / "settlements.geojson"),
     ]
 
+    server_unavailable: str | None = None
+
     for label, selector, ohsome_filter, out_path in categories:
         print("\n" + "\u2500" * 50)
         print(f"📥 Fetching {label} (as of {snapshot_date})...")
-        elements = run_attic_query(selector, bbox, snapshot_date, timeout=timeout)
+
+        skipped: str | None = None
+        if server_unavailable:
+            # Circuit breaker. Once a category has failed at every endpoint, the
+            # server is down or rate-limiting us; sweeping the remaining
+            # categories would multiply a multi-minute stall by their number,
+            # and the run stops anyway because a required layer is missing. The
+            # skip is recorded, not hidden.
+            elements, skipped = None, f"not attempted ({server_unavailable})"
+        else:
+            elements = run_attic_query(selector, bbox, snapshot_date, timeout=timeout)
+            if elements is None:
+                server_unavailable = "every Overpass endpoint failed"
+
+        # Asked before anything is written: the official OSM statistic is what
+        # tells an empty extract apart from a failed one.
+        official = ohsome_count(label, ohsome_filter, bbox, snapshot_date)
+        ohsome_counts[label] = official
+        results[label] = out_path
+
+        failure_reason = skipped
+        if failure_reason is None:
+            if elements is None:
+                failure_reason = server_unavailable or "every Overpass endpoint failed"
+            elif not elements and official:
+                failure_reason = (
+                    f"extract is empty but ohsome reports {official:,} in this bbox"
+                )
+
+        if failure_reason:
+            # NEVER write an empty layer over a failed fetch. An all-zero
+            # FeatureCollection is indistinguishable from a real "nothing here"
+            # and downstream becomes "0 buildings affected" — a fabricated
+            # measurement of the disaster, in the direction that hides people.
+            previous = _feature_count(out_path) if out_path.is_file() else 0
+            if previous > 0:
+                counts[label] = previous
+                statuses[label] = "failed_kept_previous"
+                print(f"  ⚠ {label} fetch FAILED ({failure_reason}) — keeping the "
+                      f"existing {out_path.name} with {previous} features rather "
+                      "than overwriting it with nothing")
+            else:
+                counts[label] = None
+                statuses[label] = "skipped" if skipped else "failed"
+                print(f"  ❌ {label} fetch FAILED ({failure_reason}) — no layer written")
+            if label in REQUIRED_CATEGORIES:
+                failed_required.append(label)
+            continue
+
         geojson = elements_to_geojson(elements)
         out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
         counts[label] = len(geojson["features"])
-        results[label] = out_path
+        statuses[label] = "ok"
         print(f"  ✅ {counts[label]} {label} features saved → {out_path}")
-        # Optional cross-check against the official ohsome aggregate (best effort).
-        ohsome_count(label, ohsome_filter, bbox, snapshot_date)
         if not elements:
-            print(f"  ⚠ 0 elements for {label} — check connectivity / retry later")
+            print(f"  ⚠ 0 elements for {label} and ohsome agrees — the snapshot "
+                  "has none in this bbox")
 
     # Cross-check aggregate: official ohsome count for ALL tagged elements.
     print("\n" + "─" * 50)
     print("📦 ohsome aggregate cross-check...")
-    total_ohsome = ohsome_count("all tagged elements", "type=node or type=way", bbox, snapshot_date)
+    total_ohsome = ohsome_count("all tagged elements", OHSOME_ALL_TAGGED_FILTER, bbox, snapshot_date)
 
     # Write a combined metadata file
     meta = {
@@ -273,6 +383,10 @@ def fetch_osm_features(
         "area_center": [center_lat, center_lon],
         "bbox": list(bbox),
         "feature_counts": counts,
+        "fetch_status": statuses,
+        "ohsome_counts": ohsome_counts,
+        "required_categories": list(REQUIRED_CATEGORIES),
+        "failed_required_categories": failed_required,
         "ohsome_total_check": total_ohsome,
         "api": "Overpass attic (geometry) + ohsome v1 (aggregate counts)",
         "overpass_url": OVERPASS_API,
@@ -287,7 +401,7 @@ def fetch_osm_features(
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     print(f"\n✅ OSM metadata → {meta_path}")
 
-    return results
+    return results, failed_required
 
 
 def main():
@@ -341,7 +455,7 @@ def main():
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
-    results = fetch_osm_features(
+    results, failed_required = fetch_osm_features(
         center_lat=center_lat,
         center_lon=center_lon,
         snapshot_date=args.snapshot_date,
@@ -349,6 +463,21 @@ def main():
         output_dir=output_dir,
         event_date=args.event_date,
     )
+
+    if failed_required:
+        print(
+            "\n❌ OSM fetch failed for required layer(s): "
+            + ", ".join(failed_required),
+            file=sys.stderr,
+        )
+        print(
+            "   Refusing to continue: a damage assessment without these layers "
+            "would report 0 affected features,\n   which reads as a real "
+            "finding of no impact. See "
+            f"{output_dir / 'osm_metadata.json'} for the per-layer status.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗

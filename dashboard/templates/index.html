@@ -177,6 +177,27 @@
   }
   body.demo #demo-banner { display: block; }
   body.demo .app { padding-top: 34px; }
+
+  /* Visible whenever the served numbers cannot be traced to a run by this code.
+     A page of numbers whose source cannot be named is worse than an empty page,
+     because a reader cannot tell the two apart. */
+  #provenance-banner {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 3000;
+    background: #7a2b3a;
+    color: #ffd9df;
+    font-size: 12.5px;
+    font-weight: 600;
+    text-align: center;
+    padding: 8px 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  }
+  body.unprovenanced #provenance-banner { display: block; }
+  body.unprovenanced:not(.demo) .app { padding-top: 34px; }
+  /* The demo banner already says this, and two stacked banners say it worse. */
+  body.demo #provenance-banner { display: none; }
 </style>
 </head>
 <body>
@@ -185,11 +206,26 @@
   (<span id="demo-dir">results_demo</span>), not a real pipeline run.
   Nothing here is a measurement of the 2026 Nepal flood.
 </div>
+<div id="provenance-banner" role="alert"></div>
 <div class="app">
   <div class="sidebar">
     <div>
       <h1>🌊 Jalnetra</h1>
       <div class="subtitle">Multimodal AI Hackathon 2026 — Track B</div>
+    </div>
+
+    {% if authenticated %}
+    <form method="post" action="/logout" style="margin:0;">
+      <button class="menu-btn" type="submit" style="width:auto; padding:4px 10px; font-size:11px;">
+        Sign out
+      </button>
+    </form>
+    {% endif %}
+
+    <div class="stat-card" id="provenance-panel">
+      <div class="label">Data provenance</div>
+      <div id="prov-state" style="font-size:13px; font-weight:600; color:#8899aa;">checking…</div>
+      <div id="prov-detail" style="font-size:11px; color:#8899aa; line-height:1.55; margin-top:5px;"></div>
     </div>
 
     <div id="stats-panel">
@@ -428,8 +464,61 @@ function applyRunBbox(status) {
   }
 }
 
+function updateProvenance(status) {
+  // Says, on the page, whether these numbers were computed here and from which
+  // scenes — or that they cannot be traced. Driven by the server's own
+  // reads of run_meta.json, manifest.json and the band sidecars, never by a
+  // flag inside the data it is describing.
+  const p = (status && status.provenance) || {};
+  const state = p.state || 'unknown';
+  const live = state === 'live';
+
+  const banner = document.getElementById('provenance-banner');
+  if (banner) {
+    document.body.classList.toggle('unprovenanced', !live);
+    banner.style.display = live ? 'none' : 'block';
+    if (!live) {
+      const missing = (p.missing || []);
+      banner.textContent = state === 'empty'
+        ? 'NO RESULTS — no run has produced a flood mask in this directory yet.'
+        : 'NOT COMPUTED HERE — these figures cannot be traced to a run in this '
+          + 'directory' + (missing.length ? ' (missing: ' + missing.join('; ') + ')' : '')
+          + '. Treat them as illustrative, not as measurements.';
+    }
+  }
+
+  const stateEl = document.getElementById('prov-state');
+  if (stateEl) {
+    stateEl.textContent = live ? 'LIVE — computed by this code'
+      : (state === 'empty' ? 'NO RESULTS' : 'UNTRACEABLE');
+    stateEl.style.color = live ? '#66bb6a' : '#ffa726';
+  }
+
+  const detail = document.getElementById('prov-detail');
+  if (detail) {
+    const bands = p.bands || {};
+    const lines = [];
+    ['before', 'after'].forEach(function (label) {
+      const band = bands[label] || {};
+      const when = (band.acquired_utc || '').slice(0, 10) || 'date unknown';
+      lines.push(escapeHtml(label) + ': ' + escapeHtml(band.archive || 'no scene recorded')
+                 + ' (' + escapeHtml(when) + ')');
+    });
+    if (p.computed_at) {
+      lines.push('computed: ' + escapeHtml(String(p.computed_at).slice(0, 19).replace('T', ' ')));
+    }
+    if (p.method) lines.push('method: ' + escapeHtml(p.method));
+    if (p.newest_artifact_age_hours != null) {
+      lines.push('newest artifact: ' + escapeHtml(String(p.newest_artifact_age_hours)) + ' h old');
+    }
+    if (p.attribution) lines.push(escapeHtml(p.attribution));
+    detail.innerHTML = lines.join('<br>');
+  }
+}
+
 function updateStats(status) {
   updateDemoBanner(status);
+  updateProvenance(status);
   centerOnCaseStudy(status);
   applyRunBbox(status);
   const fs = status.flood_stats || {};

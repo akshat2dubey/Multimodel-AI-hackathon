@@ -60,6 +60,14 @@ def test_every_stage_output_lands_in_the_shared_dirs(
     data.mkdir(parents=True)
     results.mkdir(parents=True)
     report.mkdir(parents=True)
+    # The preprocessing stage is mandatory and fail-closed: run_pipeline stops
+    # (exit 4) when a label has no archive of its own, rather than analysing
+    # whatever rasters are lying in data/. run() is stubbed below, so these
+    # stand-in archives are never opened.
+    import toydata
+
+    for label in ("before", "after"):
+        toydata.placeholder_safe_archive(data, label)
     monkeypatch.setattr(run_pipeline, "DATA_DIR", data)
     monkeypatch.setattr(run_pipeline, "RESULTS_DIR", results)
     monkeypatch.setattr(run_pipeline, "REPORT_DIR", report)

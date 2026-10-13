@@ -478,6 +478,8 @@ def _safe_row_dict(row) -> dict:
         if k == "geometry":
             continue
         out[str(k)] = v
+    if hasattr(row, "geometry") and row.geometry is not None:
+        out["geometry"] = row.geometry
     return out
 
 

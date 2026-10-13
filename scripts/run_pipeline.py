@@ -33,9 +33,10 @@ pipeline continues on Sentinel-1 imagery only if available.)
 """
 
 import argparse
-
+import json
 import sys
 import subprocess
+import time
 from pathlib import Path
 
 # Make `scripts/` AND the project root importable regardless of the working
@@ -54,6 +55,7 @@ from config.presets import (  # noqa: E402
     PROJECT_ROOT as ROOT,
     REPORT_DIR,
     RESULTS_DIR,
+    demo_notice_blocker,
 )
 from config.run_meta import (  # noqa: E402
     RUN_META_FILENAME,
@@ -61,6 +63,10 @@ from config.run_meta import (  # noqa: E402
     resolve_run_meta,
     write_run_meta,
 )
+
+# The delivered grid resolution comes from the preprocessor itself, so the
+# orchestrator cannot disagree with it about what "the bands" are.
+from preprocess_s1 import DEFAULT_RESOLUTION_M as PREPROCESS_RESOLUTION_M  # noqa: E402
 
 # Provenance + the disqualification boundary (T34). The rules are evaluated at
 # the start (dates, and where the inputs come from) and again at the end, when
@@ -73,6 +79,7 @@ from manifest import (  # noqa: E402
     input_paths_from,
     output_paths_from,
     rules_check,
+    stale_outputs_from,
     write_manifest,
 )
 
@@ -107,11 +114,21 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> bool:
-    """Run a command and return True on success."""
+    """Run a command and return True on success.
+
+    The child's output is decoded as UTF-8 with errors="replace": these scripts
+    print ✓/⚠/❌ and a CJK/emoji filename would otherwise be decoded with the
+    console's cp1252 codec and kill the orchestrator with UnicodeDecodeError
+    while reading a pipe — which is exactly what stopped every run on Windows
+    before this.
+    """
     print(f"\n{'='*70}")
     print(f"▶ Running: {' '.join(cmd)}")
     print(f"{'='*70}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
     if result.stdout:
         print(result.stdout)
     if result.stderr:
@@ -186,6 +203,16 @@ def main():
     data_dir = DATA_DIR
     data_dir.mkdir(parents=True, exist_ok=True)
     results_dir = RESULTS_DIR
+
+    # Anything written from here on is this run's output; anything older in
+    # results/ belongs to an earlier run (or to the demo fixture) and must not be
+    # presented as a result of this one. See the manifest at the end of main().
+    run_started = time.time()
+
+    blocker = demo_notice_blocker(results_dir)
+    if blocker:
+        print(f"❌ {blocker}", file=sys.stderr)
+        sys.exit(5)
 
     # Hard data rules first, before anything is written or fetched (T34): a run
     # that would use a post-event OSM snapshot or an EMS/UNOSAT input must leave
@@ -265,6 +292,66 @@ def main():
     ]):
         print("\n⚠️ DEM download failed — flood path tracing will be skipped")
 
+    # Step 4b: Preprocess the downloaded SAFEs into geolocated dB bands.
+    #
+    # This is the step that makes the rest of the run real. It reads the product
+    # each label actually downloaded (verified against the catalogue in step 1),
+    # warps that product's own ground control points onto the run's bbox, applies
+    # the product's own calibration LUT and writes
+    #   data/sentinel1/<label>/s1_<label>_{VV,VH}.tif + S1_PROCESSED.json
+    # Inference then refuses to run without that sidecar, so a stale or synthetic
+    # raster left lying in the directory can no longer pass itself off as this
+    # run's imagery. A failure here STOPS the run: the alternative would be to
+    # analyse whatever pixels happen to be on disk, which is how a dashboard ends
+    # up showing numbers the current code would never produce.
+    preprocess_failures: list[str] = []
+    for label in ("before", "after"):
+        label_dir = data_dir / "sentinel1" / label
+        safe_zips = sorted(label_dir.glob("*.SAFE.zip"))
+        if not safe_zips:
+            preprocess_failures.append(
+                f"{label}: no SAFE archive in {label_dir} — run the download step first"
+            )
+            continue
+        safe_zip = safe_zips[0]
+        # The acquisition instant and orbit recorded by the download, so the
+        # sidecar states the real time instead of one inferred from a filename.
+        acquisition, orbit = None, None
+        info_path = label_dir / "PRODUCT_INFO.json"
+        if info_path.is_file():
+            try:
+                info = json.loads(info_path.read_text(encoding="utf-8"))
+                acquisition = info.get("acquired")
+                orbit = info.get("relative_orbit")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        preprocess_cmd = [
+            sys.executable, _scripts("preprocess_s1.py"),
+            "--safe-zip", str(safe_zip),
+            "--output-dir", str(data_dir / "sentinel1"),
+            "--label", label,
+            "--bbox", bbox_str,
+            "--resolution-m", str(PREPROCESS_RESOLUTION_M),
+        ]
+        if acquisition:
+            preprocess_cmd += ["--acquisition", str(acquisition)]
+        if orbit is not None:
+            preprocess_cmd += ["--orbit", str(orbit)]
+        if not run(preprocess_cmd):
+            preprocess_failures.append(f"{label}: preprocessing {safe_zip.name} failed")
+
+    if preprocess_failures:
+        print("❌ Cannot produce real imagery for this run:", file=sys.stderr)
+        for failure in preprocess_failures:
+            print(f"   - {failure}", file=sys.stderr)
+        print(
+            "   Inference is NOT started. A flood mask built from anything other "
+            "than this run's own acquisitions would be a fabrication, not a result.",
+            file=sys.stderr,
+        )
+        sys.exit(4)
+
     # Step 5: Pick the flood-mask engine. THIS ORCHESTRATOR NEVER TRAINS.
     # It used to run train_segmentation.py --epochs 50 inline whenever the
     # checkpoint was missing; with an empty dataset that script then fabricated
@@ -300,6 +387,8 @@ def main():
         "--before-dir", str(data_dir / "sentinel1"),
         "--after-dir", str(data_dir / "sentinel1"),
         "--output", str(results_dir / "flood_mask.tif"),
+        # Only bands that carry this run's provenance sidecar may be analysed.
+        "--require-provenance",
     ]
     if use_baseline:
         inference_cmd.append("--baseline")
@@ -365,7 +454,8 @@ def main():
     manifest = build_manifest(
         run_meta=run_meta,
         inputs=input_paths_from(data_dir),
-        outputs=output_paths_from(results_dir),
+        outputs=output_paths_from(results_dir, since=run_started),
+        stale_outputs=stale_outputs_from(results_dir, since=run_started),
         repo_root=ROOT,
         method="unet" if not use_baseline else "log_ratio_baseline",
         model=None if use_baseline else model_path,
@@ -375,6 +465,12 @@ def main():
     print(f"\n📜 Provenance manifest: {manifest_path}")
     for name, ok in manifest["rules_check"].items():
         print(f"   {name}: {ok}")
+    stale = manifest.get("stale_outputs_not_from_this_run") or []
+    if stale:
+        print(
+            "\n⚠️ In results/ but NOT written by this run (excluded from the "
+            "manifest outputs): " + ", ".join(stale)
+        )
 
     failure = describe_rule_failure(manifest["rules_check"])
     if failure:

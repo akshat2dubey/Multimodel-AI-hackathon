@@ -162,6 +162,25 @@ def empty_geojson(path: Path):
     return path
 
 
+# A valid empty ZIP (end-of-central-directory record only).
+_EMPTY_ZIP = b"PK\x05\x06" + b"\x00" * 18
+
+
+def placeholder_safe_archive(data_dir: Path, label: str) -> Path:
+    """Stand in for the SAFE archive a download stage would have produced.
+
+    run_pipeline now refuses to run without the archive each label actually
+    downloaded — preprocessing is a required stage, because analysing whatever
+    rasters happen to be on disk is how a dashboard ends up showing numbers the
+    current code would never produce. Tests that stub run() and only inspect the
+    argv therefore need the file to exist; its contents are never read.
+    """
+    path = Path(data_dir) / "sentinel1" / label / "S1D_TEST_SAFE.SAFE.zip"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_EMPTY_ZIP)
+    return path
+
+
 def toy_road_features():
     """One OSM way (J0..J3) as a single LineString, plus its four junctions."""
     from shapely.geometry import LineString
