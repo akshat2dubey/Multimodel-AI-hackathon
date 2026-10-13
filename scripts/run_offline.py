@@ -49,11 +49,11 @@ from config.presets import (  # noqa: E402  (path set up above)
     CENTER_LAT,
     CENTER_LON,
     DATA_DEMO_DIR,
-    DEFAULT_PRESET,
+    EVENT_DATE,
     FIXTURE_EXTENT,
     OSM_SNAPSHOT_DATE,
     RESULTS_DEMO_DIR,
-    RESULTS_NAME,
+    demo_paths_error,
 )
 from config.run_meta import resolve_run_meta, write_run_meta  # noqa: E402
 
@@ -88,15 +88,27 @@ def main() -> int:
     parser.add_argument("--skip-data-generation", action="store_true",
                         help=f"Reuse the fixture already in {DATA_DEMO_DIR.name}/ and "
                              f"{RESULTS_DEMO_DIR.name}/")
+    parser.add_argument("--data-dir", default=None,
+                        help="demo input directory (must be separate from data/ and results/)")
+    parser.add_argument("--results-dir", default=None,
+                        help="demo output directory (must be separate from data/ and results/)")
     args = parser.parse_args()
+
+    # Allow the test harness to override where generated inputs and outputs land.
+    data_dir = args.data_dir or DATA_DEMO_DIR
+    results_dir = args.results_dir or RESULTS_DEMO_DIR
 
     py = sys.executable
     # Every artifact of an offline run lands in results_demo/ and every generated
     # input in data_demo/ (both imported from config.presets), never in results/
     # or data/ — the real runs write there, and the dashboard reads results/ for
     # them and shows a banner when it is pointed at the demo directory instead.
-    results = RESULTS_DEMO_DIR
-    data = DATA_DEMO_DIR
+    results = Path(results_dir)
+    data = Path(data_dir)
+    unsafe_reason = demo_paths_error(data, results)
+    if unsafe_reason:
+        print(f"\n  ✋ {unsafe_reason}")
+        return 1
     ok = True
 
     print(f"\n{'#' * 72}\n#  {BANNER}\n#  Offline run: validates plumbing, not scientific results.\n"
@@ -124,22 +136,22 @@ def main() -> int:
         print(f"\nMissing generated inputs in {data} — run without "
               f"--skip-data-generation first.")
         return 1
-    if Path(mask).parent.name == RESULTS_NAME:
-        print("\n  ✋ refusing to run: the fixture mask is inside results/. Real runs "
-              "write there; a demo must not overwrite them.")
-        return 1
 
     # 0. publish this demo run's metadata next to its artifacts, exactly as a
     # real run does, so damage/cutoff/report describe the same area and dates
     # instead of falling back to the preset. This writes to results_demo/.
     run_meta = resolve_run_meta(
-        preset=DEFAULT_PRESET,
+        # Offline fixtures are synthetic and must never inherit a confirmed real
+        # case-study AOI, even when the preset has since been verified.
+        preset=None,
         area=args.area,
         center_lat=args.center_lat,
         center_lon=args.center_lon,
         extent=args.extent,
         before_date=args.before_date,
         after_date=args.after_date,
+        event_date=EVENT_DATE,
+        osm_snapshot_date=OSM_SNAPSHOT_DATE,
     )
     meta_path = write_run_meta(results, run_meta)
     print(f"\n  Run metadata -> {meta_path}")

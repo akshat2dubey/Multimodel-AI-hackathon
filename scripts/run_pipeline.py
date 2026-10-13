@@ -159,6 +159,10 @@ def main():
             "Falls back to --center-lat/--center-lon/--extent when omitted."
         ),
     )
+    parser.add_argument(
+        "--confirm-aoi", action="store_true",
+        help="confirm you checked this AOI against an authoritative event source",
+    )
     parser.add_argument("--center-lat", type=float, default=None,
                         help="Fallback AOI centre latitude (prefer --bbox)")
     parser.add_argument("--center-lon", type=float, default=None,
@@ -187,6 +191,7 @@ def main():
             before_date=args.before_date,
             after_date=args.after_date,
             osm_snapshot_date=args.osm_snapshot,
+            confirm_aoi=args.confirm_aoi,
         )
     except ValueError as exc:
         print(f"❌ {exc}", file=sys.stderr)
@@ -244,11 +249,9 @@ def main():
     print("=" * 70)
     if not run_meta.get("aoi_confirmed"):
         print(
-            "\n⚠️ AOI NOT CONFIRMED: the bbox came from the preset fallback "
-            f"({run_meta['bbox_source']}), not a confirmed case-study AOI.\n"
-            "   Pass --bbox once the authoritative AOI is confirmed (see the TODO "
-            "in config/presets.py):\n"
-            "     python scripts/run_pipeline.py --preset trishuli --bbox min_lon,min_lat,max_lon,max_lat\n"
+            "\n⚠️ AOI NOT CONFIRMED: these bounds have not been explicitly checked "
+            "against the authoritative event footprint.\n"
+            "   Verify the event AOI, then pass --confirm-aoi to record that check.\n"
             "   Every artifact from this run is stamped aoi_confirmed: false.",
             file=sys.stderr,
         )
@@ -261,7 +264,8 @@ def main():
         "--after-date", run_meta["after_date"],
         "--output", str(data_dir / "sentinel1"),
     ]):
-        print("\n⚠️ Sentinel-1 download failed — continuing with preprocessing step (may fail if no data)")
+        print("\n❌ Sentinel-1 download failed — SAR data is required; refusing to continue.", file=sys.stderr)
+        sys.exit(1)
 
     # Step 2: Download Sentinel-2 (optical, optional — cloud dependent)
     if not run([
@@ -282,6 +286,29 @@ def main():
         "--output", str(data_dir / "osm"),
     ]):
         print("\n❌ OSM data fetch failed — cannot proceed without OSM data")
+        sys.exit(1)
+
+    osm_meta_path = data_dir / "osm" / "osm_metadata.json"
+    try:
+        osm_meta = json.loads(osm_meta_path.read_text(encoding="utf-8"))
+        if not isinstance(osm_meta, dict):
+            raise ValueError("OSM metadata is not a JSON object")
+        try:
+            osm_bbox = [float(value) for value in osm_meta.get("bbox", [])]
+            bbox_matches = len(osm_bbox) == 4 and all(
+                abs(actual - expected) <= 1e-6
+                for actual, expected in zip(osm_bbox, run_meta["bbox"])
+            )
+        except (TypeError, ValueError):
+            bbox_matches = False
+        if not bbox_matches:
+            raise ValueError("OSM bbox does not match this run's AOI")
+        if osm_meta.get("snapshot_date") != run_meta["osm_snapshot_date"]:
+            raise ValueError("OSM snapshot date does not match this run metadata")
+        if osm_meta.get("failed_required_categories"):
+            raise ValueError("OSM metadata reports failed required categories")
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"❌ OSM input verification failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
     # Step 4: Download Copernicus DEM

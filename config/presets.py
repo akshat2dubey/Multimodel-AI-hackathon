@@ -25,6 +25,8 @@ one directory with no way to tell them apart.
 
 from __future__ import annotations
 
+import json
+import math
 from pathlib import Path
 
 # config/presets.py -> config/ -> project root
@@ -49,6 +51,23 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 # carries the notice make_demo_data.py drops next to the mask. The dashboard uses
 # this to show a banner; scripts use it to pick a default output dir.
 DEMO_NOTICE_FILENAME = "DEMO_DATA_NOTICE.txt"
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left, right = left.resolve(), right.resolve()
+    return left == right or left in right.parents or right in left.parents
+
+
+def demo_paths_error(data_dir, results_dir) -> str | None:
+    """Refuse demo paths that overlap real data/results or each other."""
+    data, results = Path(data_dir).resolve(), Path(results_dir).resolve()
+    for label, candidate in (("data", data), ("results", results)):
+        for protected in (DATA_DIR.resolve(), RESULTS_DIR.resolve()):
+            if _paths_overlap(candidate, protected):
+                return f"refusing demo {label} path {candidate}: overlaps protected {protected}"
+    if _paths_overlap(data, results):
+        return f"refusing overlapping demo data/results paths: {data} and {results}"
+    return None
 
 
 def is_demo_dir(path) -> bool:
@@ -81,6 +100,30 @@ def demo_notice_blocker(results_dir) -> str | None:
         f"(e.g. move {notice.parent} to {RESULTS_DEMO_NAME}/), then re-run."
     )
 
+
+# The boundary source and its provenance are versioned with the configuration.
+# Runtime configuration must not depend on the ignored data/ download directory.
+_AOI_PATH = Path(__file__).with_name("EMSR927_AOI01_bounds.json")
+_AOI = json.loads(_AOI_PATH.read_text(encoding="utf-8"))
+_AOI_BBOX = _AOI.get("bbox")
+if (
+    _AOI.get("bbox_order") != "min_lon,min_lat,max_lon,max_lat"
+    or not isinstance(_AOI_BBOX, list)
+    or len(_AOI_BBOX) != 4
+):
+    raise ValueError(f"invalid AOI bounds or coordinate order in {_AOI_PATH}")
+BBOX_EMSR927_AOI01: tuple[float, float, float, float] = tuple(
+    float(value) for value in _AOI_BBOX
+)
+_min_lon, _min_lat, _max_lon, _max_lat = BBOX_EMSR927_AOI01
+if (
+    not all(math.isfinite(value) for value in BBOX_EMSR927_AOI01)
+    or not (-180 <= _min_lon < _max_lon <= 180)
+    or not (-90 <= _min_lat < _max_lat <= 90)
+):
+    raise ValueError(f"AOI bounds are outside valid longitude/latitude limits in {_AOI_PATH}")
+
+
 # --- Case-study presets -----------------------------------------------------
 # A preset is what a judge flips when they want a different corridor:
 #
@@ -91,17 +134,15 @@ def demo_notice_blocker(results_dir) -> str | None:
 # the same numbers (see config/run_meta.py). Nothing in scripts/ or dashboard/
 # may restate these as literals — tests/test_14_no_hardcoded_presets.py enforces
 # that, docstrings included.
+#
 
 TRISHULI = {
     "area": "Bhote Koshi – Trishuli River Corridor, Nepal",
-    # TODO(AOI): the authoritative case-study AOI is the Copernicus EMSR927
-    # AOI01 footprint (Syabru Bensi, Rasuwa district). It is being taken from
-    # the EMSR927 catalogue and must NOT be guessed — a wrong AOI silently
-    # downloads the wrong valley. Put the AOI01 bounds here, in
-    # [min_lon, min_lat, max_lon, max_lat] order, and set aoi_confirmed=True.
-    # Until then this preset runs on the unverified fallback below and stamps
-    # every artifact it produces with aoi_confirmed: false.
-    "bbox": None,
+    # The authoritative case-study AOI (Copernicus EMSR927 AOI01). Read once from the
+    # fetched catalogue sidecar, never invented. See BBOX_EMSR927_AOI01 above.
+    "bbox": BBOX_EMSR927_AOI01,
+    # The linked AOI sidecar still requires independent verification against
+    # its source before this preset may be used for operational analysis.
     "aoi_confirmed": False,
     # The Sentinel-1 pair actually downloaded for this case study (orbit 19):
     # 2026-08-24 (2 d pre-event) and 2026-09-05 (10 d post-event). Provenance:
@@ -126,6 +167,7 @@ TRISHULI = {
 
 PRESETS: dict[str, dict] = {"trishuli": TRISHULI}
 DEFAULT_PRESET = "trishuli"
+
 
 # The default preset's values as module constants, for the callers that predate
 # config/run_meta.py. Prefer resolve_run_meta()/load_run_meta() in new code: these

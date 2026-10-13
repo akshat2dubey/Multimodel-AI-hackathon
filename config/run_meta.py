@@ -31,6 +31,7 @@ from a preset (see config/presets.py) or from the operator's ``--bbox``.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,10 +68,14 @@ def parse_bbox(text: str) -> tuple[float, float, float, float]:
         raise ValueError(
             f"--bbox must be {BBOX_ORDER} (4 comma-separated numbers), got {text!r}"
         ) from exc
-    if not (min_lon < max_lon and min_lat < max_lat):
+    if (
+        not all(math.isfinite(value) for value in (min_lon, min_lat, max_lon, max_lat))
+        or not (-180 <= min_lon < max_lon <= 180)
+        or not (-90 <= min_lat < max_lat <= 90)
+    ):
         raise ValueError(
-            f"--bbox must have min < max for both axes, got {text!r} "
-            f"({BBOX_ORDER})"
+            f"--bbox must contain valid longitude/latitude bounds with min < max, "
+            f"got {text!r} ({BBOX_ORDER})"
         )
     return (min_lon, min_lat, max_lon, max_lat)
 
@@ -136,6 +141,7 @@ def resolve_run_meta(
     before_date: str | None = None,
     after_date: str | None = None,
     osm_snapshot_date: str | None = None,
+    confirm_aoi: bool = False,
 ) -> dict:
     """CLI arguments (over) preset defaults -> the one run_meta dict.
 
@@ -219,9 +225,12 @@ def resolve_run_meta(
     if picked_extent is not None:
         meta["extent"] = float(picked_extent)
 
-    # Confirmed only when the operator supplied the box, or the preset declares
-    # its own AOI as signed off. A derived box is never "confirmed".
-    meta["aoi_confirmed"] = bool(source == "cli" or base.get("aoi_confirmed", False))
+    # A supplied box does not prove that it describes the intended event. Require
+    # explicit confirmation for CLI overrides; a source-backed preset can carry
+    # its own confirmation. A derived fallback is never "confirmed".
+    meta["aoi_confirmed"] = bool(
+        source == "preset" and base.get("aoi_confirmed", False)
+    )
 
     # ── Required + consistent values ─────────────────────────────────────────
     missing = [k for k in ("area", *DATE_FIELDS) if not meta.get(k)]

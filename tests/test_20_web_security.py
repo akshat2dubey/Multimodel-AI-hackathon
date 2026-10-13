@@ -18,9 +18,10 @@ STATIC_VENDOR = Path(__file__).resolve().parent.parent / "dashboard" / "static" 
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     import app as app_module
 
+    monkeypatch.setattr(app_module, "LOGIN_REQUIRED", False)
     app_module.app.config.update(TESTING=True)
     return app_module.app.test_client()
 

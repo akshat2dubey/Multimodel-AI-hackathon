@@ -1,0 +1,7 @@
+{
+  "source": "EMSR927_AOI01 (Copernicus EMSR927 activation, AOI01 — Syabru Bensi / Rasuwa district)",
+  "source_url": "https://data.humdata.org/dataset/emsr927-boundaries/resource/4497075e-c09e-4d33-a09d-fd70f1175a2d",
+  "bbox_order": "min_lon,min_lat,max_lon,max_lat",
+  "bbox": [85.117358, 27.972395, 85.581515, 28.077922],
+  "note": "Fetched from the EMSR927 AOI01 Shapefile GeoPackage on 2026-10-13T02:59Z and checked against that backend. Independently verify against the linked source before operational use."
+}

@@ -33,6 +33,7 @@ VALID = {
 def dashboard(tmp_path, monkeypatch):
     import app as app_module
 
+    monkeypatch.setattr(app_module, "LOGIN_REQUIRED", False)
     monkeypatch.setattr(app_module, "RESULTS", tmp_path / "results")
     monkeypatch.setattr(app_module, "PIPELINE_TOKEN", "unit-test-token")
     monkeypatch.setattr(app_module, "_active_job", None)
@@ -92,6 +93,7 @@ def test_unknown_keys_are_refused(dashboard, extra):
         (dict(VALID, area="x" * 120), "area"),
         (dict(VALID, preset="../../etc/passwd"), "preset"),
         (dict(VALID, preset="no-such-preset"), "preset"),
+        (dict(VALID, confirm_aoi="yes"), "confirm_aoi"),
     ],
 )
 def test_bad_values_are_refused_with_the_field(dashboard, body, field):
@@ -120,3 +122,26 @@ def test_injection_strings_never_reach_argv(dashboard, monkeypatch):
     assert isinstance(argv, list)
     assert "toy area (north)" in argv              # one element, not split
     assert all(isinstance(part, str) for part in argv)
+
+
+def test_aoi_confirmation_is_forwarded_only_when_explicit(dashboard, monkeypatch):
+    captured = {}
+
+    def _capture(argv, params):
+        captured["argv"] = argv
+        job = {"run_id": "55555555-5555-5555-5555-555555555555", "state": "running",
+               "step": "starting", "progress": 0.0, "started_utc": "2026-10-13T00:00:00+00:00",
+               "finished_utc": None, "exit_code": None, "params": params, "log_tail": []}
+        monkeypatch.setattr(dashboard, "_active_job", job)
+        return job
+
+    monkeypatch.setattr(dashboard, "_launch_job", _capture)
+    body = dict(VALID, confirm_aoi=True)
+    assert _post(dashboard, body).status_code == 202
+    assert "--confirm-aoi" in captured["argv"]
+
+
+def test_checkbox_cannot_confirm_unverified_default_preset(dashboard):
+    response = _post(dashboard, {"confirm_aoi": True})
+    assert response.status_code == 400
+    assert "verify the preset AOI" in response.get_json()["error"]

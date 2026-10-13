@@ -36,6 +36,7 @@ def dashboard(tmp_path, monkeypatch):
 
     monkeypatch.setattr(app_module, "RESULTS", tmp_path / "results")
     monkeypatch.setattr(app_module, "PIPELINE_TOKEN", "unit-test-token")
+    monkeypatch.setattr(app_module, "LOGIN_REQUIRED", False)
     monkeypatch.setattr(app_module, "_active_job", None)
     monkeypatch.setattr(app_module, "_active_proc", None)
     # The rate limiter keeps per-client counters in the module; each test must

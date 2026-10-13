@@ -45,6 +45,7 @@ def app_module(tmp_path, monkeypatch):
         sys.modules.pop(name, None)
     module = importlib.import_module("app")
     module.app.config["TESTING"] = True
+    monkeypatch.setattr(module, "LOGIN_REQUIRED", False)
     # Limits are the subject here, not the pipeline: keep results/ untouched and
     # never spawn a real job (an accepted POST would otherwise start one and
     # write results/run_status.json).

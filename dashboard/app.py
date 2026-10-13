@@ -15,16 +15,17 @@ Open: http://localhost:5000
 
 import gzip
 import hmac
+import ipaddress
 import json
 import logging
 import logging.handlers
 import math
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
-import secrets
 import threading
 import time
 import uuid
@@ -67,6 +68,35 @@ from config.presets import (  # noqa: E402  (path set up above)
 from config.run_meta import load_run_meta  # noqa: E402
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+
+
+def _validate_public_runtime() -> None:
+    """Fail closed for WSGI deployments exposed beyond loopback."""
+    if __name__ == "__main__":
+        return
+    host = os.environ.get("JALNETRA_HOST") or "127.0.0.1"
+    try:
+        loopback = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if loopback:
+        return
+    required = (
+        "JALNETRA_SECRET_KEY",
+        "JALNETRA_DASHBOARD_PASSWORD",
+        "JALNETRA_PIPELINE_TOKEN",
+    )
+    missing = [name for name in required if not os.environ.get(name, "").strip()]
+    if os.environ.get("JALNETRA_AUTH", "").strip().lower() in ("off", "0", "false", "no"):
+        missing.append("JALNETRA_AUTH=on")
+    if missing:
+        raise RuntimeError(
+            "refusing non-loopback WSGI startup; configure " + ", ".join(missing)
+        )
+    app.config["SESSION_COOKIE_SECURE"] = True
+
+_validate_public_runtime()
+
 # No CORS: the dashboard page and its API are served from the same origin, so the
 # browser never needs cross-origin permission. `CORS(app)` reflected any Origin
 # back as Access-Control-Allow-Origin, which let any page you happened to visit
@@ -235,10 +265,10 @@ class _Auth:
         self.password = os.environ.get("JALNETRA_DASHBOARD_PASSWORD", "").strip()
         self.generated = False
         requested = os.environ.get("JALNETRA_AUTH", "").strip().lower()
-        # Explicit opt-in, or a password that was supplied. `off` always wins.
-        self.enabled = bool(self.password) or requested in ("on", "1", "true", "yes")
-        if requested in ("off", "0", "false", "no"):
-            self.enabled = False
+        # Fail closed even when the app is loaded by a WSGI server that does not
+        # execute main(). A password must be configured there; main() generates
+        # one for the documented local launch. `off` always wins explicitly.
+        self.enabled = requested not in ("off", "0", "false", "no")
 
     def enable(self, password: str | None = None) -> str:
         """Turn the gate on, generating a password when none was configured."""
@@ -263,9 +293,9 @@ app.secret_key = os.environ.get("JALNETRA_SECRET_KEY", "").strip() or secrets.to
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    # The documented deployment is plain http on loopback, where a Secure cookie
-    # would simply never be sent back.
-    SESSION_COOKIE_SECURE=False,
+    # Public deployments must set this behind HTTPS. Local HTTP is loopback only.
+    SESSION_COOKIE_SECURE=os.environ.get("JALNETRA_COOKIE_SECURE", "1").strip().lower()
+    not in ("0", "false", "off", "no"),
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
 )
 
@@ -328,7 +358,7 @@ MAX_ARG_STRING = 80
 ALLOWED_REQUEST_KEYS = {
     "bbox", "center_lat", "center_lon", "extent",
     "event_date", "osm_snapshot", "before_date", "after_date",
-    "area", "preset",
+    "area", "preset", "confirm_aoi",
 }
 MAX_BBOX_DEG2 = float(os.environ.get("JALNETRA_MAX_BBOX_DEG2", "1.0"))
 AREA_NAME_PATTERN = re.compile(r"^[\w .,\-()/]{1,80}$", re.UNICODE)
@@ -579,7 +609,11 @@ def _parse_run_request(payload: dict) -> dict:
     else:
         bbox = None
 
-    params = {"bbox": bbox}
+    confirm_aoi = payload.get("confirm_aoi", False)
+    if not isinstance(confirm_aoi, bool):
+        return ("confirm_aoi must be a boolean", "confirm_aoi")
+
+    params = {"bbox": bbox, "confirm_aoi": confirm_aoi}
     for name, low, high in (("center_lat", -90, 90), ("center_lon", -180, 180),
                             ("extent", 0.0001, 90)):
         value = _num(name, low, high)
@@ -636,6 +670,10 @@ def _parse_run_request(payload: dict) -> dict:
     custom_aoi = bool(params["bbox"]) or any(
         params.get(key) is not None for key in ("center_lat", "center_lon", "extent")
     )
+    if params["confirm_aoi"] and not custom_aoi and not params.get("preset"):
+        return ("confirm_aoi requires an AOI to confirm", "confirm_aoi")
+    if params["confirm_aoi"] and params.get("preset") and not custom_aoi:
+        return ("verify the preset AOI against its source before confirming", "confirm_aoi")
     if custom_aoi and not params.get("preset"):
         needed = ("area", "event_date", "osm_snapshot", "before_date", "after_date")
         missing = [name for name in needed if not params.get(name)]
@@ -661,6 +699,8 @@ def _pipeline_argv(params: dict) -> list[str]:
         argv += ["--area", params["area"]]
     if params.get("bbox"):
         argv += ["--bbox", ",".join(f"{v:.6f}" for v in params["bbox"])]
+    if params.get("confirm_aoi"):
+        argv.append("--confirm-aoi")
     if params.get("center_lat") is not None:
         argv += ["--center-lat", str(params["center_lat"])]
     if params.get("center_lon") is not None:
@@ -1013,6 +1053,8 @@ def band_provenance(label: str) -> dict:
         sidecar = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+    if not isinstance(sidecar, dict):
+        return {}
     stats = sidecar.get("band_stats") or {}
     return {
         "archive": sidecar.get("archive"),
@@ -1030,6 +1072,20 @@ def band_provenance(label: str) -> dict:
             if isinstance(value, dict)
         },
     }
+
+
+def _current_repo_commit() -> str | None:
+    """Read the checkout revision without invoking a shell or network access."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=3, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}", value) else None
 
 
 def results_provenance() -> dict:
@@ -1052,7 +1108,8 @@ def results_provenance() -> dict:
     manifest_path = RESULTS / RESULTS_MANIFEST
     if manifest_path.is_file():
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = loaded if isinstance(loaded, dict) else {}
         except (OSError, json.JSONDecodeError):
             manifest = {}
 
@@ -1074,10 +1131,73 @@ def results_provenance() -> dict:
 
     has_results = (RESULTS / "flood_mask.tif").is_file() or (RESULTS / "change_detection.json").is_file()
     chain_complete = bool(run_meta) and bool(manifest) and all(bands.values())
+    issues: list[str] = []
+    if chain_complete:
+        if not run_meta.get("aoi_confirmed"):
+            issues.append("AOI has not been confirmed")
+
+        parameters = manifest.get("parameters") or {}
+        for key in ("area", "bbox", "before_date", "after_date", "event_date", "osm_snapshot_date"):
+            if parameters.get(key) != run_meta.get(key):
+                issues.append(f"manifest {key} does not match run_meta.json")
+                break
+
+        expected_bbox = run_meta.get("bbox")
+        for label, band in bands.items():
+            bbox = band.get("bbox_deg")
+            if (
+                not isinstance(expected_bbox, list)
+                or not isinstance(bbox, list)
+                or len(bbox) != 4
+                or len(expected_bbox) != 4
+            ):
+                issues.append(f"{label} Sentinel sidecar has no usable AOI bounds")
+            else:
+                try:
+                    aligned = all(
+                        math.isclose(float(actual), float(expected), rel_tol=0, abs_tol=1e-6)
+                        for actual, expected in zip(bbox, expected_bbox)
+                    )
+                except (TypeError, ValueError):
+                    aligned = False
+                if not aligned:
+                    issues.append(f"{label} Sentinel bounds do not match run_meta.json")
+            actual_date = str(band.get("acquired_utc") or "")[:10]
+            expected_date = str(run_meta.get(f"{label}_date") or "")
+            if not actual_date or actual_date != expected_date:
+                issues.append(f"{label} Sentinel acquisition date does not match run_meta.json")
+
+        rules = manifest.get("rules_check") or {}
+        required_rules = (
+            "osm_snapshot_before_event", "acquisitions_bracket_event",
+            "no_forbidden_input_sources", "sentinel_orbit_same_for_pair",
+        )
+        failed = [name for name in required_rules if rules.get(name) is not True]
+        if failed:
+            issues.append("data rules are not all verified: " + ", ".join(failed))
+
+        current_commit = _current_repo_commit()
+        if not current_commit or manifest.get("repo_commit") != current_commit:
+            issues.append("manifest was produced by a different or unverified code revision")
+
+        osm_meta_path = DATA / "osm" / "osm_metadata.json"
+        try:
+            osm_meta = json.loads(osm_meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            osm_meta = {}
+        if osm_meta.get("bbox") != run_meta.get("bbox"):
+            issues.append("OSM bounds do not match run_meta.json")
+        if osm_meta.get("snapshot_date") != run_meta.get("osm_snapshot_date"):
+            issues.append("OSM snapshot date does not match run_meta.json")
+        if osm_meta.get("failed_required_categories"):
+            issues.append("OSM metadata reports failed required categories")
+
     if not has_results:
         state = "empty"
-    elif chain_complete:
+    elif chain_complete and not issues:
         state = "live"
+    elif chain_complete:
+        state = "unverified"
     else:
         state = "stale"
 
@@ -1089,6 +1209,7 @@ def results_provenance() -> dict:
     for label, band in bands.items():
         if not band:
             missing.append(f"the {label}-date band sidecar (data/sentinel1/{label}/{BAND_SIDECAR})")
+    missing.extend(issues)
 
     notes = {
         "live": (
@@ -1098,6 +1219,10 @@ def results_provenance() -> dict:
         "stale": (
             "These layers cannot be traced to a run in this directory. Treat them "
             "as illustrative, not as measurements from the current code."
+        ),
+        "unverified": (
+            "A provenance chain exists, but one or more checks failed. Treat these "
+            "figures as illustrative, not as validated event measurements."
         ),
         "empty": "No run has produced a flood mask in this directory yet.",
     }
@@ -1480,7 +1605,7 @@ def login():
                 429,
             )
         supplied = request.form.get("password") or ""
-        if hmac.compare_digest(supplied, AUTH.password):
+        if AUTH.password and hmac.compare_digest(supplied, AUTH.password):
             session.clear()
             session[AUTH_SESSION_KEY] = True
             session.permanent = True
@@ -1719,17 +1844,29 @@ if __name__ == "__main__":
     # JALNETRA_HOST=0.0.0.0 opts in explicitly (HOST is the older name, still
     # honoured so existing commands keep working).
     host = os.environ.get("JALNETRA_HOST") or os.environ.get("HOST") or "127.0.0.1"
+    try:
+        loopback_bind = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback_bind = False
+    app.config["SESSION_COOKIE_SECURE"] = not loopback_bind or (
+        os.environ.get("JALNETRA_COOKIE_SECURE", "1").strip().lower()
+        not in ("0", "false", "off", "no")
+    )
+    if not loopback_bind and not os.environ.get("JALNETRA_SECRET_KEY", "").strip():
+        raise SystemExit("JALNETRA_SECRET_KEY must be configured for non-loopback deployments")
+    if not loopback_bind and not os.environ.get("JALNETRA_DASHBOARD_PASSWORD", "").strip():
+        raise SystemExit("JALNETRA_DASHBOARD_PASSWORD must be configured for non-loopback deployments")
     # The Werkzeug debugger is a live Python REPL: anyone who can reach a
     # traceback gets code execution on this machine. So debug is enabled only
     # when it is explicitly asked for AND the server is bound to loopback.
     _wants_debug = (
         os.environ.get("JALNETRA_DEBUG") or os.environ.get("FLASK_DEBUG") or "0"
     ).lower() in ("1", "true", "yes", "on")
-    debug = _wants_debug and host in ("127.0.0.1", "localhost", "::1")
+    debug = _wants_debug and loopback_bind
     # A server started by a person requires a login unless the operator said
     # otherwise. A password is generated when none was configured, and printed
     # exactly once, here — the same contract as the pipeline token below.
-    if not AUTH.off_by_request() and not AUTH.enabled:
+    if not AUTH.off_by_request() and (not AUTH.enabled or not AUTH.password):
         AUTH.enable()
     LOGIN_REQUIRED = AUTH.enabled
 

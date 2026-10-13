@@ -292,9 +292,18 @@
         <input id="run-max-lat" class="run-input" placeholder="max_lat" inputmode="decimal">
       </div>
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:8px;">
-        <input id="run-event-date" class="run-input" placeholder="event date" inputmode="decimal">
+        <input id="run-event-date" class="run-input" placeholder="event date" type="date">
         <input id="run-area" class="run-input" placeholder="area name">
       </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:5px;">
+        <input id="run-before-date" class="run-input" placeholder="before image date" type="date">
+        <input id="run-after-date" class="run-input" placeholder="after image date" type="date">
+        <input id="run-osm-snapshot" class="run-input" placeholder="pre-event OSM date" type="date">
+      </div>
+      <label style="display:block; font-size:11px; color:#ccd; line-height:1.4; margin:4px 0 8px;">
+        <input id="run-confirm-aoi" type="checkbox">
+        I checked this AOI against the authoritative event footprint
+      </label>
       <button class="menu-btn" id="btn-draw-aoi">▭ Draw AOI on map</button>
       <button class="menu-btn" id="btn-run-pipeline" style="background:#e94560; color:white;">
         ▶ Run Full Pipeline
@@ -472,6 +481,8 @@ function updateProvenance(status) {
   const p = (status && status.provenance) || {};
   const state = p.state || 'unknown';
   const live = state === 'live';
+  const empty = state === 'empty';
+  const unverified = state === 'unverified';
 
   const banner = document.getElementById('provenance-banner');
   if (banner) {
@@ -479,18 +490,20 @@ function updateProvenance(status) {
     banner.style.display = live ? 'none' : 'block';
     if (!live) {
       const missing = (p.missing || []);
-      banner.textContent = state === 'empty'
+      banner.textContent = empty
         ? 'NO RESULTS — no run has produced a flood mask in this directory yet.'
-        : 'NOT COMPUTED HERE — these figures cannot be traced to a run in this '
-          + 'directory' + (missing.length ? ' (missing: ' + missing.join('; ') + ')' : '')
-          + '. Treat them as illustrative, not as measurements.';
+        : (unverified
+          ? 'NOT VERIFIED — ' + (p.note || 'the run did not pass its provenance checks')
+          : 'NOT COMPUTED HERE — these figures cannot be traced to a run in this directory.')
+          + (missing.length ? ' (' + missing.join('; ') + ')' : '')
+          + ' Treat them as illustrative, not as measurements.';
     }
   }
 
   const stateEl = document.getElementById('prov-state');
   if (stateEl) {
     stateEl.textContent = live ? 'LIVE — computed by this code'
-      : (state === 'empty' ? 'NO RESULTS' : 'UNTRACEABLE');
+      : (empty ? 'NO RESULTS' : (unverified ? 'NOT VERIFIED' : 'UNTRACEABLE'));
     stateEl.style.color = live ? '#66bb6a' : '#ffa726';
   }
 
@@ -866,6 +879,10 @@ function readRunForm() {
   if (corners.every(v => v !== '')) { body.bbox = corners.map(Number); }
   if (val('run-event-date')) { body.event_date = val('run-event-date'); }
   if (val('run-area')) { body.area = val('run-area'); }
+  if (val('run-before-date')) { body.before_date = val('run-before-date'); }
+  if (val('run-after-date')) { body.after_date = val('run-after-date'); }
+  if (val('run-osm-snapshot')) { body.osm_snapshot = val('run-osm-snapshot'); }
+  body.confirm_aoi = document.getElementById('run-confirm-aoi').checked;
   return body;
 }
 

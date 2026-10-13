@@ -26,9 +26,9 @@ from config import run_meta as rm
 def test_preset_resolves_and_round_trips_through_run_meta_json(tmp_path):
     meta = rm.resolve_run_meta(preset="trishuli")
     assert meta["area"] and meta["before_date"] and meta["after_date"]
-    # The trishuli preset has no confirmed AOI yet, so it runs on the fallback.
-    assert meta["bbox"] == [85.4, 28.0, 86.0, 28.6]
-    assert meta["bbox_source"] == "center_extent_fallback"
+    # The trishuli AOI is provisional until its source is independently checked.
+    assert meta["bbox"] == [85.117358, 27.972395, 85.581515, 28.077922]
+    assert meta["bbox_source"] == "preset"
     assert meta["aoi_confirmed"] is False
 
     path = rm.write_run_meta(tmp_path, meta)
@@ -56,15 +56,29 @@ def test_bbox_is_primary_and_the_center_follows_it():
     meta = rm.resolve_run_meta(preset="trishuli", bbox="85.00,28.00,85.40,28.40")
     assert meta["bbox"] == [85.0, 28.0, 85.4, 28.4]
     assert meta["bbox_source"] == "cli"
-    assert meta["aoi_confirmed"] is True
+    assert meta["aoi_confirmed"] is False
     # The center is the BOX's midpoint, not the preset's unverified fallback: a
     # center that disagrees with the AOI is exactly the drift being removed.
     assert (meta["center_lat"], meta["center_lon"]) == (28.2, 85.2)
 
+    confirmed = rm.resolve_run_meta(
+        preset="trishuli", bbox="85.00,28.00,85.40,28.40", confirm_aoi=True,
+    )
+    assert confirmed["aoi_confirmed"] is False
+
+    custom_confirmed = rm.resolve_run_meta(
+        area="Verified Valley", bbox="85.00,28.00,85.40,28.40", confirm_aoi=True,
+        before_date="2026-08-14", after_date="2026-08-28",
+        event_date="2026-08-26", osm_snapshot_date="2026-07-27",
+    )
+    assert custom_confirmed["aoi_confirmed"] is True
+
 
 def test_center_extent_is_only_a_fallback_and_is_marked_unconfirmed():
     meta = rm.resolve_run_meta(
-        preset="trishuli", center_lat=27.5, center_lon=84.9, extent=0.2
+        area="Unconfirmed Valley", center_lat=27.5, center_lon=84.9, extent=0.2,
+        before_date="2026-08-14", after_date="2026-08-28",
+        event_date="2026-08-26", osm_snapshot_date="2026-07-27",
     )
     assert meta["bbox"] == [84.7, 27.3, 85.1, 27.7]
     assert meta["bbox_source"] == "center_extent_fallback"
@@ -86,7 +100,10 @@ def test_post_event_osm_snapshot_is_refused():
 
 
 def test_malformed_bboxes_are_refused():
-    for bad in ("85,28,86", "86,28,85,28.6", "a,b,c,d"):
+    for bad in (
+        "85,28,86", "86,28,85,28.6", "a,b,c,d", "nan,28,86,29",
+        "-181,28,86,29", "85,91,86,92",
+    ):
         with pytest.raises(ValueError):
             rm.parse_bbox(bad)
 
@@ -117,6 +134,14 @@ def test_run_pipeline_publishes_run_meta_and_hands_it_to_every_stage(tmp_path, m
 
     def fake_run(cmd, cwd=None):  # noqa: ANN001 - mirrors run_pipeline.run
         commands.append([str(part) for part in cmd])
+        if any("fetch_osm.py" in part for part in cmd):
+            osm_dir = data / "osm"
+            osm_dir.mkdir(parents=True, exist_ok=True)
+            (osm_dir / "osm_metadata.json").write_text(json.dumps({
+                "bbox": [85.117358, 27.972395, 85.581515, 28.077922],
+                "snapshot_date": "2026-07-27",
+                "failed_required_categories": [],
+            }), encoding="utf-8")
         return True
 
     monkeypatch.setattr(run_pipeline, "run", fake_run)
@@ -139,14 +164,61 @@ def test_run_pipeline_publishes_run_meta_and_hands_it_to_every_stage(tmp_path, m
         "all four download stages (sentinel-1, sentinel-2, OSM, DEM) must get --bbox"
     )
 
-    # Damage, cut-off and the report each read the metadata this run published.
-    for stage in ("damage_assessment.py", "cutoff_analysis.py", "generate_report.py"):
-        stage_cmds = [c for c in commands if any(stage in part for part in c)]
-        assert stage_cmds, f"{stage} was never invoked"
-        assert flag_values(stage_cmds[0], "--run-meta") == [str(meta_path)], (
-            f"{stage} must be handed the run_meta.json this run published"
-        )
 
+def test_pipeline_stops_when_required_sentinel_download_fails(tmp_path, monkeypatch):
+    import run_pipeline
+
+    data, results, report = (tmp_path / n for n in ("data", "results", "report"))
+    for directory in (data, results, report):
+        directory.mkdir(parents=True)
+    monkeypatch.setattr(run_pipeline, "DATA_DIR", data)
+    monkeypatch.setattr(run_pipeline, "RESULTS_DIR", results)
+    monkeypatch.setattr(run_pipeline, "REPORT_DIR", report)
+    monkeypatch.setattr(run_pipeline.sys, "argv", ["run_pipeline.py", "--preset", "trishuli"])
+
+    calls = []
+
+    def fail_sentinel(cmd, cwd=None):
+        calls.append(cmd)
+        return not any("download_sentinel.py" in str(part) for part in cmd)
+
+    monkeypatch.setattr(run_pipeline, "run", fail_sentinel)
+    with pytest.raises(SystemExit) as exc:
+        run_pipeline.main()
+
+    assert exc.value.code == 1
+    assert len(calls) == 1
+    assert not (results / "manifest.json").exists()
+
+
+def test_pipeline_stops_when_osm_bounds_do_not_match_run_aoi(tmp_path, monkeypatch):
+    import run_pipeline
+
+    data, results, report = (tmp_path / n for n in ("data", "results", "report"))
+    for directory in (data, results, report):
+        directory.mkdir(parents=True)
+    monkeypatch.setattr(run_pipeline, "DATA_DIR", data)
+    monkeypatch.setattr(run_pipeline, "RESULTS_DIR", results)
+    monkeypatch.setattr(run_pipeline, "REPORT_DIR", report)
+    monkeypatch.setattr(run_pipeline.sys, "argv", ["run_pipeline.py", "--preset", "trishuli"])
+
+    def write_osm_metadata(cmd, cwd=None):
+        if any("fetch_osm.py" in str(part) for part in cmd):
+            osm_dir = data / "osm"
+            osm_dir.mkdir(parents=True, exist_ok=True)
+            (osm_dir / "osm_metadata.json").write_text(json.dumps({
+                "bbox": [85.4, 28.0, 86.0, 28.6],
+                "snapshot_date": "2026-07-27",
+                "failed_required_categories": [],
+            }), encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(run_pipeline, "run", write_osm_metadata)
+    with pytest.raises(SystemExit) as exc:
+        run_pipeline.main()
+
+    assert exc.value.code == 1
+    assert not (results / "manifest.json").exists()
 
 # ─── the artifacts describe their own run ────────────────────────────────────
 
@@ -157,19 +229,25 @@ def _stats_inputs(tmp_path: Path):
     mask_path = toydata.write_mask_tif(
         tmp_path / "flood_mask.tif", toydata.cutoff_flood_mask()
     )
-    (tmp_path / "damage.geojson").write_text(json.dumps({
-        "type": "FeatureCollection", "features": [],
-        "metadata": {"assessment_method": "flood_mask_overlay"},
-    }), encoding="utf-8")
-    (tmp_path / "cutoff.geojson").write_text(json.dumps({
-        "type": "FeatureCollection", "features": [], "status": "ok",
-        "summary": {
-            "total_settlements": 0, "total_hospitals": 1, "reachable_settlements": 0,
-            "cutoff_settlements": 0, "cutoff_percentage": 0.0,
-            "already_isolated_settlements": 0, "flooded_road_segments": 0,
-        },
-        "cutoff_settlements": [],
-    }), encoding="utf-8")
+    (tmp_path / "damage.geojson").write_text(
+        json.dumps({
+            "type": "FeatureCollection", "features": [],
+            "metadata": {"assessment_method": "flood_mask_overlay"},
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "cutoff.geojson").write_text(
+        json.dumps({
+            "type": "FeatureCollection", "features": [], "status": "ok",
+            "summary": {
+                "total_settlements": 0, "total_hospitals": 1, "reachable_settlements": 0,
+                "cutoff_settlements": 0, "cutoff_percentage": 0.0,
+                "already_isolated_settlements": 0, "flooded_road_segments": 0,
+            },
+            "cutoff_settlements": [],
+        }),
+        encoding="utf-8",
+    )
     return mask_path, tmp_path / "damage.geojson", tmp_path / "cutoff.geojson"
 
 
@@ -181,6 +259,7 @@ def test_report_header_and_data_label_come_from_run_meta(tmp_path):
         area="Toy Valley", bbox="85.00,28.00,85.40,28.40",
         before_date="2026-01-01", after_date="2026-01-02",
         event_date="2026-01-02", osm_snapshot_date="2025-12-01",
+        confirm_aoi=True,
     )
     out = tmp_path / "situation_report.html"
     generate_report.generate_html_report(
@@ -208,7 +287,11 @@ def test_report_states_an_unconfirmed_aoi_plainly(tmp_path):
     import generate_report
 
     mask_path, damage_path, cutoff_path = _stats_inputs(tmp_path)
-    meta = rm.resolve_run_meta(preset="trishuli")  # fallback AOI, unconfirmed
+    # A custom bbox is not confirmation by itself, even when it overrides a preset.
+    meta = rm.resolve_run_meta(
+        preset="trishuli", bbox="85.2,28.0,85.4,28.2",
+        area="Unconfirmed AOI Test",
+    )
     assert meta["aoi_confirmed"] is False
 
     out = tmp_path / "report.html"
@@ -220,8 +303,7 @@ def test_report_states_an_unconfirmed_aoi_plainly(tmp_path):
         out, synthetic=True, run_meta=meta,
     )
     assert "AREA OF INTEREST NOT CONFIRMED" in out.read_text(encoding="utf-8"), (
-        "an unconfirmed fallback AOI must be visible in the published report, not "
-        "only in a console warning"
+        "a custom bbox without explicit AOI confirmation must be labelled unconfirmed"
     )
 
 

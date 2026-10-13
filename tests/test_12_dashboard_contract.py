@@ -47,6 +47,7 @@ def empty_dashboard(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "RESULTS", empty / "results")
     monkeypatch.setattr(app_module, "DATA", empty / "data")
     monkeypatch.setattr(app_module, "REPORT_DIR", empty / "report")
+    monkeypatch.setattr(app_module, "LOGIN_REQUIRED", False)
     app_module.app.config.update(TESTING=True)
     return app_module, empty
 

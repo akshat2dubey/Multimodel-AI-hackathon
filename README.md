@@ -1,6 +1,6 @@
 # Jalnetra — Flood Damage Mapping from Space
 
-Jalnetra is a flood-damage mapping tool for the Himalayas. It takes **an area** and **a flood date** and uses free satellite data to answer the three questions rescue teams care about:
+Jalnetra is a research prototype for exploring flood-damage mapping from satellite data. Its current outputs are **not validated for emergency response or other operational decisions**. It takes an area and dates, then produces an experimental flood-change map, an OpenStreetMap overlay, a road-network reachability analysis, and a situation report.
 
 1. **Where did the flood hit?** — a map of flooded and debris-covered areas, made by comparing before/after satellite images.
 2. **What was damaged?** — an estimate of which buildings, roads, and bridges were hit, from OpenStreetMap overlaid on that flood map.
@@ -8,7 +8,7 @@ Jalnetra is a flood-damage mapping tool for the Himalayas. It takes **an area** 
 
 It is built for the Multimodal AI Hackathon 2026, Track B (Mapping Flood Damage from Space), and uses Sentinel-1 radar (which sees through monsoon clouds), Sentinel-2 optical when the sky is clear, a Copernicus digital elevation model for flood-path tracing, and a pre-event OpenStreetMap snapshot. There is also a bonus flood-path tracer that, given any upstream point, traces the likely flow down the valley and lists the settlements along it.
 
-Jalnetra is a pipeline with a live web dashboard and a generated one-page situation report. The pipeline runs end-to-end from raw satellite data for any area and date — the idea is that a judge can point it at a corridor and a date on the day, and it produces the map, the damage numbers, the cut-off list, and the report from that data.
+Jalnetra includes a web dashboard and a generated situation report. The pipeline can fetch and process inputs when credentials and dependencies are available, but a successful run does not establish scientific accuracy. Verify AOI and input coverage and independently evaluate the change-detection outputs before using any results.
 
 - **Sentinel-1 radar** is the backbone: it sees through monsoon clouds, and for change detection it is compared against a before image from the **same orbit track** — different tracks view the terrain from different angles and cannot be compared pixel by pixel.
 - **Sentinel-2 optical** is used when the sky is clear; it is cloud-dependent, so it is optional rather than required.
@@ -16,24 +16,41 @@ Jalnetra is a pipeline with a live web dashboard and a generated one-page situat
 - **Copernicus DEM** is used for the flood-path bonus. It comes from a public AWS Open Data bucket with no account needed.
 - The **AI component** is a flood segmentation model (U-Net with a ResNet-34 encoder) trained on the listed training data, or a situation-report copilot — choose one. In either case, every number in a generated report must come from the system's maps, never invented by the language model.
 
-The case study is the **26 August 2026 Bhote Koshi–Trishuli flood** in Nepal: a partial collapse of a high-altitude glacier sent a flood of water, mud, and debris down that corridor. Nepal's National Disaster Risk Reduction and Management Authority reported **1,342 deaths** by 6 September, with almost **4,900 people** still missing or out of contact (as reported by the Copernicus Emergency Management Service).
+The case study is the **26 August 2026 Rasuwa flood** in Nepal. Incident context and impact figures change as authorities update them; this repository does not use casualty estimates as model inputs or validated outputs.
 
 The code, the dashboard, the report generator, and the pipeline orchestration all exist and run. The terrain pipeline is fully real: a **258 MB Copernicus digital elevation model** of the Trishuli corridor was downloaded from the public AWS Open Data bucket (6 tiles, 38–45 MB each, covering 84–87°E × 27–29°N), and a **flood-flow trace** was computed from it — about **251 km** of channel, **5,961 m** of descent, written as a verified GeoJSON the dashboard serves.
 
-Everything from the satellite imagery onward is **synthetic demo data** right now. The flood mask, the damage numbers, the cut-off list, and the report itself are all marked synthetic in their own metadata, and there is a `DEMO_DATA_NOTICE.txt` that calls this out plainly. They exist so the code, dashboard, and report could be built and exercised before the real Sentinel imagery and the real pre-event OSM snapshot arrive. Until that data lands and the model runs against it, none of those numbers should be quoted as a measurement of the actual Nepal event.
+The checkout contains real Sentinel-1 scenes, DEM tiles, and a pre-event OSM extract, but they are cropped to a wider, different area than the EMSR927 AOI01 preset. The current flood model is only a two-epoch synthetic smoke model; its own status note says it detects no meaningful flood signal on the available scenes. Existing results also have an old run manifest. Treat all current maps, damage counts, and cutoff counts as illustrative; they are not measurements of the event.
+
+**Release status: not production-ready.** The configured AOI still needs independent source verification, imagery and OSM must be freshly acquired for matching bounds, and the detection method must be validated against genuine labeled observations with documented accuracy and uncertainty. This prototype is unsuitable for rescue dispatch, safety decisions, or public impact reporting.
 
 ## How to run it
 
 ```bash
-# Install dependencies
+# Use a clean virtual environment with a supported Python and install dependencies
+python -m venv .venv
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
 python -m pip install -r requirements.txt
 
-# Start the dashboard locally
+# Start the dashboard locally (the local launcher generates a one-time password)
 cd dashboard
 python app.py
 ```
 
-Then open the dashboard in a browser. That is the live, visual face of Jalnetra: the flood layer, roads, buildings, bridges, cut-off markers, and the traced flood path.
+Then open the dashboard in a browser. For local HTTP, the loopback launcher selects a non-Secure session cookie. Use a strong `JALNETRA_DASHBOARD_PASSWORD` even for a shared demo; do not bind beyond loopback without the public deployment secrets.
+
+### Hosted prototype deployment
+
+The Flask development server (`python app.py`) is for local use only. Do not expose it to the internet. This repository does not include a container image, locked dependency set, TLS/reverse-proxy configuration, or managed job/data storage. Those must be selected and reviewed for the target host; setting a host to `0.0.0.0` is not sufficient.
+
+Install dependencies, set `JALNETRA_HOST=127.0.0.1`, and run Waitress bound to loopback behind an HTTPS reverse proxy, for example:
+
+```bash
+waitress-serve --listen=127.0.0.1:8080 --call dashboard.wsgi:app
+```
+
+Configure `JALNETRA_SECRET_KEY`, `JALNETRA_DASHBOARD_PASSWORD`, and `JALNETRA_PIPELINE_TOKEN` with strong unique values in the host's secret manager. Set `JALNETRA_COOKIE_SECURE=1`. The app refuses non-loopback WSGI startup unless authentication and all three secrets are configured. The current pipeline launches long-running local subprocesses and expects persistent local `data/` and `results/` storage, so stateless/serverless hosting is not supported. Complete the checks in [`docs/SECURITY.md`](docs/SECURITY.md) and scientific validation before handling real users or operational data.
 
 To run the full pipeline from raw satellite data:
 
@@ -97,7 +114,7 @@ Every run therefore writes four rasters. `damage_assessment.py` and `cutoff_anal
 ## Tests
 
 ```bash
-python -m pytest -q              # all 81 logic tests, ~5 min (torch import dominates)
+python -m pytest -q              # full logic test suite
 python -m pytest -q -m "not slow"  # skip the full-scene-sized performance test
 ```
 
@@ -136,11 +153,11 @@ The helper `scripts/cdse_env.py` reads that file so the secret never appears on 
 | After-date | **2026-09-05** — the post-event acquisition actually downloaded |
 | Event date | **2026-08-26** |
 | OSM snapshot date | **2026-07-27** |
-| AOI (bbox) | **not yet confirmed** — see the TODO in `config/presets.py` |
+| AOI (bbox) | **provisional** — copied from the linked EMSR927 AOI01 resource; independently verify before use |
 
 The acquisition dates are the Sentinel-1 pair on disk (`data/sentinel1/*/PRODUCT_INFO.json`); the event itself is 26 August 2026 (GLIDE `FF-2026-000162-NPL`, EMSR927 activated 26/08/2026). The rules require the OSM snapshot to precede the event, which is enforced in `config/run_meta.py`.
 
-**The case-study AOI is not yet confirmed.** The authoritative area is the Copernicus EMSR927 AOI01 footprint (Syabru Bensi, Rasuwa district) — note that the event is *not* at 85.7°E, which is merely the center the existing OSM snapshot was pulled at. Until the AOI01 bounds are entered in the preset, `--preset trishuli` runs on that unverified center+extent fallback and stamps everything it produces `aoi_confirmed: false`.
+The preset stores provisional EMSR927 AOI01 bounds and leaves `aoi_confirmed` false by default. The checked-in input sidecars still describe the older `[85.4, 28.0, 86.0, 28.6]` extent, so they do not match this AOI. The pipeline will fetch new inputs for its selected bbox; do not reuse the old outputs as evidence. Use `--confirm-aoi` only after independently checking the boundary against the authoritative source.
 
 ## Scripts
 
@@ -172,8 +189,10 @@ The acquisition dates are the Sentinel-1 pair on disk (`data/sentinel1/*/PRODUCT
 ```bash
 python scripts/run_offline.py                 # every stage, on fabricated data
 
-# look at it — the dashboard shows a DEMO DATA banner when it serves the fixture
-cd dashboard && JALNETRA_RESULTS_DIR=results_demo python app.py
+# Look at it — the dashboard shows a DEMO DATA banner when serving the fixture.
+cd dashboard
+# PowerShell: $env:JALNETRA_RESULTS_DIR="results_demo"; python app.py
+# macOS/Linux: JALNETRA_RESULTS_DIR=results_demo python app.py
 ```
 
 A demo run keeps its own trees: generated inputs in `data_demo/`, generated
@@ -196,10 +215,11 @@ The official reference to check against is **Copernicus EMSR927** at [mapping.em
 
 ## Limitations
 
+- **Not production-ready for operational response.** The checked-in Sentinel-1 and OSM bounds do not match the provisional AOI; the smoke model was trained on synthetic data and is not validated. Current layers and derived counts are illustrative only.
 - **Sentinel satellites revisit an area only every few days.** They cannot warn of a sudden glacier collapse minutes ahead. This system is for response, not warning.
 - **Radar change detection needs same-orbit-track before/after images.** Different tracks view the terrain from different angles and cannot be compared pixel by pixel. If the available acquisitions do not line up, the comparison degrades.
 - **Optical imagery is cloud-dependent.** In a monsoon-season Himalayan flood, Sentinel-2 can be largely blank, which is why Sentinel-1 radar is the backbone, not the nice-to-have.
-- **The flood mask, damage numbers, and cut-off list are only as good as the model and the imagery.** Until real Sentinel imagery downloads and a trained model runs against it, the headline outputs are synthetic demo data.
+- **The flood mask, damage numbers, and cut-off list are only as good as the model and the imagery.** A log-ratio baseline is available, but it is experimental and has not been independently evaluated for this event.
 - **OSM is incomplete and unevenly distributed**, especially for high-altitude settlements. A cut-off analysis is only as good as the road network in the snapshot.
 - **This is an educational prototype, not an operational tool.** Treat the topic with respect: do not use images of victims in demos or reports. The disaster is recent and many families are still affected.
 

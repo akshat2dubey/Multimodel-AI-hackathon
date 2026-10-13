@@ -50,6 +50,7 @@ FIXTURE = {
 def dashboard(tmp_path, monkeypatch):
     import app as app_module
 
+    monkeypatch.setattr(app_module, "LOGIN_REQUIRED", False)
     results = tmp_path / "results"
     results.mkdir()
     (results / "damage_assessment.geojson").write_text(json.dumps(FIXTURE), encoding="utf-8")

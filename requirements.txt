@@ -1,8 +1,7 @@
 # Jalnetra — runtime dependencies
-# Verified on Python 3.14.2 (Windows, this project's development machine): the full
-# test suite passes and every wheel resolves from PyPI. Python 3.10-3.12 should work
-# (nothing here is 3.13+ only) but was NOT tested for this submission — treat the
-# 3.14 statement as the verified one.
+# Python 3.12 is the minimum intended runtime; deployment should pin an exact
+# Python and dependency lockfile after validating the chosen platform. This file
+# uses minimum versions, not a reproducible production lock.
 #
 #   python -m pip install -r requirements.txt
 #
@@ -35,6 +34,7 @@ torchvision>=0.15      # ResNet-34 encoder for ResNetUNet
 # installed (or imported). flask-cors was a declared dependency that nothing
 # used; it was removed in T36.
 flask>=3.0
+waitress>=3.0          # production WSGI server (Windows/Linux)
 
 # --- Progress + CLI --------------------------------------------------------
 tqdm>=4.65

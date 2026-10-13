@@ -75,6 +75,7 @@ from config.presets import (  # noqa: E402  (path set up above)
     OSM_SNAPSHOT_DATE,
     RESULTS_DEMO_NAME,
     RESULTS_NAME,
+    demo_paths_error,
 )
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
@@ -583,6 +584,11 @@ def main():
     # Demo output goes to results_demo/, NOT results/. Keeping them apart is what
     # lets the dashboard tell a fabricated fixture from a real run.
     results = args.results_dir or (root / RESULTS_DEMO_NAME)
+
+    unsafe_reason = demo_paths_error(data, results)
+    if unsafe_reason:
+        print(f"\n  ✋ {unsafe_reason}", file=sys.stderr)
+        return 1
 
     if results.name == RESULTS_NAME and not args.force:
         print(

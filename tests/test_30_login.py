@@ -11,6 +11,7 @@ is covered last, so turning the gate off stays a deliberate choice.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -26,6 +27,25 @@ PASSWORD = "correct-horse-battery-staple"
 
 PAGES = ("/", "/report", "/demo")
 API_ROUTES = ("/api/status", "/api/damage", "/api/cutoffs")
+
+
+def test_wsgi_import_defaults_to_authentication(monkeypatch):
+    """A WSGI import must fail closed even though main() is never called."""
+    monkeypatch.delenv("JALNETRA_AUTH", raising=False)
+    monkeypatch.delenv("JALNETRA_DASHBOARD_PASSWORD", raising=False)
+    auth = app_module._Auth()
+    assert auth.enabled is True
+    assert auth.password == ""
+
+
+def test_missing_wsgi_password_cannot_be_bypassed_with_blank_login(gated, monkeypatch):
+    monkeypatch.setattr(gated.AUTH, "password", "")
+    client = gated.app.test_client()
+    response = client.post(
+        "/login", data={"password": ""}, headers={"Origin": "http://localhost"}
+    )
+    assert "Incorrect password" in response.get_data(as_text=True)
+    assert client.get("/").status_code == 302
 
 
 @pytest.fixture
@@ -173,6 +193,11 @@ def test_the_session_cookie_is_not_readable_by_scripts(gated):
     cookie = response.headers.get("Set-Cookie", "")
     assert "HttpOnly" in cookie
     assert "SameSite=Lax" in cookie
+    assert "Secure" in cookie
+
+
+def test_secure_cookie_can_be_disabled_for_loopback_http(monkeypatch):
+    assert app_module.app.config["SESSION_COOKIE_SECURE"] is True
 
 
 def test_auth_off_is_the_documented_loopback_mode(monkeypatch, tmp_path):
