@@ -1,0 +1,1135 @@
+   JALNETRA -- MASTER
+
+EXECUTION PLAN v2 (for an
+
+         AI coding agent)
+
+  Project: Multimodal AI Hackathon 2026, Track B "Mapping Flood Damage from Space" (case study: Aug 2026 Trishuli
+GLOF, Copernicus EMSR927). Repo: github.com/akshat2dubey/Multimodel-AI-hackathon Submission deadline: 15 Oct
+
+                            2026, 12:15 am. Freeze code on 14 Oct by noon, submit by 14 Oct 10 pm.
+
+      What changed vs v1: the human already gave you the first 10 fix prompts (preprocessing bridge, results paths,
+      hardcoded values, change mask, no-synthetic/baseline, performance, cut-off logic, empty-data, inference bugs,
+dashboard form). v2 therefore starts with a GATE AUDIT of that work, then finishes the remaining fixes (old prompts 11­
+25), then builds the standout FEATURES, then adds SECURITY, and ends with DOCS/DELIVERABLES (written last so
+
+                                                            they describe the final system).
+
+  0. HOW YOU (THE AI AGENT) MUST
+            WORK -- READ FIRST
+
+      1. Read this whole file once. Then start with Phase 0 (Gate Audit) and continue strictly in the order of the
+         Execution Order table (section 4). Do not ask what to do first; the order is decided.
+
+      2. Inspect the real repo state before every task. The first 10 fixes were done from earlier prompts, so file names,
+         flags and function names may differ from what this document assumes. Trust the code you read, not this
+         document's guesses. If something a task wants already exists and works, say so, verify it with a test, and move
+         on (do not redo it).
+
+      3. Work on one task at a time. For each task: read the listed files  implement the "Do" steps  write/run the
+         task's tests  run the full test suite (pytest -q)  commit with message T<id>: <title>  tick it in
+         docs/dev/PROGRESS.md  print a 5-line report (what changed, files touched, tests run, consumers verified,
+         anything unverified).
+
+      4. If a test or an earlier task breaks, fix it before moving on. Never leave the repo in a failing state.
+      5. Forward references: some tasks mention a later task (e.g. T14 mentions blind spots from T24). Implement that
+
+         part only when the referenced task exists; until then skip it and leave a # TODO(T24) comment.
+      6. Stop and ask the human only for the items in section 3 (HUMAN INPUT REQUIRED). For everything else choose
+
+         the simplest option that satisfies "Done when" and note the choice in PROGRESS.md.
+      7. Tags: [VERIFIED] = confirmed by reading the code earlier; [CHECK FIRST] = suspected, inspect before
+
+         changing; if already fine, skip and say so.
+      8. The human prefers guidance over a black box: keep code short and readable with brief comments so they can
+
+         explain it to judges. No over-engineering.
+      9. Why this order: gate audit (make sure the base is real)  remaining fixes (so features sit on correct data) 
+          features (they touch the dashboard and outputs)  security hardening (after features, so the
+          XSS/headers/validation audit covers the final UI and routes)  docs last (so nothing described is untrue). Basic
+          security quick-wins (secrets scan, bind/debug/CORS/token) are pulled forward into the fixes phase because they
+          are cheap and risky to delay.
+
+     1. CONTEXT (what the hackathon
+                      requires)
+
+                                The system takes an area + flood date and, from satellite data, answers:
+
+      1. Where did the flood hit? (flooded + debris-covered areas, before/after, Sentinel-1 radar, Sentinel-2 optional)
+      2. What was damaged? (buildings, roads, bridges from pre-event OpenStreetMap)
+      3. Who is cut off? (settlements with no road connection to nearest town/hospital)
+      4. AI component -- we chose flood segmentation model (NOT the copilot). Must show how well it works on
+
+          Himalayan scenes it has never seen.
+      5. Bonus: flood-path trace from an upstream point using DEM + list of settlements along it.
+      6. Case study: map the Aug 2026 flood and compare with Copernicus EMS EMSR927 (comparison only).
+
+Judging: live, on areas/dates chosen by judges. Flood+damage mapping 30%, AI component 25%, cut-off analysis 20%,
+   report/Q&A/honesty 15%, dashboard+sitrep 10%. The system must run end-to-end from raw satellite data for any
+                                                                       area and date.
+
+ Deliverables: dashboard + one-page auto-generated situation report; GitHub repo with README; report (max 6 pages,
+                      with limitations section); 3-min demo video; attributions/citations; EMSR927 comparison.
+
+        HARD DATA RULES (violating = disqualification)
+
+          Allowed inputs: Sentinel-1, Sentinel-2, Copernicus DEM, OpenStreetMap as it was before 26 Aug 2026
+          (snapshot  27 Jul 2026), and listed training datasets (Kuro Siwo, optionally Sen1Floods11).
+          NOT allowed as inputs: Copernicus EMS / EMSR927, UNOSAT or any published damage maps, OSM edits
+          after the event. These may only be used to check results. Never tune thresholds on them. No pipeline script may
+          read anything from docs/EMSR927*.
+          For change detection use same orbit track, same time of day (e.g. 12 days apart).
+          No images of victims anywhere. System is an educational prototype, not operational.
+
+REQUIRED ATTRIBUTIONS (exact text, show in dashboard
+                   footer, sitrep, report, README)
+
+          "Contains modified Copernicus Sentinel data 2026."
+          "Produced using Copernicus WorldDEM-30 © DLR e.V. 2010­2014 and © Airbus Defence and Space GmbH
+          2014­2018 provided under COPERNICUS by the European Union and ESA; all rights reserved."
+     "© OpenStreetMap contributors."
+     Training data citations: Bountos et al., 2024 (Kuro Siwo, NeurIPS); Bonafilia et al., CVPR Workshops 2020
+     (Sen1Floods11) if used.
+     For EMSR927 comparison: "European Union, Copernicus Emergency Management Service data".
+
+REPO FACTS (from a code review; paths relative to repo
+                                   root)
+
+     scripts/: run_pipeline.py (orchestrator), download_sentinel.py, download_sentinel2.py,
+     download_dem.py, fetch_osm.py (Overpass attic + ohsome counts), train_segmentation.py,
+     inference.py, damage_assessment.py, cutoff_analysis.py, flood_path.py,
+     generate_report.py, make_demo_data.py, run_offline.py, cdse_env.py.
+     dashboard/app.py (Flask + Leaflet, routes incl. POST /api/run-pipeline), docs/, report/, models/,
+     data/, results/.
+     Confirmed problems: see the tasks below. Do not assume anything else is broken; check [CHECK FIRST] items.
+
+  2. GLOBAL ENGINEERING RULES
+            (apply to EVERY task)
+
+  1. Minimal diff. Change only what the task names. No refactors. No new dependencies unless the task says so
+     (use what is in requirements.txt; allowed new dev-only dep: pytest).
+
+  2. Keep contracts. Keep CLI flags, output file names and JSON keys that other scripts or dashboard/app.py
+     read. If one must change, grep the whole repo for all consumers and update them in the same commit.
+
+  3. Never fabricate data or silently fall back to synthetic data. Fail loudly with a clear message. Synthetic data is
+     allowed only inside tests/ or demo/ and must carry a visible banner.
+
+  4. Stay fast. No per-feature full-raster operations; no O(N×M) loops where a window / KD-tree / vectorised op
+     works. Prefer numpy/scipy/rasterio/geopandas already installed.
+
+  5. Everything generic. No hardcoded area names, dates, coordinates, or snapshot dates in code. They come from
+     results/run_meta.json (see T04).
+
+  6. Empty-safe. Every script must handle zero buildings/roads/bridges/hospitals and produce a valid empty result
+     with exit code 0.
+
+  7. Windows-safe. Judges may use Windows: use pathlib, UTF-8 everywhere, no bash-only steps.
+  8. Security by default (see tasks T05­T22, T34­T39): no secrets in code/logs, validated inputs, no debug, no
+
+     tracebacks to users.
+  9. After each change run the touched script on a tiny input and show real output. Never claim a fix works without
+
+     running it.
+10. If something is impossible with the allowed data/time, say so and record it as a limitation in
+
+     docs/LIMITATIONS.md instead of faking it.
+3. HUMAN INPUT REQUIRED (stop and
+
+                    ask only for these)
+
+#                   Needed from human                                                Needed
+                                                                                     by task
+    Case-study bbox (west,south,east,north) taken from the EMSR927 AOI /
+                                                                                     T04
+H1  Rasuwa­Syabru Bensi corridor. The current 28.3N/85.7E and bbox 85.4­     is
+    86.0E/28.0­28.6N are very likely wrong (docs say Rasuwa district; 85.7E          T07
+
+    east of the border). Do not guess; leave a marked TODO until given.              T10,
+                                                                                     T31
+    Copernicus Data Space credentials in a local .secrets/env (never paste into      T26
+                                                                                     T05,
+H2  chat or commit). Sentinel Hub OAuth client may be required for   the Process     T39
+    API (created in the Sentinel Hub dashboard; verify which client  type is
+
+    needed).
+
+    Training dataset choice and download location (Kuro Siwo subset and/or
+H3 Sen1Floods11) and GPU run (Colab/Kaggle). You prepare scripts +
+
+    instructions; human runs training.
+
+H4 Native Nepali speaker review of the Nepali template strings.
+
+H5 Any git-history rewrite or credential rotation (you only prepare the checklist).
+
+    4. EXECUTION ORDER (do top to
+
+                    bottom)
+
+      Phase   Task  Title                                                              Origin
+
+0 Gate audit  G0    Verify the 10 earlier fixes (table in section 5); complete       prompts
+                    any gap using Appendix A                                         1­10
+1 Remaining
+fixes         T01 Repo hygiene + secret scan                                         prompt
+                                                                                     19
+              T02 Test scaffold (extend if tests already exist)
+                                                                                     test
+              T14 Damage labels + accuracy                                           prompt
+
+              T15 Cut-off output = real GeoJSON, no path leak                        prompt
+                                                                                     11
+              T06 Secure defaults on dashboard
+                                                                                     prompt
+              T18 Token / same-origin / no open CORS                                 16
+
+              T33 Live-run robustness (cache, retries, timings)                      prompt
+                                                                                     18a
+              T31 AI evaluation (held-out, IoU/F1, baseline)
+                                                                                     prompt
+              T32 EMSR927 comparison (check-only)                                    18b
+
+                                                                                     prompt
+                                                                                     14
+
+                                                                                     prompt
+                                                                                     12
+
+                                                                                     prompt
+                                                                                     13
+      Phase   Task                            Title              Origin
+2 Standout
+features      T29 Flood-path validation + click start (bonus)  prompt
+                                                               17
+3 Security
+              T23 Rescue triage + "repair this link"           feature 3
+4 Docs &
+deliverables  T24 Confidence score + blind-spot map            feature 2
+
+              T25 Debris vs water classes                      feature 1
+
+              T26 Grounded sitrep with number ledger           feature 6
+
+              T27 Acquisition timeline "why this pair"         feature 5
+
+              T28 Dashboard usability pack                     feature 7
+
+              T30 OPTIONAL Sentinel-2 confirmation layer       feature 8
+
+              T05 Secrets management + redaction               Basic 1
+
+              T17 Input validation allowlist                   Basic 2
+
+              T19 Safe errors + logging                        Basic 5
+
+              T20 Rate limiting + resource limits              Mid 6
+
+              T21 XSS-safe rendering + security headers        Mid 7
+
+              T22 Safe file handling + payload size            Mid 9
+
+              T36 Dependency hygiene                           Mid 8
+
+              T34 Provenance manifest + rule checks            Adv 11
+
+              T35 Safe deserialization / model supply chain    Adv 12
+
+              T37 CI security pipeline                         Adv 13
+
+              T39 Tamper-evident audit log + kill switch + incident checklist Adv 14
+
+              T38 Container sandbox (optional)                 Adv 10
+
+              T40 Attribution everywhere                       prompt
+                                                               20
+
+              T41 Reproducibility + cached case-study pack     prompt
+                                                               21
+
+              T43 Make every document truthful                 prompt
+                                                               15
+
+              T42 One-page sitrep generic                      prompt
+                                                               24
+
+              T44 6-page report + limitations + threat model   prompt
+                                                               22
+
+              T45 Judge Q&A sheet                              prompt
+                                                               25
+
+              T46 3-minute demo script                         prompt
+                                                               23
+
+                  Suggested schedule (IST)
+
+11 Oct (today)  12 Oct: Phase 0 + Phase 1 (fixes). A real S1 run on the case-study bbox must exist by the end
+of 12 Oct (needs H1, H2).
+13 Oct: Phase 2 (features T23, T24, T25 first) + start Phase 3 basics (T05, T17, T19). Model training (H3) runs in
+parallel on Colab/Kaggle.
+       14 Oct morning: finish Phase 3, code freeze at noon (bug fixes only). Afternoon/evening: Phase 4 deliverables,
+       demo video, final checklist, submit by 10 pm.
+
+If time runs short, DROP in this order (never drop Phase 0,
+               Phase 1 except T29, security basics
+
+       T05/T17/T19/T20/T21/T22, and docs T43/T44):
+
+          T30  T38  T29  T27  T26 (Nepali part)  T25  T28  T39 (keep only the kill switch)  T37.
+
+                               Progress file
+
+Create/extend docs/dev/PROGRESS.md with one checkbox per task above and a "Decisions & unverified items" list.
+                                                             Update it after each task.
+
+5. PHASE 0 -- GATE AUDIT (do this first,
+                target  2 hours)
+
+The human already ran 10 fix prompts. Before building anything new, prove they are really done. For each row below:
+find the implementation in the repo, run/write the check, and mark PASS/FAIL in docs/dev/PROGRESS.md. For every
+FAIL, complete the missing parts using the full original spec in Appendix A (same task id), then re-check. Do not redo
+
+                                                                parts that already pass.
+
+  Old   Task  Title              Gate check (must pass)
+prompt
+
+              Sentinel-1         a mocked-API test builds the four files + sidecar from a
+
+#1      T07 preprocessing fake response; a real run (human credentials) yields 4
+
+              bridge             aligned GeoTIFFs for the case-study bbox.
+
+#2      T03   One results/data   test asserts pipeline and dashboard resolve the same
+              path + demo        RESULTS_DIR; demo script cannot write into results/.
+              separation
+
+              run_meta.json test greps scripts/ and dashboard/ and finds no 85.7,
+
+              and zero           28.3, 2026-07-27, 2026-08-26, Trishuli outside config/
+#3      T04 hardcoded            and docs; a run with a different bbox writes a different
+
+              area/date/coords run_meta.json and the report shows that bbox.
+
+#4      T08   Change mask =      toy test (river in both dates + new patch)  mask contains
+              newly flooded,     only the new patch.
+              not "after water"
+
+              Baseline
+
+#5             fallback, no      test: empty dataset dir  non-zero exit; pipeline with no
+        T10 synthetic            model  baseline mask produced.
+
+               training, model
+
+              contract
+  Old   Task  Title                         Gate check (must pass)
+prompt
+
+#6      T11   Performance of    slow test:  5,000 toy features on a 3000×3000 mask     finish
+              damage + cut-off  in < 20 s;  results equal the old implementation on a  small
+                                input.
+
+                                tests: (a) no hospitals  "no reference facility"; (b) pre-
+
+#7      T13   Cut-off logic     isolated village not reported; (c) village whose only road is
+              rewrite           flooded IS reported; (d) a long road flooded in only part of
+
+                                its length does not cut the whole way.
+
+#8      T12   Empty-data        test runs all three scripts with empty buildings, bridges,
+              crash fixes       hospitals, roads  exit 0 and valid JSON.
+
+#9      T09   Inference bug     tests for tiling coverage (sizes 200, 256, 300, 700) and
+              fixes             pixel-area on 10 m and 20 m grids.
+
+#10     T16   Area/date form + test client: POST valid  202 with run_id; status route
+              background job returns state; second POST while running  409.
+
+                                Extra gate checks (cheap, do all):
+
+     pytest -q is green (create the scaffold from T02 first if no tests exist).
+     One end-to-end run on a toy/mocked input completes: download-bridge (mocked)  change mask  inference
+     or baseline  damage  cut-off  report, writing into the same RESULTS_DIR the dashboard reads.
+     grep finds no hardcoded 85.7, 28.3, 2026-07-27, 2026-08-26 outside config/ and docs.
+     No script silently creates synthetic data; run_pipeline.py never trains.
+     Output of every script is valid with empty inputs (exit code 0).
+     Print a short gate report to the human: PASS/FAIL list and what you fixed.
+
+ 6. TASK TEMPLATE (every task below
+                     follows it)
+
+                                  Goal · Files · Do (numbered) · Don't break · Done when (tests)
+
+  PHASE 1 -- REMAINING
+ FIXES (old prompts 11­25,
+
+            code part)
+
+Finish the remaining fixes from the earlier prompt list (old prompts 11­25 that are code fixes), plus the cheap security
+  quick-wins. Docs-type fixes (old prompts 15, 20­25) are in Phase 4 because they must describe the final system.
+T01 -- Repo hygiene + secret scan [P0 | ~45 min]  (old
+                               prompt #19)
+
+ Goal: public repo is clean, leaks nothing, looks professional. Files: NOTICE.md, docs/CEO_STATUS_REPORT.md,
+                             verification_*.json, .gitignore, README.md, new LICENSE. Do:
+
+    1. Delete NOTICE.md (non-English agent notes + a local absolute path) and docs/CEO_STATUS_REPORT.md.
+        Move verification_*.json to docs/dev/ (or delete if unused).
+
+    2. grep -rn "F:/\|C:\\\\Users\|Akshat" . and remove every local absolute path / personal path from
+        tracked files.
+
+    3. .gitignore must contain: .secrets, .env, *.env, data/, results/, logs/, *.pt (but keep a tracked
+        models/README.md explaining where weights come from), __pycache__/, .venv/. Add .env.example with
+        placeholder names only.
+
+    4. Add MIT LICENSE (copyright "Akshat Dubey").
+    5. Remove AI-chat leftovers from README ("Two things only you can decide...", similar). Fix "earthquake" 
+
+        "glacial lake outburst flood (GLOF)". (Full README rewrite happens in T43.)
+    6. Secret scan: search tracked files and git history for tokens (client_secret, Bearer , password, 32+ char
+
+        random strings). Report findings; do not rewrite history yourself (H5). If a real secret appears, tell the human
+        to rotate it. Don't break: nothing functional. Done when: git ls-files shows none of the removed files; grep
+        for local paths returns nothing; scan report printed.
+
+       T02 -- Test scaffold + toy fixtures [P0 | ~45 min]
+
+ Goal: a fast pytest suite that later tasks extend. Files: new tests/conftest.py, pytest.ini, requirements-
+                                                            dev.txt (pytest only). Do:
+
+    1. Fixtures in tmp_path (never write to results/ or data/): a ~200×200 float raster with transform+CRS
+        (EPSG:4326 and a metric CRS variant), a "before" raster containing a permanent river, an "after" raster with river
+        + new flooded patch, a tiny OSM set (a few buildings, two roads, one bridge over the river, one hospital, a few
+        place=village points) as GeoDataFrames/GeoJSON, plus an empty-features variant.
+
+    2. Mark long tests @pytest.mark.slow. Whole default suite < 60 s. No network, no credentials, no GPU.
+    3. Toy data is allowed here only; name fixtures clearly "toy_*". Done when: pytest -q runs (zero or few tests) and
+
+        fixtures import cleanly.
+
+   T14 -- Damage labels + accuracy [P1 | ~2 h]  (old
+                               prompt #11)
+
+       Files: scripts/damage_assessment.py (+ dashboard colours, report counts). Problems [VERIFIED]:
+"DESTROYED" overclaims (SAR/10­20 m cannot show structural destruction); bridge deck pixels are over the river so
+ bridges are always "damaged"; thin roads rasterize unreliably; "UNKNOWN (shadow/nodata)" is documented but not
+
+                                  implemented; damage threshold (0.5) differs from cut-off (0.3). Do:
+      1. Levels: UNAFFECTED, FLOODED_PARTIAL, FLOODED_MAJOR, UNKNOWN (nodata/shadow/outside). Keep a legacy
+          alias property if the dashboard styling needs it (grep first). Never say "destroyed" from SAR alone.
+
+      2. Bridges: judge by flood on the approaches/abutments (a small buffer ring around the bridge minus pre-event
+          water), not the deck.
+
+      3. One shared FLOOD_FRACTION_THRESHOLD constant used by damage and cut-off (config).
+      4. Features overlapping valid_mask==0 (or in blind-spot areas from T24)  UNKNOWN.
+      5. Mask out very steep slope zones using DEM slope (cheap numpy.gradient on the Copernicus DEM, threshold
+
+          in config) and record it in change_detection.json.
+      6. Keep the output properties (damage_level, damage_overlap_ratio, damage_method, flood_affected,
+
+          road_cut, bridge_damaged). Done when: tests: building on new flood flagged; building on permanent river
+          not; bridge over permanent water intact; feature in nodata  UNKNOWN.
+
+  T15 -- Cut-off output = real GeoJSON, no path leak [P1 |
+                    ~30 min]  (old prompt #16)
+
+      Files: scripts/cutoff_analysis.py, dashboard/app.py, scripts/generate_report.py. Problem
+ [VERIFIED]: file named .geojson is plain JSON; analysis_timestamp is set to str(Path.cwd()) (leaks a local
+
+   path). Do: write a valid GeoJSON FeatureCollection (points = cut-off settlements, lines = flooded segments) with the
+ summary dict under top-level metadata; real ISO-8601 UTC timestamp; no filesystem paths anywhere in outputs (use
+
+     relative names). Update the dashboard layer and report to read the new structure (keep old summary keys inside
+          metadata). Done when: test validates GeoJSON structure and asserts no absolute path string in the file.
+
+  T06 -- Secure defaults on the dashboard (SEC-BASIC 3)
+           [P0 | ~20 min]  (old prompt #18 (part a))
+
+       Goal: remove remote-code-execution and exposure risks immediately. Files: dashboard/app.py. Problem
+   [VERIFIED]: debug defaults ON (Werkzeug debugger = RCE), binds 0.0.0.0, CORS(app) open. Do: default host
+  127.0.0.1 (override via env JALNETRA_HOST); debug=False by default (only if JALNETRA_DEBUG=1 AND host is
+ 127.0.0.1); remove the open CORS(app) (same-origin dashboard needs none; any later need uses an explicit origin
+allowlist, see T18); print the URL only. Done when: Flask test client / source test confirms host default, debug False, and
+
+                                                               no wildcard CORS header.
+
+T18 -- Access control, token, CORS, CSRF (SEC-BASIC 4)
+              [P0 | ~1 h]  (old prompt #18 (part b))
+
+                                                                              Do:
+
+      1. State-changing routes (POST /api/runs, POST /api/cancel) require header X-Jalnetra-Token.
+          Generate with secrets.token_urlsafe(32) at startup, keep in memory, print once to the console and inject
+          into the served page for the same-origin UI (not in URL, not logged).
+
+      2. Check Origin/Host against an allowlist (localhost/127.0.0.1 + configured port); reject otherwise (403).
+      3. No CORS (same-origin app). If a future cross-origin need arises, explicit origin list, never *.
+      4. Compare tokens with hmac.compare_digest. Done when: tests: no token  403; wrong token  403; wrong
+         Origin  403; correct  202.
+
+   T33 -- Live-run robustness [P1 | ~2.5 h]  (old prompt
+                                     #14)
+
+     Do: cache all downloads keyed by bbox+date in data/cache/ (reuse on re-runs); fetch_osm.py: retries with
+  exponential backoff, split large bboxes into tiles, bbox size limit with a clear message, fallback to ohsome for the same
+snapshot date, keep the snapshot strictly before the event; per-step timings and total runtime in run_meta.json; --
+
+     fast flag (coarser resolution/grid cap) so a full run stays 5 min on a laptop CPU; clear actionable messages for
+   credential/network failures. Done when: second identical run is much faster (cache hit); mocked 504 from Overpass
+
+                                                                  triggers retry/fallback.
+
+    T31 -- AI evaluation (held-out) [P1 | ~2 h] (training by
+                  human, H3)  (old prompt #12)
+
+                          Files: new scripts/evaluate.py, train_segmentation.py split logic. Do:
+
+      1. Verify the real event list of the chosen training dataset(s) before assuming anything (do not assume a Nepal event
+         exists). Hold out whole events/regions -- the closest to Himalayan terrain available -- from train AND val. No tile
+         from the same scene in train and val (split by scene/event).
+
+      2. evaluate.py: for a checkpoint and a held-out list compute IoU, F1, precision, recall (per event and overall) and
+         the same for the baseline (T10). Output results/eval_metrics.json + a markdown table.
+
+      3. Report/dashboard show the metrics only if the file exists, with the held-out description. Done when: toy test with
+         known masks gives the expected IoU/F1.
+
+ T32 -- EMSR927 comparison (check-only) [P1 | ~2 h] 
+                             (old prompt #13)
+
+                                                                              Do:
+
+      1. docs/emsr927_reference.json holds reference values and the AOI polygon entered by the human (from the
+         official EMSR927 maps; credit line required).
+
+      2. scripts/compare_emsr927.py counts inside the AOI only: our flooded buildings vs the reference, flooded
+         road km vs the reference, and overlap metrics for any reference extent polygon.
+
+      3. Add a test that fails if any file under scripts/ or dashboard/ (except compare_emsr927.py) references
+         emsr927 or reads docs/EMSR927*. The comparison script must not feed anything back into thresholds.
+
+      4. Generate the table in docs/EMSR927_COMPARISON.md automatically; state the resolution gap and the limitation
+         that EMSR products show different damage definitions. Done when: the leakage test passes; table generated
+         from toy reference values.
+ T29 -- Flood-path validation + click start (bonus) [~3 h] 
+                             (old prompt #17)
+
+  Files: scripts/flood_path.py, dashboard. Do: accept --start-lat/--start-lon from the dashboard (map
+    click) instead of center+0.1; settlement buffer in metres (convert to degrees by latitude); build a corridor (path +
+
+height-above-channel limit from the DEM) and report (a) % of detected flood inside the corridor, (b) settlements along the
+  path ranked by elevation above the channel; include them in the report. Do not change the sink-breach/D8 algorithm.
+                         Done when: toy DEM test with a known channel returns the expected settlements.
+
+   PHASE 2 -- STANDOUT
+
+            FEATURES
+
+Each feature builds a new layer on the fixed core without changing existing output contracts (flood_mask.tif stays binary,
+                                                                  old JSON keys stay).
+
+ T23 -- Rescue triage + "repair this link" [Standout 1 | ~4 h]
+
+ Goal: turn "who is cut off" into "where do we go first and what do we fix first". Files: new scripts/triage.py (reads
+                                    the T13 graph/output), dashboard table + layer, report section. Do:
+
+      1. Priority score per cut-off settlement: weighted sum of normalised building count (population proxy only, no
+         external population data), distance to nearest reachable facility, and number of alternate routes left (0 = highest).
+         Weights in config, documented; output rank 1..N with the score breakdown.
+
+      2. Detour impact: for settlements still reachable, compare shortest-path length to the nearest facility before vs after
+         (Dijkstra on length_m); list the top increases (+X km).
+
+      3. Critical link analysis: candidates = flooded segments/bridges (cap at top ~50 by length or flagged bridge). For
+         each, count how many cut-off settlements would be reconnected if only that link were restored (use union-find /
+         connected components incrementally, not a full recompute per candidate). Output top 10 ranked "repair first" links
+         with coordinates.
+
+      4. Outputs results/triage.json (+ GeoJSON for map). Label clearly: "proxy, not population". Don't break:
+         cutoff_settlements.geojson contract. Done when: toy graph test with known answer (one bridge restores
+         3 villages, another restores 1  ranked correctly).
+
+T24 -- Confidence score + blind-spot map [Standout 2 | ~3
+                                       h]
+
+ Goal: the system says how much to trust each result and where it cannot see. Files: new scripts/confidence.py
+                         (called by run_pipeline.py after T08/T09), dashboard layer toggles, report. Do:
+     1. confidence.tif (0­1) per pixel from: model probability or normalised |log-ratio| (baseline), VV/VH agreement
+         (both indicate change), local slope penalty, valid-data mask. Weights in config; output also a 3-level class
+         High/Medium/Low.
+
+     2. blind_spots.tif: nodata, steep slope (config threshold), and a documented approximation of radar
+         shadow/layover using slope and aspect relative to the satellite look direction when available in s1_meta.json
+         (otherwise slope-only). Say "approximation" in the file's metadata and in the report.
+
+     3. change_detection.json adds blind_spot_percent, high_confidence_percent.
+     4. Per-feature confidence for damage/cut-off: damage output gains confidence (mean confidence in its window);
+
+         T14's UNKNOWN rule uses blind spots.
+     5. Dashboard: toggle layers + a visible line "X% of the area could not be assessed". Done when: toy test: pixels in
+
+         steep/nodata zones are blind spots and never High confidence.
+
+      T25 -- Debris vs water classes [Standout 3 | ~3 h]
+
+               Goal: the brief asks for "flooded AND debris-covered areas". Files: scripts/inference.py /
+                                         baseline_change.py, new flood_classes.tif. Do:
+
+     1. Using the before/after log-ratio sign: strong decrease (smooth surface)  class 1 new_water; strong increase
+         in valid, non-steep terrain where the before image was not water  class 2 possible_debris_disturbance;
+         else 0. Thresholds in config; slope/blind-spot mask applied.
+
+     2. flood_mask.tif stays = class 1 (water) only so existing consumers don't change. Add debris_mask.tif;
+         damage assessment adds an optional debris_affected boolean (no change to existing fields).
+
+     3. Dashboard legend + report text: "possible debris/disturbance (heuristic, not validated)". Add to
+         docs/LIMITATIONS.md. Done when: toy raster test with a decrease patch, an increase patch and a steep-
+         slope increase patch  classes 1, 2 and 0 respectively.
+
+T26 -- Grounded sitrep with number ledger [Standout 6 | ~3
+                          h] (Nepali needs H4)
+
+Goal: every number in the situation report is traceable to a result file -- no language model invents numbers (this is the
+                  copilot's key rule, delivered without an LLM). Files: scripts/generate_report.py, new
+                               scripts/number_ledger.py, i18n/en.json, i18n/ne.json. Do:
+
+     1. Build results/number_ledger.json: each entry {key, value, unit, source_file, json_path} for
+         every number printed (flooded ha, buildings affected, road km cut, bridges damaged, cut-off settlements, blind-
+         spot %, etc.).
+
+     2. Render the sitrep only from the ledger + template strings. Show a small "Number ledger" table at the bottom (key,
+         value, source).
+
+     3. Test: every number in the generated HTML appears in the ledger.
+     4. Nepali: fixed template strings in i18n/ne.json; numbers unchanged; Devanagari font fallback in CSS; show a
+
+         visible "translation pending review" note until the human marks reviewed: true (H4). If H4 isn't available, ship
+         English only and list Nepali as future work. Done when: ledger test passes for the toy run; sitrep prints on one A4
+         page (T42 verifies).
+T27 -- Acquisition timeline "why this pair" [Standout 5 | ~2 h]
+                    (needs credentials for real run)
+
+         Do: new scripts/list_acquisitions.py queries the CDSE catalog for the bbox + window and writes
+   results/acquisitions.json: scenes, relative orbit, flight direction, datetime, chosen pair and the reason (same
+  orbit, gap in days, nearest to event) plus revisit gap. Dashboard panel shows a simple timeline. If no usable pair: clear
+ message "no same-orbit pair for this area/date; nearest options: ...". Cache results (T33). Done when: mocked-catalog
+
+                                            test returns the expected chosen pair and explanation.
+
+     T28 -- Dashboard usability pack [Standout 7 | ~3 h]
+
+                                                        Do: (all local JS, no CDN, CSP-safe)
+
+      1. Before/after swipe: preview_before.png, preview_after.png (dB percentile stretch, downsampled, with
+          bounds) generated in the pipeline; Leaflet imageOverlay + a CSS clip-path slider.
+
+      2. Ranked table of cut-off settlements (from T23) -- click zooms the map.
+      3. Layer toggles (flood, debris, damage, cut-off, confidence, blind spots, flood path).
+      4. Export buttons: CSV of cut-off settlements, GeoJSON of damage (affected only).
+      5. Attribution footer on every page (T40). Done when: UI loads with an empty results dir and with a full one without
+
+          console errors.
+
+   T30 -- OPTIONAL: Sentinel-2 confirmation [~3 h, only if
+                                     time]
+
+         Do: SCL cloud mask + NDWI as a confirmation layer only (no fusion into the model): tag flooded features
+               optical_confirmed where the sky is clear. Document that S2 is cloud-limited during monsoon.
+
+   PHASE 3 -- SECURITY
+
+    Security hardening after features, so the audit covers the final UI and routes. T06/T18 (secure defaults, token) were
+                               already done in Phase 1: here verify and extend them instead of redoing.
+
+T05 -- Secrets management (SEC-BASIC 1) [P0 | ~45 min]
+
+ Goal: Copernicus credentials never appear in code, git, logs, or HTTP responses. Files: scripts/cdse_env.py, all
+                                         scripts that print or log, .env.example, .gitignore. Do:
+
+      1. Credentials only from environment variables or the git-ignored .secrets/.env file, loaded in exactly one place
+          (cdse_env.py). Missing credentials  clear error naming the variable, never a stack trace with values.
+
+      2. Add a redact() helper used by every logger/print that may touch headers, URLs or exceptions: masks
+          client_secret, access_token, Authorization, passwords, and long random-looking strings.
+      3. Never print the token; never write it into run_meta.json, manifests, audit logs, or the report.
+      4. Document in README: how to create the .secrets file, and "if a secret was ever committed, rotate it" (H5).
+
+         Done when: test runs a fake failing token request and asserts the secret string is absent from stdout, stderr and
+         log file.
+
+ T17 -- Input validation allowlist (SEC-BASIC 2) [P0 | ~1 h]
+
+ Goal: nothing unvalidated reaches the pipeline, filesystem, or a shell. Files: new scripts/validation.py, used by
+   dashboard/app.py AND run_pipeline.py (the sink validates too). Do: validate and normalise: bbox (4 floats,
+   ranges lat -90..90 / lon -180..180, west<east, south<north, area  MAX_BBOX_DEG2 from config, default ~1.0 deg²),
+
+dates (ISO YYYY-MM-DD, not in the future, osm_snapshot < event_date, before < event < after), area name (^[\w
+      .,\-­()]{1,80}$), float/int types strict, reject unknown JSON keys, max body size. On failure  HTTP 400
+
+  {"error": "invalid input", "field": "..."} (no internals). Done when: parametrised tests for good/bad
+                  bbox, dates, names, extra keys, oversized body, injection strings (; rm -rf, ../, $(...)).
+
+T19 -- Safe errors + logging (SEC-BASIC 5) [P0 | ~45 min]
+
+                                                                              Do:
+
+      1. Use Python logging with a rotating file (logs/jalnetra.log, git-ignored) and a redact() filter (T05) that
+         also masks absolute paths (replace repo root with <repo>).
+
+      2. Global Flask error handlers: JSON {"error": "internal error", "id": "<uuid>"} to the client, full
+         detail only in the log keyed by that id. Never return tracebacks, stderr, or file paths. Remove stdout/stderr tails
+         from /api/run-pipeline responses.
+
+      3. Pipeline steps log structured step start/end/time (feeds T33 timings). Done when: test forces an exception 
+         client body has no traceback/path; log file has the detail.
+
+ T20 -- Rate limiting + resource limits (SEC-MID 6) [P1 | ~1
+                                       h]
+
+       Do: single-job lock; per-IP in-process rate limit (e.g. 5 POST/min, tiny dict+timestamps, no new dependency);
+   MAX_CONTENT_LENGTH (e.g. 64 KB); job wall-clock timeout (config, default 30 min) that kills the process group and
+marks the run timeout; free-disk check and a cache size cap (e.g. 10 GB) before downloading; max concurrent threads
+  configurable. Done when: tests for 429 on burst, 413 on large body, 409 on concurrent job, timeout kill with a dummy
+
+                                                                long-running subprocess.
+
+T21 -- XSS-safe rendering + security headers (SEC-MID 7)
+                                [P1 | ~1.5 h]
+
+    Why: OSM tags (name, amenity, ...) are attacker-editable text and end up in map popups. [CHECK FIRST] read
+dashboard/templates/ and dashboard/static/ JS for innerHTML, template-literal HTML, document.write, or
+
+                                                            unescaped popup content. Do:
+      1. Replace every use of untrusted strings in HTML with textContent/DOM construction or a single
+          escapeHtml() helper. No eval, no inline event handlers.
+
+      2. Vendor Leaflet and any JS/CSS locally under dashboard/static/vendor/ (no CDN; also makes the demo
+          work offline). Basemap tiles may come from an external tile host: keep the tile attribution visible and respect the
+          tile usage policy.
+
+      3. after_request headers: Content-Security-Policy: default-src 'self'; img-src 'self'
+          data: <tile host>; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src
+          'self'; frame-ancestors 'none', X-Content-Type-Options: nosniff, X-Frame-Options:
+          DENY, Referrer-Policy: no-referrer, Cache-Control: no-store for /api/*. (Own small function;
+          no new dependency.) Done when: test posts a feature name <img src=x onerror=alert(1)> into a fixture
+          GeoJSON, loads the page in a headless check (or asserts JS code path uses textContent) and the headers test
+          passes.
+
+ T22 -- Safe file handling + payload size (SEC-MID 9) [P1 |
+                                     ~1 h]
+
+       Do: any route that serves files uses an allowlist mapping (name  fixed path), never a user-built path; if
+   send_from_directory is used, verify the resolved path stays inside RESULTS_DIR; extension allowlist; compact
+
+      JSON (no indent=2) for big GeoJSON; by default /api/damage returns only affected features (+ ?all=1 for
+    everything, capped); simplify geometries for display; gzip responses if available; restrict permissions on results/,
+   logs/, data/cache/ (owner-only where the OS allows). Done when: tests: ../../etc/passwd, absolute paths,
+
+                      encoded traversals  404/400; payload size of a 5,000-feature response < agreed cap.
+
+        T36 -- Dependency hygiene (SEC-MID 8) [~1 h]
+
+   Do: pin exact versions in requirements.txt for Python 3.10­3.12 (drop any "Python 3.14" claim unless verified);
+remove unused packages (e.g. flask_cors if no longer used); make torch optional so the baseline path works without
+
+ it; run pip-audit and record results in docs/SECURITY.md; optional --require-hashes file if tooling is available.
+                           Done when: fresh venv install + pytest -q passes; pip-audit output saved.
+
+ T34 -- Provenance manifest + rule checks (SEC-ADV 11)
+                                    [~2 h]
+
+Goal: prove that no forbidden input was used (protects against disqualification) and make results tamper-evident. Do: at
+      the end of every run write results/manifest.json: run_id, UTC time, git commit (if available), parameters
+
+ (run_meta), inputs (each with SHA-256, size, source ID: S1/S2 product IDs + datetimes, OSM snapshot date + query
+hash, DEM tile names), model checkpoint SHA-256 (or "baseline"), outputs (SHA-256 each), Python/package versions,
+and rules_check booleans computed by code: osm_snapshot_before_event, no_emsr_or_post_event_input
+(no input path matches emsr/unosat/damage-map patterns), sentinel_orbit_same_for_pair. If any rule check fails
+
+    the pipeline stops with a clear error. Done when: tests: snapshot  event  run refused; different orbits  refused;
+                                                              manifest hashes match files.
+T35 -- Safe deserialization / model supply chain (SEC-ADV
+                                  12) [~1 h]
+
+   Files: scripts/inference.py, train_segmentation.py. Do: torch.load(..., map_location="cpu",
+ weights_only=True) everywhere [CHECK FIRST for weights_only=False]; checkpoints contain only tensors + a
+ plain config dict (no pickled classes/objects); verify a sibling <model>.sha256 before loading and refuse on mismatch;
+never load model paths supplied through the web UI; document in README where the official weights hash comes from.
+
+                Done when: tests: tampered file  refused; checkpoint with a pickled custom object  refused.
+
+       T37 -- CI security pipeline (SEC-ADV 13) [~1.5 h]
+
+   Do: .github/workflows/ci.yml running on push/PR: pytest -q, bandit -r scripts dashboard, pip-
+ audit, gitleaks (secret scan). Optional job: OWASP ZAP baseline against the running app (continue-on-error:
+true at first). Add a badge to README. Fix or explicitly justify (# nosec with reason) each bandit finding. Done when:
+
+                                             workflow file valid; local bandit run clean or justified.
+
+    T39 -- Tamper-evident audit log + kill switch + incident
+                    checklist (SEC-ADV 14) [~2 h]
+
+                                                                              Do:
+
+      1. logs/audit.jsonl: one line per event (run started/finished/failed/cancelled, auth failure): ts, event, run_id,
+          params_hash, prev_hash, entry_hash = sha256(prev_hash + canonical_json(entry)).
+          scripts/verify_audit.py checks the chain and reports the first broken entry. State in docs: tamper-evident,
+          not tamper-proof.
+
+      2. Kill switch: POST /api/cancel (token-protected, T18) kills the active job's process group, marks the run
+          cancelled, audit-logs it.
+
+      3. docs/INCIDENT_RESPONSE.md checklist: rotate the Copernicus client secret, revoke tokens, purge
+          logs/caches, history cleanup (H5, e.g. git filter-repo/BFG) and notify. Done when: tests: edited audit line
+           verification fails; cancel route stops a dummy job.
+
+T38 -- Container sandbox (SEC-ADV 10) [OPTIONAL | ~2.5
+                                       h]
+
+ Do: Dockerfile (slim base, pinned, non-root user, no shell tools not needed) and docker-compose.yml: read-only
+  root filesystem, tmpfs for temp, writable volumes only for results/, logs/, data/cache/, security_opt: no-
+
+                     new-privileges, CPU/memory limits, published port bound to 127.0.0.1. Document
+          docs/EGRESS_ALLOWLIST.md: the only hosts the pipeline needs (Copernicus Data Space/Sentinel Hub,
+ Overpass/ohsome, the DEM bucket, map tile host) and how to enforce via a proxy/firewall (state honestly that compose
+ alone does not filter egress). Done when: docker compose up serves the dashboard on localhost; container runs as
+
+                                                                           non-root.
+     PHASE 4 -- DOCS &
+
+        DELIVERABLES
+
+              Written last so every statement matches the final system. Use only numbers present in results/,
+                                                      eval_metrics.json, or the manifest.
+
+   T40 -- Attribution everywhere [~45 min]  (old prompt
+                                     #20)
+
+  Do: show the exact attribution strings (section 1) + dataset citations in: dashboard footer on every page, the situation
+   report footer, the report, README. Fill the Copernicus DEM licence row. EMSR927 credit line wherever its numbers
+
+          appear. Test: attribution strings present in the dashboard index template and the generated sitrep HTML.
+
+       T41 -- Reproducibility [~2 h]  (old prompt #21)
+
+  Do: clean install on a fresh venv works (setup.bat + setup.sh, single run command, Python 3.10­3.12); README
+ quick-start in 10 lines; a clearly labelled pre-computed case-study result pack (results_cached/, from a REAL
+run, with its manifest) so the dashboard opens instantly if the live data fails on judging day; document typical runtime and
+
+                             disk usage; add a "clean clone test" note: fresh git clone  setup  run.
+
+    T43 -- Make every document truthful [~1.5 h]  (old
+                                prompt #15)
+
+   Do: audit README.md, report/report.md, docs/*.md for statements not true of the repo right now (e.g. "U-Net
+ trained on Kuro Siwo" if no checkpoint exists; "what actually ran on real data"; inconsistent dates/bbox). Replace with a
+
+        status table: REAL / BASELINE / SYNTHETIC / NOT DONE, and use only numbers present in results/ or
+ eval_metrics.json. README: what it is, install, run, flags, attributions, security notes, status table, limitations link.
+
+  T42 -- One-page sitrep (generic) [~1.5 h]  (old prompt
+                                     #24)
+
+ Do: generate_report.py fully generic (area, dates, counts from results/ via the ledger T26); verify it fits one A4
+ page (print CSS @page, check via headless print/PDF page count); missing layers show "not available"; synthetic data
+ never printed without the banner; includes method used (model/baseline), confidence/blind-spot line, top triage actions
+
+   (T23), limitations one-liner, attributions. Done when: test renders the toy run to HTML and (if a headless browser is
+                                                           available) PDF page count = 1.
+
+        T44 -- 6-page report [~3 h]  (old prompt #22)
+Do: max 6 pages: problem; method (S1 same-orbit change detection, baseline vs U-Net, change mask, debris heuristic,
+OSM overlay, graph-based cut-off with pre/post baseline, triage); results from real runs only; evaluation metrics (held-out)
+ vs baseline; EMSR927 comparison table; Limitations (revisit time  no early warning; 20 m resolution vs 0.3 m; radar
+shadow/layover and steep terrain; OSM incompleteness in Nepal; SAR cannot prove structural damage; debris heuristic
+
+  not validated; population proxy only; no copilot/Nepali (or Nepali pending review); not an operational tool); Security &
+ threat model (half page, from docs/THREAT_MODEL.md: assets, attackers, mitigations, residual risk); attributions and
+
+                                   citations. Export PDF. Mark anything not measured "not measured".
+
+     T45 -- Judge Q&A sheet [~1 h]  (old prompt #25)
+
+  Do: docs/QA.md with ~20 likely questions and honest 2­3-line answers that match what the code actually does (why
+ same-orbit pairs; how permanent water is removed; why S1-only; how "cut-off" is defined and why a pre-event baseline;
+thresholds and why; how leakage from EMSR927 is prevented -- point to T32/T34; what the model fails on; why heuristic
+
+                                  debris; what the confidence score means; what the security model is).
+
+T46 -- 3-minute demo script [~45 min]  (old prompt #23)
+
+   Do: timed script: 0:00 problem (10 s), 0:10 enter a judge-style area/date live in the dashboard, 1:10 flood + debris +
+confidence/blind spots, 1:40 damage + cut-off + triage ("fix this link first"), 2:15 EMSR927 comparison + held-out metrics,
+2:40 limitations + security in one sentence. List screen recordings to capture, a fallback using results_cached/ if live
+
+                                                             data fails. No victim images.
+
+    FINAL DEFINITION OF
+
+      DONE (check before
+
+            submitting)
+
+               Fresh clone  setup  run works; pytest -q green; CI green.
+               A real run (case-study bbox from H1) produced results/ with a manifest whose rules_check all pass.
+               A second, different area/date also runs end-to-end (generalisation rehearsal) and the runtime is noted.
+               Dashboard shows the real run, no demo banner, no console errors, footer attributions present.
+               Sitrep fits one page and every number is in the ledger.
+               README, report, docs match reality (no claim without evidence).
+               No secrets or local paths in the repo or its history (H5 done if needed).
+               Report PDF  6 pages, demo video  3 minutes, no victim imagery.
+               Submission uploaded by 14 Oct, 10 pm.
+APPENDIX A -- ORIGINAL
+
+ SPECS OF THE 10 GATE-
+
+         AUDIT TASKS
+
+     Use these only to complete gaps found in Phase 0. Task ids and cross-references match the rest of this file.
+
+T07 -- Sentinel-1 preprocessing bridge [P0 | ~3 h] (needs
+                       H2)  (old prompt #1)
+
+             Goal: raw Copernicus data becomes the GeoTIFFs inference expects, fast, for any bbox. Files:
+ scripts/download_sentinel.py, new scripts/preprocess_s1.py, scripts/cdse_env.py. Problem
+
+      [VERIFIED]: download_sentinel.py saves raw GRD .SAFE zips (0.6­1.3 GB); inference.py needs
+               s1_before_VV/VH.tif, s1_after_VV/VH.tif. No step converts one into the other. Do:
+
+   1. Keep the existing same-relative-orbit pair-picking function (pick_same_track_pair or equivalent) unchanged.
+      Add an option to give a date window instead of exact dates; default pair = the same-orbit acquisition nearest
+      before the event and the one ~12 days after the first, or nearest after.
+
+   2. Do not process full scenes. Use the Copernicus Data Space Sentinel Hub Process API (or openEO if the
+      Process API is unavailable) to request, for the bbox only: Sentinel-1 IW GRD, VV+VH, orthorectified, linear
+      sigma0, the two chosen acquisition datetimes, ~20 m resolution, output GeoTIFF. [CHECK FIRST which OAuth
+      client type this API needs; ask human if it fails.]
+
+   3. Convert to dB, clip to a sane range (e.g. -30...+5 dB; keep as config constants), light 3×3 speckle filter via scipy,
+      mask nodata. Write s1_before_VV.tif, s1_before_VH.tif, s1_after_VV.tif, s1_after_VH.tif plus
+      a sidecar s1_meta.json (units=dB, CRS, pixel size, orbit number, flight direction if available, acquisition
+      datetimes, product IDs, valid fraction).
+
+   4. Keep the old full-SAFE path behind --full-scene. Cache responses in CACHE_DIR keyed by bbox+datetime
+      (T33 extends this).
+
+   5. If no same-orbit pair exists for the bbox/date: stop with a clear message listing the scenes found (feeds T27).
+   6. Update run_meta.json with the chosen acquisition IDs/dates. Don't break: PRODUCT_INFO.json consumers,
+
+      run_pipeline.py step order, file names inference reads. Done when: a mocked-API test builds the four files +
+      sidecar from a fake response; a real run (human credentials) yields 4 aligned GeoTIFFs for the case-study bbox.
+
+T03 -- One results/data path + demo separation [P0 | ~45
+                      min]  (old prompt #2)
+                  Goal: a real run is visible in the dashboard; demo data can never be mistaken for real. Files:
+scripts/run_pipeline.py, dashboard/app.py, scripts/make_demo_data.py, scripts/run_offline.py,
+ scripts/generate_report.py. Problem [VERIFIED]: run_pipeline.py sets root = scripts/ so results go
+
+                            to scripts/results/, while the dashboard reads <repo>/results/. Do:
+
+      1. Create scripts/paths.py exposing REPO_ROOT, RESULTS_DIR, DATA_DIR, REPORT_DIR, CACHE_DIR (all
+         derived from the repo root, overridable by env var). Import it everywhere (pipeline, dashboard, report generator,
+         offline runner).
+
+      2. Move make_demo_data.py and run_offline.py to demo/ and make them write ONLY to results_demo/
+         (never results/). Dashboard: if it serves anything with "synthetic": true or from results_demo/, show
+         a loud red banner "SYNTHETIC DEMO DATA".
+
+      3. Keep every output file name unchanged. Don't break: every script's --output arg in run_pipeline.py;
+         dashboard load_geojson/load_flood_mask_info; generate_report.py inputs. Done when: test
+         asserts pipeline and dashboard resolve the same RESULTS_DIR; demo script cannot write into results/.
+
+         T04 -- run_meta.json and zero hardcoded
+        area/date/coords [P0 | ~1 h]  (old prompt #3)
+
+         Goal: the pipeline is generic: area + date in, everything else derived. Files: scripts/run_pipeline.py,
+   scripts/damage_assessment.py (metadata), scripts/generate_report.py, scripts/flood_path.py
+  (docstring), dashboard/app.py, new config/presets.json. Problem [VERIFIED]: literals such as 28.3, 85.7,
+  Bhote Koshi ­ Trishuli, 2026-07-27, 2026-08-26, dates 08-14/08-28, 08-24/08-31, 08-24/09-05 are
+
+        scattered and inconsistent; docs/EMSR927_COMPARISON.md says the event is Rasuwa/Syabru Bensi. Do:
+
+      1. Primary input is --bbox west south east north plus --event-date; --center-lat/--center-lon/-
+         -extent stays only as a fallback. Add --before-date/--after-date as optional overrides (default: chosen
+         automatically in T07).
+
+      2. At the start of every run write RESULTS_DIR/run_meta.json: run_id, area name, bbox, event_date,
+         before/after acquisition IDs+datetimes (filled later), osm_snapshot_date, created_utc. All scripts and
+         generate_report.py read it; remove literals everywhere (damage metadata, report header, footer snapshot
+         text, dashboard run route).
+
+      3. config/presets.json: a trishuli preset whose bbox is "TODO_H1". If H1 is not provided, stop at this
+         point and ask the human (do not guess). Presets are the only place the case study lives.
+
+      4. Remove old coordinates (e.g. 78.6E) from docstrings. Don't break: CLI flags other scripts call; report text must
+         still render. Done when: test greps scripts/ and dashboard/ and finds no 85.7, 28.3, 2026-07-27, 2026-
+         08-26, Trishuli outside config/ and docs; a run with a different bbox writes a different run_meta.json
+         and the report shows that bbox.
+
+T08 -- Change mask = newly flooded, not "after water" [P0 |
+                      ~1.5 h]  (old prompt #4)
+     Goal: permanent water (rivers/lakes) is excluded, so bridges and riverside roads are not falsely damaged. Files:
+ scripts/inference.py, (consumers: damage_assessment.py, cutoff_analysis.py, dashboard flood layer).
+Problem [VERIFIED]: inference.py saves after_mask as flood_mask.tif; the newly-flooded extent (after minus
+
+                                                      before) lives only in memory/JSON. Do:
+
+      1. Save water_after.tif (water in after image) and water_before.tif.
+      2. flood_mask.tif = after AND NOT before (use before-water as the permanent-water mask), then remove tiny
+
+         connected components (scipy.ndimage label, min size from config, a few pixels) and fill tiny holes.
+      3. Also save valid_mask.tif (1 = valid data, 0 = nodata/outside swath) and keep CRS/transform/nodata identical
+
+         across all rasters.
+      4. change_detection.json keeps old keys and adds permanent_water_ha, newly_flooded_ha. Don't
+
+         break: flood_mask.tif stays binary 0/1 in the same grid (downstream scripts read it unchanged). Done
+         when: toy test (river in both dates + new patch)  mask contains only the new patch.
+
+    T10 -- Baseline fallback, no synthetic training, model
+ contract [P0 | ~2 h] (training run needs H3)  (old prompt
+
+                                      #5)
+
+                         Goal: a real mask is always produced; training never silently uses fake data. Files:
+          scripts/train_segmentation.py, scripts/inference.py, scripts/run_pipeline.py, new
+scripts/baseline_change.py. Problem [VERIFIED]: training falls back to a synthetic dataset when no real images
+     exist; models/ has only a smoke checkpoint; run_pipeline.py can start a 50-epoch training inside a run. Do:
+
+      1. train_segmentation.py: remove the synthetic fallback. Empty/missing dataset  exit non-zero with a clear
+         message. Keep synthetic only behind --smoke-test writing *_smoke.pt.
+
+      2. Add baseline_change.py: log-ratio (after dB - before dB) on VV (and VH), threshold (Otsu or fixed from
+         config), restricted to valid pixels, same output contract as the model path. It is the fallback AND the comparison
+         baseline for T31.
+
+      3. run_pipeline.py never trains. If models/flood_unet.pt is absent  use the baseline and log "BASELINE
+         used (no trained model)". The report/dashboard must show which method produced the mask (method field in
+         change_detection.json).
+
+      4. Checkpoint contract: {state_dict, config{normalisation, in_channels, tile_size},
+         trained_on, metrics}; inference validates it (see T35).
+
+      5. Write docs/TRAINING.md: exact steps for the human to train on Colab/Kaggle with a Kuro Siwo subset (SAR
+         channels; check dataset licence/citation), how to hold out unseen events for T31, expected runtime. Don't break:
+         inference output files; the method/model name fields read by the report. Done when: test: empty dataset dir 
+         non-zero exit; pipeline with no model  baseline mask produced.
+
+  T11 -- Performance of damage + cut-off [P0 | ~1.5 h] 
+                              (old prompt #6)
+          Files: scripts/damage_assessment.py, scripts/cutoff_analysis.py. Problem [VERIFIED]:
+                               estimate_feature_damage and is_road_segment_affected call
+
+rasterio.features.rasterize(out_shape=full mask shape) for every feature and every road segment (and
+                                      once per way AND once per segment in the graph builder). Do:
+
+      1. Per feature: compute bounds  pixel window (rasterio.windows.from_bounds, clipped to the raster, round
+         outward)  read only that window of the mask, rasterize into the window shape with the window transform. For
+         lines use all_touched=True (or sample points every ~half-pixel along the line and read mask values directly).
+
+      2. Cut-off graph: decide flooded per segment once (midpoint + vertices sample), never per way and per segment.
+      3. Remove row.to_dict() copies into graph nodes (store only id/name/type/pos).
+      4. Keep thresholds/classification semantics identical in this task (semantics change in T13/T14). Done when: slow
+
+         test: 5,000 toy features on a 3000×3000 mask finish in < 20 s; results equal the old implementation on a small
+         input.
+
+  T13 -- Cut-off logic rewrite [P0 | ~3 h] (20% of score) 
+                              (old prompt #7)
+
+      Files: scripts/cutoff_analysis.py (+ consumers generate_report.py, dashboard /api/cutoffs).
+                                                                Problems [VERIFIED]:
+
+         "Settlement" = every individual building (68 "cut-off settlements" = 68 buildings).
+         With no hospital in OSM, reachability starts from an empty set  all settlements = 100% cut off.
+         Towns are not sources although the brief says "nearest town or hospital".
+         No pre-event baseline  places already disconnected in OSM are blamed on the flood.
+         Whole way marked flooded if >30% of it is flooded; settlement snapping scans all nodes linearly; only Point
+         hospitals handled. Do:
+
+      1. Settlements: OSM place=village|hamlet|town|suburb nodes if present; otherwise cluster buildings
+         (union of ~100­150 m buffers or DBSCAN on centroids) and use the cluster centroid; store building count per
+         settlement.
+
+      2. Sources (reference facilities): hospitals (points AND polygon centroids; also amenity=clinic|doctors if
+         present) plus place=town|city. If none exist  output "no_reference_facility": true and no cut-off
+         claims (never 100%).
+
+      3. Graph: build once from OSM ways; split at shared vertices; edge attributes length_m, flooded (per segment,
+         T11), bridge flag.
+
+      4. Baseline: compute reachability on the intact graph and on the flooded graph. Report only settlements
+         reachable before and unreachable after (cut_off). Also list already_isolated separately (not blamed on
+         the flood).
+
+      5. Snapping: use scipy.spatial.cKDTree on road nodes with a max snap distance (config, default ~300 m);
+         settlements farther than that  unsnapped list (limitation), not "connected".
+
+      6. For each cut-off settlement keep: id, name, coordinates, building_count, nearest reachable facility (name,
+         straight-line km), and the top blocking flooded segments (ids, lengths).
+
+      7. Keep the old summary keys (total_settlements, cutoff_settlements, cutoff_percentage, ...) and
+         add already_isolated, unsnapped, reference_facilities. Don't break: keys read by the
+         report/dashboard; T23 will build on this graph. Done when: tests: (a) no hospitals  "no reference facility"; (b)
+         pre-isolated village not reported; (c) village whose only road is flooded IS reported; (d) a long road flooded in only
+         part of its length does not cut the whole way.
+
+    T12 -- Empty-data crash fixes [P0 | ~45 min]  (old
+                                 prompt #8)
+
+ Files: scripts/damage_assessment.py, scripts/cutoff_analysis.py, scripts/generate_report.py,
+    dashboard routes. Problem [VERIFIED/CHECK FIRST]: divisions like affected/total*100, cut/total*100;
+
+  to_crs on empty GeoDataFrames whose CRS is None; graph.add_node(..., **row.to_dict()) can collide
+  with keys named type/pos [CHECK FIRST]. Do: guard every division (max(total, 1)); for empty frames set CRS
+ explicitly and skip reprojection; every script writes a valid empty result (zero counts) and exits 0; report and dashboard
+show "none found in OSM" instead of errors; node attributes go in a prefixed dict. Done when: test runs all three scripts
+
+                                with empty buildings, bridges, hospitals, roads  exit 0 and valid JSON.
+
+T09 -- Inference bug fixes [P0 | ~1.5 h]  (old prompt #9)
+
+                                                       Files: scripts/inference.py. Do:
+
+      1. [VERIFIED] Tiling bug: with stride < tile size the last window may not reach the image edge (e.g. size 768, tile
+         256, stride 192 leaves rows uncovered  zeros). Compute window starts so the final window always ends exactly
+         at the edge; assert coverage count > 0 for every pixel.
+
+      2. [VERIFIED] Pixel area is hardcoded 0.01 ha (10 m). Compute from the raster transform (convert
+         degreesmetres using latitude if CRS is geographic).
+
+      3. Use the single shared normalisation function (fixed dB range  0..1; defined in T10) for both train and
+         inference.
+
+      4. Replace the Sentinel-2 "placeholder zero bands" path: if S2 channels are requested but unsupported  raise a
+         clear error (S2 is optional, see T30).
+
+      5. --model ""/missing path  clear error or baseline fallback (T10), never a crash on Path("").
+      6. Read VV/VH paths from s1_meta.json/CLI, not hardcoded names; propagate nodata  valid_mask.tif.
+
+         Done when: tests for tiling coverage (sizes 200, 256, 300, 700) and pixel-area on 10 m and 20 m grids.
+
+T16 -- Area/date form + background job [P1 | ~3 h]  (old
+                                prompt #10)
+
+Goal: judges choose area and date live; the UI never freezes. Files: dashboard/app.py, dashboard/templates/*,
+   dashboard/static/*, scripts/run_pipeline.py. Problem [VERIFIED]: POST /api/run-pipeline runs
+
+hardcoded Trishuli args, blocks the request up to 5 minutes, and returns subprocess stdout/stderr (path leaks). UI has no
+                                                                          input. Do:
+
+      1. Form: draw a rectangle on the Leaflet map or type lat/lon + extent ( bbox), event date; before/after chosen
+         automatically (T07); optional "Case-study preset" button (T04).
+2. POST /api/runs starts the pipeline as a background subprocess (args list, never a shell string), writes
+   results/run_status.json (state, step, progress, started_utc, last log lines already redacted). GET
+   /api/run-status returns it; UI polls every 2 s and reloads layers when state=done.
+
+3. Only one active job at a time (T20). Keep every existing GET route unchanged. Don't break: run_pipeline.py
+   CLI; result file names. Done when: test client: POST valid  202 with run_id; status route returns state; second
+   POST while running  409.
+
