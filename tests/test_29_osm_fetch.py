@@ -103,15 +103,16 @@ def _run_fetch(tmp_path, *, failed=(), elements=None, official=None):
     def fake_ohsome(label, filter_expr, bbox, snapshot_date):
         return official.get(label)
 
-    original = (fetch_osm.run_attic_query, fetch_osm.ohsome_count)
+    original = (fetch_osm.run_attic_query, fetch_osm.ohsome_count, fetch_osm.ohsome_v2_features)
     fetch_osm.run_attic_query, fetch_osm.ohsome_count = fake_attic, fake_ohsome
+    fetch_osm.ohsome_v2_features = lambda *_: None
     try:
         paths, failed_required = fetch_osm.fetch_osm_features(
             center_lat=28.3, center_lon=85.7, snapshot_date=SNAPSHOT,
             bbox=BBOX, output_dir=tmp_path,
         )
     finally:
-        fetch_osm.run_attic_query, fetch_osm.ohsome_count = original
+        fetch_osm.run_attic_query, fetch_osm.ohsome_count, fetch_osm.ohsome_v2_features = original
     return paths, failed_required, calls
 
 

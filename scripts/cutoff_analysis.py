@@ -61,6 +61,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from config.presets import case_study  # noqa: E402
+from config.presets import FLOOD_FRACTION_THRESHOLD  # noqa: E402
 from config.run_meta import run_meta_for_script  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
@@ -197,7 +198,7 @@ def is_road_segment_affected(
     road_geom: LineString,
     flood_mask: np.ndarray,
     transform: rasterio.Affine,
-    threshold: float = 0.3,
+    threshold: float = FLOOD_FRACTION_THRESHOLD,
 ) -> bool:
     """
     Check if a road segment intersects flooded areas significantly.
@@ -262,7 +263,7 @@ def build_road_graph(
         # just because >30% of it is flooded: only the individual segment's own overlap
         # fraction determines whether that segment is cut. way_partly_flooded is reported
         # for transparency only — it is deliberately NOT OR-ed into `flooded`.
-        way_partly_flooded = _line_overlap_ratio(geom, flood_mask, transform) > 0.3
+        way_partly_flooded = _line_overlap_ratio(geom, flood_mask, transform) > FLOOD_FRACTION_THRESHOLD
 
         for i in range(len(coords) - 1):
             p1 = coords[i]
@@ -287,8 +288,8 @@ def build_road_graph(
                 node1, node2,
                 length=_segment_length_m(p1, p2, crs),
                 way_cut=way_partly_flooded,
-                road_cut=seg_ratio > 0.3,
-                flooded=seg_ratio > 0.3,
+                road_cut=seg_ratio > FLOOD_FRACTION_THRESHOLD,
+                flooded=seg_ratio > FLOOD_FRACTION_THRESHOLD,
             )
 
     # Cache the filtered junction candidate array so the per-settlement nearest-node
@@ -864,21 +865,32 @@ def analyze_cutoffs(
         for d in cutoff_details
     ]
 
-    # The published artifact is a GeoJSON FeatureCollection (cut-off settlements as
-    # points) plus the analysis block the dashboard reads. It carries NO local
-    # filesystem path: a machine-specific directory in a published product is a
-    # leak and makes the file non-portable.
+    features.extend(
+        {
+            "type": "Feature",
+            "properties": {
+                "feature_type": "flooded_road_segment",
+                "from_node": segment["from_node"],
+                "to_node": segment["to_node"],
+                "length_km": segment["length_km"],
+            },
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [node_positions[segment["from_node"]], node_positions[segment["to_node"]]],
+            },
+        }
+        for segment in cut_road_segments
+        if segment["from_node"] in node_positions and segment["to_node"] in node_positions
+    )
 
-    result = {
-        "type": "FeatureCollection",
-        "features": features,
+    # The published artifact uses GeoJSON features for both settlements and cut
+    # road segments; analysis details live in GeoJSON's permitted metadata member.
+
+    metadata = {
         "status": status,
         "analysis_timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "method": "road_network_graph_bfs",
-        # Artifact name only — never an absolute local path.
         "flood_mask": "flood_mask.tif",
-        # Which run this analysis belongs to (area, bbox, dates), from the
-        # run_meta.json every stage shares.
         "area": meta.get("area"),
         "bbox": meta.get("bbox"),
         "aoi_confirmed": bool(meta.get("aoi_confirmed", False)),
@@ -906,7 +918,12 @@ def analyze_cutoffs(
             "in already_isolated_before_event. Settlement counts are based on named OSM "
             "places when present, otherwise on clusters of nearby buildings."
         ),
-        "settlement_method": ("osm_places" if places_sources else "building_clusters"),
+        "settlement_method": settlement_method,
+    }
+    result = {
+        "type": "FeatureCollection",
+        "features": features,
+        "metadata": metadata,
     }
 
     # Save — always, including the empty/degenerate cases, so downstream stages
@@ -1204,14 +1221,15 @@ def main():
     print(f"\n{'='*70}")
     print(" Cut-off Analysis Summary")
     print(f"{'='*70}")
-    print(f"  Total settlements analyzed:  {result['summary']['total_settlements']}")
-    print(f"  Hospitals in network:        {result['summary']['total_hospitals']}")
-    print(f"  Reachable settlements:       {result['summary']['reachable_settlements']}")
-    print(f"  🚫 Cut-off settlements:      {result['summary']['cutoff_settlements']} "
-          f"({result['summary']['cutoff_percentage']}%)")
-    print(f"  Flooded road segments:       {result['summary']['flooded_road_segments']}")
+    metadata = result["metadata"]
+    print(f"  Total settlements analyzed:  {metadata['summary']['total_settlements']}")
+    print(f"  Hospitals in network:        {metadata['summary']['total_hospitals']}")
+    print(f"  Reachable settlements:       {metadata['summary']['reachable_settlements']}")
+    print(f"  🚫 Cut-off settlements:      {metadata['summary']['cutoff_settlements']} "
+          f"({metadata['summary']['cutoff_percentage']}%)")
+    print(f"  Flooded road segments:       {metadata['summary']['flooded_road_segments']}")
     print(f"\n💡 Top cut-off settlements:")
-    for i, s in enumerate(result["cutoff_settlements"][:5]):
+    for i, s in enumerate(metadata["cutoff_settlements"][:5]):
         print(f"   {i+1}. ({s['coordinates']['latitude']:.4f}, {s['coordinates']['longitude']:.4f}) "
               f"— nearest town: {s.get('nearest_reachable_town', 'N/A')} "
               f"({s.get('nearest_reachable_distance_km', '?')} km)")

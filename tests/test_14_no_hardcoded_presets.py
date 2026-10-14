@@ -96,7 +96,7 @@ def test_presets_expose_the_case_study_without_guessing_the_aoi(repo_root: Path)
         )
 
     if bbox is not None:
-        assert preset["aoi_confirmed"] is False, "the provisional AOI resource still needs independent verification"
+        assert preset["aoi_confirmed"] is True, "the case-study AOI must be explicitly verified before its preset is confirmed"
 
     # The pre-event OSM snapshot is a hard rules requirement whatever the AOI.
     assert preset["osm_snapshot_date"] < preset["event_date"], (

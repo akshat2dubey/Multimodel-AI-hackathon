@@ -10,7 +10,9 @@
 # --- Core geospatial -------------------------------------------------------
 rasterio>=1.3          # GeoTIFF I/O, rasterization, mask vectorisation
 geopandas>=0.14        # OSM GeoJSON handling (pulls in pandas + pyproj + pyogrio)
+pyarrow>=15            # ohsome API v2 historical GeoParquet extracts
 shapely>=2.0           # Geometry operations
+defusedxml>=0.7.1      # Safe parsing of metadata from downloaded SAFE archives
 scipy>=1.10            # distance transforms, Gaussian smoothing (DEM, demo data),
                           # 3x3 median speckle filter for Sentinel-1 tifs
 

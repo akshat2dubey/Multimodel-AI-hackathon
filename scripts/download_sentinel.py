@@ -323,7 +323,7 @@ def verify_safe_archive(path, *, expected_bytes=None, expected_md5=None) -> tupl
     except OSError as exc:
         return False, f"unreadable ({exc})"
     if expected_md5:
-        digest = hashlib.md5()
+        digest = hashlib.md5(usedforsecurity=False)
         with p.open("rb") as handle:
             for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
                 digest.update(chunk)

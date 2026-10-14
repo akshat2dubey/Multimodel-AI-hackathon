@@ -107,13 +107,15 @@
 </div>
 
 <script nonce="{{ csp_nonce }}">
-const map = L.map('map', { center: [28.3, 85.7], zoom: 11 });
+const center = {{ demo_center|tojson }};
+const map = L.map('map', { center, zoom: 11 });
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; OSM &copy; CARTO',
   subdomains: 'abcd'
 }).addTo(map);
 
-// Demo flood area (sample polygon)
+// Synthetic sample geometry is placed relative to the active AOI center.
+const point = (dx, dy) => [center[1] + dx, center[0] + dy];
 const demoFlood = {
   type: 'FeatureCollection',
   features: [{
@@ -121,11 +123,9 @@ const demoFlood = {
     properties: { demo: true },
     geometry: {
       type: 'Polygon',
-      coordinates: [[
-        [85.55, 28.20], [85.70, 28.18], [85.85, 28.22],
-        [85.88, 28.32], [85.80, 28.40], [85.65, 28.42],
-        [85.50, 28.38], [85.48, 28.30], [85.55, 28.20]
-      ]]
+      coordinates: [[[-0.025, -0.012], [0.012, -0.018], [0.032, 0.006],
+        [0.018, 0.030], [-0.014, 0.026], [-0.030, 0.008], [-0.025, -0.012]]
+        .map(([dx, dy]) => point(dx, dy))]
     }
   }]
 };
@@ -135,14 +135,15 @@ L.geoJSON(demoFlood, {
 
 // Demo settlements
 const demoSettlements = [
-  { name: 'Samra Bazaar', lat: 28.22, lon: 85.62, status: 'CUT OFF' },
-  { name: 'Kimathanka', lat: 28.28, lon: 85.68, status: 'CUT OFF' },
-  { name: 'Bhote Koshi Village', lat: 28.15, lon: 85.72, status: 'PARTIAL' },
-  { name: 'Larcha', lat: 28.35, lon: 85.75, status: 'OK' },
+  { name: 'Settlement A', offset: [-0.016, -0.006], status: 'CUT OFF' },
+  { name: 'Settlement B', offset: [0.006, 0.004], status: 'CUT OFF' },
+  { name: 'Settlement C', offset: [0.018, 0.018], status: 'PARTIAL' },
+  { name: 'Settlement D', offset: [-0.018, 0.020], status: 'OK' },
 ];
 demoSettlements.forEach(s => {
   const color = s.status === 'CUT OFF' ? '#e94560' : s.status === 'PARTIAL' ? '#ffa726' : '#66bb6a';
-  L.circleMarker([s.lat, s.lon], {
+  const [lon, lat] = point(...s.offset);
+  L.circleMarker([lat, lon], {
     radius: 8,
     fillColor: color,
     fillOpacity: 0.8,

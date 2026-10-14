@@ -26,10 +26,10 @@ from config import run_meta as rm
 def test_preset_resolves_and_round_trips_through_run_meta_json(tmp_path):
     meta = rm.resolve_run_meta(preset="trishuli")
     assert meta["area"] and meta["before_date"] and meta["after_date"]
-    # The trishuli AOI is provisional until its source is independently checked.
+    # The case-study AOI was checked against the EMSR927 AOI01 source.
     assert meta["bbox"] == [85.117358, 27.972395, 85.581515, 28.077922]
     assert meta["bbox_source"] == "preset"
-    assert meta["aoi_confirmed"] is False
+    assert meta["aoi_confirmed"] is True
 
     path = rm.write_run_meta(tmp_path, meta)
     assert path.name == rm.RUN_META_FILENAME and path.is_file()
@@ -64,7 +64,7 @@ def test_bbox_is_primary_and_the_center_follows_it():
     confirmed = rm.resolve_run_meta(
         preset="trishuli", bbox="85.00,28.00,85.40,28.40", confirm_aoi=True,
     )
-    assert confirmed["aoi_confirmed"] is False
+    assert confirmed["aoi_confirmed"] is True
 
     custom_confirmed = rm.resolve_run_meta(
         area="Verified Valley", bbox="85.00,28.00,85.40,28.40", confirm_aoi=True,
@@ -238,13 +238,13 @@ def _stats_inputs(tmp_path: Path):
     )
     (tmp_path / "cutoff.geojson").write_text(
         json.dumps({
-            "type": "FeatureCollection", "features": [], "status": "ok",
+            "type": "FeatureCollection", "features": [], "metadata": {"status": "ok",
             "summary": {
                 "total_settlements": 0, "total_hospitals": 1, "reachable_settlements": 0,
                 "cutoff_settlements": 0, "cutoff_percentage": 0.0,
                 "already_isolated_settlements": 0, "flooded_road_segments": 0,
             },
-            "cutoff_settlements": [],
+            "cutoff_settlements": []},
         }),
         encoding="utf-8",
     )
@@ -342,6 +342,6 @@ def test_damage_and_cutoff_metadata_carry_the_run_metadata(toy_scene, tmp_path):
         run_meta=meta,
     )
     cdata = json.loads(cutoff_out.read_text(encoding="utf-8"))
-    assert cdata["area"] == "Toy Valley"
-    assert cdata["bbox"] == [85.0, 28.0, 85.4, 28.4]
-    assert cdata["event_date"] == "2026-01-02"
+    assert cdata["metadata"]["area"] == "Toy Valley"
+    assert cdata["metadata"]["bbox"] == [85.0, 28.0, 85.4, 28.4]
+    assert cdata["metadata"]["event_date"] == "2026-01-02"

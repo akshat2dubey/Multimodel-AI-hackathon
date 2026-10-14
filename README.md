@@ -1,5 +1,7 @@
 # Jalnetra — Flood Damage Mapping from Space
 
+[![Security checks](https://github.com/akshat2dubey/Multimodel-AI-hackathon/actions/workflows/security.yml/badge.svg)](https://github.com/akshat2dubey/Multimodel-AI-hackathon/actions/workflows/security.yml)
+
 Jalnetra is a research prototype for exploring flood-damage mapping from satellite data. Its current outputs are **not validated for emergency response or other operational decisions**. It takes an area and dates, then produces an experimental flood-change map, an OpenStreetMap overlay, a road-network reachability analysis, and a situation report.
 
 1. **Where did the flood hit?** — a map of flooded and debris-covered areas, made by comparing before/after satellite images.
@@ -14,15 +16,21 @@ Jalnetra includes a web dashboard and a generated situation report. The pipeline
 - **Sentinel-2 optical** is used when the sky is clear; it is cloud-dependent, so it is optional rather than required.
 - **OpenStreetMap** provides the buildings, roads, bridges, and hospitals as vector data to overlay on the flood map. The snapshot must be **pre-event** (on or before 26 August 2026; the latest available at the time of building this is 27 July 2026). OSM edits made after the event are for checking only, never as input.
 - **Copernicus DEM** is used for the flood-path bonus. It comes from a public AWS Open Data bucket with no account needed.
-- The **AI component** is a flood segmentation model (U-Net with a ResNet-34 encoder) trained on the listed training data, or a situation-report copilot — choose one. In either case, every number in a generated report must come from the system's maps, never invented by the language model.
+- **Inference** uses a verified trained checkpoint when one is supplied; otherwise it falls back to a Sentinel-1 log-ratio baseline. The repository's smoke checkpoint is synthetic and is not a usable event model. Reports use computed artifact values and do not use a language model.
 
 The case study is the **26 August 2026 Rasuwa flood** in Nepal. Incident context and impact figures change as authorities update them; this repository does not use casualty estimates as model inputs or validated outputs.
 
-The code, the dashboard, the report generator, and the pipeline orchestration all exist and run. The terrain pipeline is fully real: a **258 MB Copernicus digital elevation model** of the Trishuli corridor was downloaded from the public AWS Open Data bucket (6 tiles, 38–45 MB each, covering 84–87°E × 27–29°N), and a **flood-flow trace** was computed from it — about **251 km** of channel, **5,961 m** of descent, written as a verified GeoJSON the dashboard serves.
+## Current result status (15 October 2026)
 
-The checkout contains real Sentinel-1 scenes, DEM tiles, and a pre-event OSM extract, but they are cropped to a wider, different area than the EMSR927 AOI01 preset. The current flood model is only a two-epoch synthetic smoke model; its own status note says it detects no meaningful flood signal on the available scenes. Existing results also have an old run manifest. Treat all current maps, damage counts, and cutoff counts as illustrative; they are not measurements of the event.
+| Status | Component | Evidence |
+|---|---|---|
+| REAL | AOI01 and Sentinel-1 inputs | AOI01 is confirmed against the Copernicus EMS activation catalogue; the before/after Sentinel-1 archives match its bounds and share relative orbit 19. |
+| REAL | Historical OSM for AOI01 | Pre-event snapshot 2026-07-27 fetched for the confirmed bbox through Overpass attic and cached by AOI/date. 29,601 buildings, 1,879 roads, 74 bridges, 6 hospitals, 85 settlements. Building count differs from the ohsome aggregate by 3; other available category counts match. |
+| BASELINE RUN, UNVALIDATED | Flood inference and impact layers | Full pipeline completed with the Sentinel-1 log-ratio baseline. It reports 16.72 ha newly flooded, 5 buildings with flood overlap, 1 affected road (0 fully cut), 0 cut-off settlements, and 0 bridges with flood overlap. These are experimental algorithm outputs, not independently verified event measurements. |
+| SYNTHETIC | Offline demo | `demo/` generates clearly labeled sample data in separate demo directories. It is for software demonstration only. |
+| NOT DONE | Accuracy and event comparison | No held-out labeled evaluation or verified EMSR927 comparison is available. |
 
-**Release status: not production-ready.** The configured AOI still needs independent source verification, imagery and OSM must be freshly acquired for matching bounds, and the detection method must be validated against genuine labeled observations with documented accuracy and uncertainty. This prototype is unsuitable for rescue dispatch, safety decisions, or public impact reporting.
+**Release status: not production-ready.** `results/` now contains a real-input baseline run for confirmed AOI01; its outputs remain unvalidated and must not be used for rescue dispatch, safety decisions, or public impact reporting. Held-out accuracy and an EMSR927 comparison are still outstanding.
 
 ## How to run it
 
@@ -102,7 +110,7 @@ python scripts/train_segmentation.py --dataset ./data/kuro_siwo --epochs 50
 The model is a U-Net (optionally with a ResNet-34 encoder). Three things about it are easy to get wrong, so they are pinned down:
 
 - **One input scaling, shared.** [`scripts/s1_normalization.py`](scripts/s1_normalization.py) is the only place that maps Sentinel-1 dB to the network's 0..1 input range. Training and inference both call it, and the window it used is written into the checkpoint's config, so inference re-applies the *same* scaling the weights were trained against instead of re-deriving one.
-- **The mask is the change, not the river.** `flood_mask.tif` is `after AND NOT before` — newly flooded water only. The permanent river and lakes are subtracted using the pre-event water extent, so a riverside building is not reported as destroyed merely for being next to a river. `water_after.tif` holds all post-event water (river included) for comparison, and `flood_mask_before.tif` holds the permanent-water mask.
+- **The mask is the change, not the river.** `flood_mask.tif` is `after AND NOT before` — newly flooded water only. Asset labels report flood overlap, not structural destruction. `water_after.tif` holds all post-event water (river included) for comparison, and `flood_mask_before.tif` holds the permanent-water mask.
 - **Speckle is not a flood.** Small connected blobs are dropped from the delivered mask, because a couple of dark radar pixels would otherwise become a "flooded" building or a severed road downstream.
 
 Every run therefore writes four rasters. `damage_assessment.py` and `cutoff_analysis.py` read `flood_mask.tif` and need no change.
@@ -131,6 +139,8 @@ Sentinel-1 and Sentinel-2 come from the Copernicus Data Space Ecosystem via an O
 
 The helper `scripts/cdse_env.py` reads that file so the secret never appears on a command line or in a log. Without valid credentials, the Sentinel download scripts exit non-zero — they no longer write placeholders.
 
+Historical OSM geometry uses the keyed [ohsome API v2](https://docs.ohsome.org/ohsome-api/v2/). Create a free API key and save it in the git-ignored `.secrets/ohsome.env` file as `OHSOME_API_KEY=<key>`. Do not paste it into chat or commit it. `fetch_osm.py` reads the file locally; without a key it falls back to public Overpass attic servers.
+
 ## The flags
 
 | Flag | Meaning |
@@ -151,11 +161,11 @@ The helper `scripts/cdse_env.py` reads that file so the secret never appears on 
 | After-date | **2026-09-05** — the post-event acquisition actually downloaded |
 | Event date | **2026-08-26** |
 | OSM snapshot date | **2026-07-27** |
-| AOI (bbox) | **provisional** — copied from the linked EMSR927 AOI01 resource; independently verify before use |
+| AOI (bbox) | Confirmed EMSR927 AOI01 boundary: `[85.117358, 27.972395, 85.581515, 28.077922]` |
 
 The acquisition dates are the Sentinel-1 pair on disk (`data/sentinel1/*/PRODUCT_INFO.json`); the event itself is 26 August 2026 (GLIDE `FF-2026-000162-NPL`, EMSR927 activated 26/08/2026). The rules require the OSM snapshot to precede the event, which is enforced in `config/run_meta.py`.
 
-The preset stores provisional EMSR927 AOI01 bounds and leaves `aoi_confirmed` false by default. The checked-in input sidecars still describe the older `[85.4, 28.0, 86.0, 28.6]` extent, so they do not match this AOI. The pipeline will fetch new inputs for its selected bbox; do not reuse the old outputs as evidence. Use `--confirm-aoi` only after independently checking the boundary against the authoritative source.
+The preset stores the confirmed EMSR927 AOI01 boundary. Sentinel-1 inputs, pre-event OSM layers, `results/run_meta.json`, and the current manifest are aligned to this bbox. The generated mask uses an unvalidated log-ratio baseline; see the status table and limitations before interpreting its figures.
 
 ## Scripts
 
@@ -176,7 +186,7 @@ The preset stores provisional EMSR927 AOI01 bounds and leaves `aoi_confirmed` fa
 | `scripts/flood_path.py` | DEM-based flood-path tracing (bonus) |
 | `scripts/generate_report.py` | Generates the one-page situation report |
 | `scripts/cdse_env.py` | Loads Copernicus creds from git-ignored `.secrets/cdse.env` |
-| `scripts/run_offline.py` | Runs every stage on the synthetic fixture (no account needed) |
+| `demo/run_offline.py` | Runs every stage on the synthetic fixture (no account needed) |
 | `config/presets.py` | **All paths + the case-study PRESETS — the one file to edit** |
 | `config/run_meta.py` | Resolves CLI + preset into the run's metadata and reads/writes `results/run_meta.json` |
 | `dashboard/app.py` | Live web dashboard (Flask) |
@@ -185,7 +195,7 @@ The preset stores provisional EMSR927 AOI01 bounds and leaves `aoi_confirmed` fa
 ## The synthetic fixture (no account needed)
 
 ```bash
-python scripts/run_offline.py                 # every stage, on fabricated data
+python demo/run_offline.py                    # every stage, on fabricated data
 
 # Look at it — the dashboard shows a DEMO DATA banner when serving the fixture.
 cd dashboard
@@ -213,7 +223,7 @@ The official reference to check against is **Copernicus EMSR927** at [mapping.em
 
 ## Limitations
 
-- **Not production-ready for operational response.** The checked-in Sentinel-1 and OSM bounds do not match the provisional AOI; the smoke model was trained on synthetic data and is not validated. Current layers and derived counts are illustrative only.
+- **Not production-ready for operational response.** The AOI-specific real-input baseline has run, but its flood mask and derived counts have not been independently evaluated. Current figures are experimental estimates; the smoke model is synthetic and is not an event model.
 - **Sentinel satellites revisit an area only every few days.** They cannot warn of a sudden glacier collapse minutes ahead. This system is for response, not warning.
 - **Radar change detection needs same-orbit-track before/after images.** Different tracks view the terrain from different angles and cannot be compared pixel by pixel. If the available acquisitions do not line up, the comparison degrades.
 - **Optical imagery is cloud-dependent.** In a monsoon-season Himalayan flood, Sentinel-2 can be largely blank, which is why Sentinel-1 radar is the backbone, not the nice-to-have.

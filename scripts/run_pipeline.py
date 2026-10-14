@@ -51,6 +51,7 @@ for _p in (str(_scripts_root), str(_project_root)):
 from config.presets import (  # noqa: E402
     DATA_DIR,
     MODELS_DIR,
+    MAX_BBOX_DEG2,
     PRESETS,
     PROJECT_ROOT as ROOT,
     REPORT_DIR,
@@ -195,6 +196,15 @@ def main():
         )
     except ValueError as exc:
         print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    west, south, east, north = run_meta["bbox"]
+    if (east - west) * (north - south) > MAX_BBOX_DEG2:
+        print(
+            f"❌ requested bbox exceeds {MAX_BBOX_DEG2} deg²; reduce the area or set "
+            "JALNETRA_MAX_BBOX_DEG2 deliberately.",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     # Anchor everything to the scripts/ directory so the pipeline can be
@@ -409,6 +419,7 @@ def main():
     # NOTE: inference.py appends "before"/"after" itself, so both flags take the
     # sentinel1 root (which download_sentinel.py filled with before/ + after/).
     results_dir.mkdir(parents=True, exist_ok=True)
+    dem_path = data_dir / "dem" / "dem.tif"
     inference_cmd = [
         sys.executable, _scripts("inference.py"),
         "--before-dir", str(data_dir / "sentinel1"),
@@ -417,6 +428,8 @@ def main():
         # Only bands that carry this run's provenance sidecar may be analysed.
         "--require-provenance",
     ]
+    if dem_path.is_file():
+        inference_cmd += ["--dem", str(dem_path)]
     if use_baseline:
         inference_cmd.append("--baseline")
     else:

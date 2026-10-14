@@ -57,7 +57,7 @@ def test_building_in_new_flood_is_flagged_building_on_river_is_not():
                               _valid_mask())
     levels = _levels(out)
 
-    assert levels["b/flood"] in ("PARTIAL", "SEVERELY_DAMAGED", "DESTROYED"), (
+    assert levels["b/flood"] in ("FLOODED_PARTIAL", "FLOODED_MAJOR"), (
         f"a building inside the new flood patch must be flagged, got "
         f"{levels['b/flood']!r} (overlap={dict(zip(out['id'], out['damage_overlap_ratio']))})"
     )
@@ -100,14 +100,16 @@ def test_bridge_over_permanent_water_is_intact_bridge_over_new_flood_is_not():
                             _valid_mask())
     levels = _levels(out)
 
-    assert levels["way/bridge-river"] == "BRIDGE_INTACT", (
+    assert levels["way/bridge-river"] == "UNAFFECTED", (
         f"a bridge crossing the permanent river must stay intact, got "
         f"{levels['way/bridge-river']!r} — the river was already there before the event"
     )
-    assert levels["way/bridge-patch"] == "BRIDGE_DAMAGED", (
+    assert levels["way/bridge-patch"] in ("FLOODED_PARTIAL", "FLOODED_MAJOR"), (
         f"a bridge crossing the new flood patch must be damaged, got "
         f"{levels['way/bridge-patch']!r}"
     )
+    damaged = dict(zip(out["id"].astype(str), out["bridge_damaged"].astype(bool)))
+    assert not damaged["way/bridge-river"] and damaged["way/bridge-patch"]
 
 
 def test_road_crossing_new_flood_is_cut():
@@ -117,10 +119,11 @@ def test_road_crossing_new_flood_is_cut():
                           _valid_mask())
     levels = _levels(out)
 
-    assert levels["way/road"] == "SEGMENT_CUT", (
-        f"a road whose whole length lies in the new flood must be SEGMENT_CUT, got "
+    assert levels["way/road"] == "FLOODED_MAJOR", (
+        f"a road whose whole length lies in the new flood must be FLOODED_MAJOR, got "
         f"{levels['way/road']!r}"
     )
+    assert bool(out.loc[out["id"] == "way/road", "road_cut"].iloc[0])
 
 
 def test_empty_feature_types_do_not_crash_and_report_zero():

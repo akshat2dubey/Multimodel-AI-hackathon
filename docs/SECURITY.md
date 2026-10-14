@@ -83,9 +83,10 @@ argument **list**, never `shell=True`, from a fixed script path) and `B311`
   local subprocess with the same privileges as the operator; there is no
   container sandbox in this submission (the plan's T38 is optional and was not
   built).
-- **The log is redacted, not tamper-evident.** There is no hash-chained audit log
-  (T39), so an operator with filesystem access could edit it; the manifest is the
-  artifact that carries hashes.
+- **The audit chain is tamper-evident, not tamper-proof.** `logs/audit.jsonl` links
+  run and authentication events by SHA-256; `python scripts/verify_audit.py`
+  reports the first broken entry. Someone who can rewrite the whole file can
+  recompute the chain, so preserve a protected copy outside this machine.
 - **Unknown rules are recorded as `null`, not as a pass.** If the relative orbit
   is not reported by the acquisition step, `sentinel_orbit_same_for_pair` is
   `null` — a reader can see that it was not verified rather than assume it was.

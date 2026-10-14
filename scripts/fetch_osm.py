@@ -30,7 +30,9 @@ config/run_meta.py).
 """
 
 import argparse
-
+import hashlib
+import http.client
+import os
 import sys
 import json
 import urllib.error
@@ -46,7 +48,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from config.presets import DEFAULT_EXTENT, EVENT_DATE  # noqa: E402
+from config.presets import DEFAULT_EXTENT, EVENT_DATE, MAX_BBOX_DEG2  # noqa: E402
 from config.run_meta import resolve_bbox  # noqa: E402
 
 # Every outbound fetch goes through the HTTPS-only wrapper (T36).
@@ -65,10 +67,6 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 # required by the hackathon rules (no post-event edits may be used as input).
 # The event date itself is an argument (--event-date), never a literal here.
 #
-# Why not ohsome for geometry? Verified live 2026-10-09:
-#   - /elements/geometry returns HTTP 403 (Apache-level block on the public host)
-#   - aggregation endpoints (e.g. /elements/count) work and are used below to
-#     cross-check our extract against the official OSH statistics.
 # Endpoints are tried in order, and a failure moves to the next one. Verified
 # live 2026-10-13: overpass-api.de answers the building extract for this AOI
 # with HTTP 504 while overpass.kumi.systems returns 3745 elements (3738 ways)
@@ -77,12 +75,14 @@ if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows consol
 # risk, it is the difference between a real building layer and an empty one.
 OVERPASS_ENDPOINTS = (
     "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 )
 # Kept for compatibility with anything that imported the old name.
 OVERPASS_API = OVERPASS_ENDPOINTS[0]
 OHSOME_API = "https://api.ohsome.org/v1"          # used only for aggregate counts
+OHSOME_API_V2 = "https://api.heigit.org/ohsome-api/v2"
 
 # ohsome filter syntax is `type:node`, NOT `type=node`. The wrong form does not
 # error — it returns 0 — which silently disabled this cross-check until it was
@@ -140,7 +140,7 @@ def overpass_ql(
             print(f"  ⚠ Overpass HTTP {e.code} from {host} (attempt {attempt}/{total_attempts})")
             if e.code == 429:
                 print("  ℹ️ Rate limited — backing off")
-        except (urllib.error.URLError, ValueError, json.JSONDecodeError, OSError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, ValueError, json.JSONDecodeError, OSError) as e:
             print(f"  ⚠ Overpass error from {host} (attempt {attempt}/{total_attempts}): {e}")
         time.sleep(min(5 * attempt, 20))
     return None, None
@@ -204,6 +204,59 @@ def elements_to_geojson(elements: list[dict]) -> dict[str, Any]:
             ),
         })
     return {"type": "FeatureCollection", "features": feats}
+
+
+def ohsome_v2_features(
+    filter_expr: str,
+    bbox: tuple[float, float, float, float],
+    snapshot_date: str,
+) -> dict[str, Any] | None:
+    """Fetch a dated GeoParquet extract when the local ohsome key is available."""
+    key = os.environ.get("OHSOME_API_KEY", "").strip()
+    secret_file = _ROOT / ".secrets" / "ohsome.env"
+    if not key and secret_file.is_file():
+        for line in secret_file.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("OHSOME_API_KEY="):
+                key = line.strip().split("=", 1)[1].strip()
+                break
+    if not key:
+        return None
+
+    body = json.dumps({"aoi": bbox, "time": snapshot_date, "filter": filter_expr}).encode()
+    request = urllib.request.Request(
+        f"{OHSOME_API_V2}/extraction/features.parquet",
+        data=body,
+        headers={"Authorization": key, "Content-Type": "application/json", "User-Agent": USER_AGENT},
+    )
+    try:
+        with urlopen(request, timeout=240) as response:
+            import geopandas as gpd
+            from io import BytesIO
+
+            frame = gpd.read_parquet(
+                BytesIO(response.read()),
+                to_pandas_kwargs={"maps_as_pydicts": "strict"},
+            )
+        features = []
+        for index, row in frame.iterrows():
+            geom = frame.geometry.loc[index]
+            if geom is None or geom.is_empty:
+                continue
+            tags = row.get("tags") or {}
+            osm_type, osm_id = row["osm_type"], int(row["osm_id"])
+            features.append({
+                "type": "Feature",
+                "id": f"{osm_type}/{osm_id}",
+                "properties": {"osm_id": osm_id, "osm_type": osm_type, **tags},
+                "geometry": geom.__geo_interface__,
+            })
+        return {"type": "FeatureCollection", "features": features}
+    except Exception as exc:
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 403:
+            print("  ⚠ ohsome rejected the API key (HTTP 403); check .secrets/ohsome.env")
+        else:
+            print(f"  ⚠ ohsome API v2 geometry extract failed: {type(exc).__name__}: {exc}")
+        return None
 
 
 def ohsome_count(
@@ -286,12 +339,16 @@ def fetch_osm_features(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     event_date = event_date or EVENT_DATE
+    width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    if width <= 0 or height <= 0 or width * height > MAX_BBOX_DEG2:
+        raise ValueError(f"OSM bbox must be positive and no larger than {MAX_BBOX_DEG2} deg²")
 
     results: dict[str, Path] = {}
     counts: dict[str, int | None] = {}
     statuses: dict[str, str] = {}
     ohsome_counts: dict[str, int | None] = {}
     failed_required: list[str] = []
+    api_used = "Overpass attic (geometry) + ohsome v1 (aggregate counts)"
 
     # Each category = one attic Overpass query (nodes+ways as of snapshot_date)
     # plus one official ohsome count cross-check. Categories are independent:
@@ -314,8 +371,26 @@ def fetch_osm_features(
         print("\n" + "\u2500" * 50)
         print(f"📥 Fetching {label} (as of {snapshot_date})...")
 
+        cache_key = hashlib.sha256(json.dumps(
+            {"bbox": bbox, "snapshot_date": snapshot_date, "filter": ohsome_filter},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        cache_path = output_dir.parent / "cache" / "osm" / f"{cache_key}-{label}.geojson"
+        cached_geojson = None
+        if cache_path.is_file():
+            try:
+                candidate = json.loads(cache_path.read_text(encoding="utf-8"))
+                if candidate.get("type") == "FeatureCollection" and isinstance(candidate.get("features"), list):
+                    cached_geojson = candidate
+                    api_used = "local OSM cache (AOI + snapshot keyed)"
+            except (OSError, json.JSONDecodeError):
+                pass
+
         skipped: str | None = None
-        if server_unavailable:
+        if cached_geojson is not None:
+            geojson = cached_geojson
+            elements = geojson["features"]
+        elif server_unavailable:
             # Circuit breaker. Once a category has failed at every endpoint, the
             # server is down or rate-limiting us; sweeping the remaining
             # categories would multiply a multi-minute stall by their number,
@@ -323,9 +398,15 @@ def fetch_osm_features(
             # skip is recorded, not hidden.
             elements, skipped = None, f"not attempted ({server_unavailable})"
         else:
-            elements = run_attic_query(selector, bbox, snapshot_date, timeout=timeout)
-            if elements is None:
-                server_unavailable = "every Overpass endpoint failed"
+            geojson = ohsome_v2_features(ohsome_filter, bbox, snapshot_date)
+            if geojson is not None:
+                elements = geojson["features"]
+                api_used = "ohsome API v2 extraction + ohsome v1 aggregate counts"
+            else:
+                elements = run_attic_query(selector, bbox, snapshot_date, timeout=timeout)
+                geojson = elements_to_geojson(elements) if elements is not None else None
+                if elements is None:
+                    server_unavailable = "every Overpass endpoint failed"
 
         # Asked before anything is written: the official OSM statistic is what
         # tells an empty extract apart from a failed one.
@@ -362,8 +443,10 @@ def fetch_osm_features(
                 failed_required.append(label)
             continue
 
-        geojson = elements_to_geojson(elements)
         out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
+        if cached_geojson is None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
         counts[label] = len(geojson["features"])
         statuses[label] = "ok"
         print(f"  ✅ {counts[label]} {label} features saved → {out_path}")
@@ -388,7 +471,7 @@ def fetch_osm_features(
         "required_categories": list(REQUIRED_CATEGORIES),
         "failed_required_categories": failed_required,
         "ohsome_total_check": total_ohsome,
-        "api": "Overpass attic (geometry) + ohsome v1 (aggregate counts)",
+        "api": api_used,
         "overpass_url": OVERPASS_API,
         "ohsome_url": OHSOME_API,
         "attribution": "© OpenStreetMap contributors (ODbL)",

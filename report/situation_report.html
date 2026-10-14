@@ -148,59 +148,58 @@
     <span class="badge">Situation Report • Automated</span>
     <h1>Bhote Koshi – Trishuli River Corridor, Nepal</h1>
     <div class="meta">
-      Flood Event Analysis • 2026-08-26 • bbox 85.400, 28.000, 86.000, 28.600
+      Flood Event Analysis • 2026-08-26 • bbox 85.117, 27.972, 85.582, 28.078
     </div>
     <div class="report-date">
-      Generated: 13 October 2026 • By Jalnetra System • Data: Sentinel-1 SAR + OSM pre-event snapshot (2026-07-27)
+      Generated: 15 October 2026 • By Jalnetra System • Data: Sentinel-1 SAR + OSM pre-event snapshot (2026-07-27)
     </div>
   </div>
-
 
   <div style="background:#fff8e1; border:1px solid #ffe082; border-left:4px solid #f9a825;
               padding:12px 18px; margin:0 0 18px; border-radius:4px; font-size:12px; color:#5d4037;">
-    <strong>AREA OF INTEREST NOT CONFIRMED.</strong> This run used a fallback
-    bounding box (center_extent_fallback), not the
-    confirmed case-study AOI. Treat the area covered here as provisional.
+    <strong>EXPERIMENTAL BASELINE — Sentinel-1 log-ratio</strong>
+    <div style="margin-top:4px">This flood-change estimate and the derived asset/connectivity counts have not been independently validated for this event. Do not use them for emergency decisions.</div>
   </div>
+
 
   <div class="alert-box">
     <span class="alert-num">0</span>
     settlements cut off from hospitals and towns due to flood-damaged roads.
     <span style="margin-left: 16px; color: #666; font-size: 13px;">
-      Rescue teams should prioritize road clearance on the segments listed below.
+      Review mapped segments with current local reports before making decisions.
     </span>
   </div>
 
   <div class="grid">
     <div class="card">
       <h3>Flood Extent</h3>
-      <div class="value danger">1,928.5 <span style="font-size:14px;color:#888;">hectares</span></div>
-      <div class="sub">18,181 pixels • 0.49% of area • 32.62m resolution</div>
+      <div class="value danger">16.7 <span style="font-size:14px;color:#888;">hectares</span></div>
+      <div class="sub">186 pixels • 0.03% of area • 29.99m resolution</div>
     </div>
 
     <div class="card">
-      <h3>Buildings Affected</h3>
-      <div class="value warning">0 <span style="font-size:14px;color:#888;">of 3755</span></div>
-      <div class="sub">0.0% affected • 0 destroyed</div>
+      <h3>Buildings With Flood Overlap</h3>
+      <div class="value warning">5 <span style="font-size:14px;color:#888;">of 29601</span></div>
+      <div class="sub">0.0% affected • 5 with major flood overlap</div>
     </div>
 
     <div class="card">
       <h3>Road Segments Blocked</h3>
-      <div class="value danger">2</div>
+      <div class="value danger">7</div>
       <div class="sub">network edges cut by flooding &middot;
-        1 of 715
+        1 of 1879
         OSM ways touched, 0 fully cut</div>
     </div>
 
     <div class="card">
       <h3>Bridges Damaged</h3>
       <div class="value ok">0</div>
-      <div class="sub">of 63 total bridges</div>
+      <div class="sub">of 74 total bridges</div>
     </div>
   </div>
 
   <div class="full-width">
-    <h2 style="font-size:16px; margin-bottom:12px; color:#444;">Cut-Off Settlements — Priority Rescue Targets</h2>
+    <h2 style="font-size:16px; margin-bottom:12px; color:#444;">Settlement Connectivity Review</h2>
     <table>
       <thead>
         <tr>
@@ -230,10 +229,9 @@
         <h3>Buildings by Damage Level</h3>
         <table style="font-size:13px;">
           <tbody>
-            <tr><td>Destroyed</td><td><span class="rating critical">0</span></td></tr>
-            <tr><td>Severely damaged</td><td><span class="rating high">0</span></td></tr>
-            <tr><td>Partially flooded</td><td><span class="rating moderate">0</span></td></tr>
-            <tr><td>Unaffected</td><td><span class="rating low">3755</span></td></tr>
+            <tr><td>Major flood overlap</td><td><span class="rating critical">5</span></td></tr>
+            <tr><td>Partial flood overlap</td><td><span class="rating moderate">0</span></td></tr>
+            <tr><td>Unaffected</td><td><span class="rating low">29596</span></td></tr>
           </tbody>
         </table>
       </div>
@@ -241,9 +239,9 @@
         <h3>Road Network Status</h3>
         <table style="font-size:13px;">
           <tbody>
-            <tr><td>Total segments</td><td>715</td></tr>
+            <tr><td>Total segments</td><td>1879</td></tr>
             <tr><td>OSM ways fully cut (feature-level)</td><td><span class="rating critical">0</span></td></tr>
-            <tr><td>Road-network edges cut (graph-level)</td><td><span class="rating critical">2</span></td></tr>
+            <tr><td>Road-network edges cut (graph-level)</td><td><span class="rating critical">7</span></td></tr>
             <tr><td>Segments affected</td><td><span class="rating high">1</span></td></tr>
             <tr><td>Bridges damaged</td><td><span class="rating low">0</span></td></tr>
           </tbody>
@@ -254,10 +252,10 @@
         <table style="font-size:13px;">
           <tbody>
             <tr><td>Total settlements</td><td>6</td></tr>
-            <tr><td>Reachable</td><td><span class="rating low">4</span></td></tr>
+            <tr><td>Reachable</td><td><span class="rating low">5</span></td></tr>
             <tr><td>Cut off</td><td><span class="rating critical">0</span></td></tr>
             <tr><td>Cut-off rate</td><td><strong>0.0%</strong></td></tr>
-            <tr><td>Already isolated before the event</td><td>2</td></tr>
+            <tr><td>Already isolated before the event</td><td>1</td></tr>
           </tbody>
         </table>
 

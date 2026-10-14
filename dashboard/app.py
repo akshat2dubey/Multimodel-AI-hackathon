@@ -14,6 +14,7 @@ Open: http://localhost:5000
 """
 
 import gzip
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -61,6 +62,7 @@ from config.presets import (  # noqa: E402  (path set up above)
     DATA_DIR,
     DEFAULT_PRESET,
     EVENT_DATE,
+    MAX_BBOX_DEG2,
     PRESETS,
     REPORT_DIR,
     RESULTS_DIR,
@@ -149,6 +151,10 @@ def _require_login():
         return None
     if session.get(AUTH_SESSION_KEY) or _token_ok():
         return None
+    try:
+        _append_audit_event("auth_failure")
+    except Exception:
+        log.exception("could not audit an authentication failure")
     if path.startswith("/api/"):
         return jsonify({"error": "authentication required", "status": 401}), 401
     return redirect("/login?next=" + quote(request.full_path.rstrip("?") or "/", safe="/?=&"))
@@ -446,7 +452,6 @@ ALLOWED_REQUEST_KEYS = {
     "event_date", "osm_snapshot", "before_date", "after_date",
     "area", "preset", "confirm_aoi",
 }
-MAX_BBOX_DEG2 = float(os.environ.get("JALNETRA_MAX_BBOX_DEG2", "1.0"))
 AREA_NAME_PATTERN = re.compile(r"^[\w .,\-()/]{1,80}$", re.UNICODE)
 LOG_TAIL_LINES = 40
 # The orchestrator's steps, in order. Used only to turn a log line into a step
@@ -579,6 +584,39 @@ def redact(text: str) -> str:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
+_audit_lock = threading.Lock()
+
+
+def _append_audit_event(event: str, run_id: str | None = None,
+                        params: dict | None = None) -> None:
+    """Append one hash-linked event; the chain is tamper-evident, not tamper-proof."""
+    canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    params_hash = hashlib.sha256(canonical(params).encode()).hexdigest() if params is not None else None
+    with _audit_lock:
+        AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _chmod_quietly(AUDIT_PATH.parent, 0o700)
+        previous = "0" * 64
+        if AUDIT_PATH.is_file() and AUDIT_PATH.stat().st_size:
+            with AUDIT_PATH.open("rb") as source:
+                source.seek(max(0, AUDIT_PATH.stat().st_size - 4096))
+                tail = source.read().splitlines()
+                last = json.loads(tail[-1].decode("utf-8"))
+                previous = last["entry_hash"]
+        entry = {
+            "ts": _utc_now(), "event": event, "run_id": run_id,
+            "params_hash": params_hash, "prev_hash": previous,
+        }
+        entry["entry_hash"] = hashlib.sha256(
+            (previous + canonical(entry)).encode("utf-8")
+        ).hexdigest()
+        with AUDIT_PATH.open("a", encoding="utf-8", newline="\n") as output:
+            output.write(canonical(entry) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        _chmod_quietly(AUDIT_PATH, 0o600)
 
 
 def _status_path() -> Path:
@@ -1002,10 +1040,20 @@ def _launch_job(argv: list[str], params: dict) -> dict:
     global _active_proc
     _active_proc = proc
     try:
+        _append_audit_event("run_started", run_id, job["params"])
+    except Exception:
+        _terminate(proc)
+        _active_proc = None
+        raise
+    try:
         _write_status(job, force_store=True, require_store=OBJECT_STORE is not None)
     except ObjectStoreError:
         _terminate(proc)
         _active_proc = None
+        try:
+            _append_audit_event("run_failed", run_id, job["params"])
+        except Exception:
+            log.exception("could not audit pipeline launch failure")
         raise
     _arm_timeout(proc, job)
 
@@ -1059,6 +1107,13 @@ def _launch_job(argv: list[str], params: dict) -> dict:
                     job["step"] = "failed"
                     job["error"] = "pipeline status could not be saved to persistent storage"
                     _write_status(job)
+                event = "run_finished" if job["state"] == "done" else (
+                    "run_cancelled" if job["state"] == "cancelled" else "run_failed"
+                )
+                try:
+                    _append_audit_event(event, run_id, job["params"])
+                except Exception:
+                    log.exception("could not audit pipeline completion")
                 _active_job = None
                 _active_proc = None
 
@@ -1417,8 +1472,9 @@ def api_status():
     buildings = [f for f in damage_features if f["properties"]["feature_type"] == "building"]
     roads = [f for f in damage_features if f["properties"]["feature_type"] == "road"]
 
-    cutoff_features = cutoffs.get("cutoff_settlements", [])
-    summary = cutoffs.get("summary", {})
+    cutoff_meta = cutoffs.get("metadata", cutoffs)
+    cutoff_features = cutoff_meta.get("cutoff_settlements", [])
+    summary = cutoff_meta.get("summary", {})
 
     demo = serving_demo_data()
     run_meta = current_run_meta()
@@ -1456,15 +1512,15 @@ def api_status():
             "total_buildings": len(buildings),
             "affected_buildings": sum(
                 1 for b in buildings
-                if b["properties"]["damage_level"] in ("PARTIAL", "SEVERELY_DAMAGED", "DESTROYED")
+                if b["properties"].get("flood_affected", b["properties"]["damage_level"] in ("PARTIAL", "SEVERELY_DAMAGED", "DESTROYED", "FLOODED_PARTIAL", "FLOODED_MAJOR"))
             ),
-            "destroyed_buildings": sum(
-                1 for b in buildings if b["properties"]["damage_level"] == "DESTROYED"
+            "major_flooded_buildings": sum(
+                1 for b in buildings if b["properties"]["damage_level"] in ("DESTROYED", "FLOODED_MAJOR")
             ),
             "total_roads": len(roads),
             # Feature-level: whole OSM ways whose majority is under water.
             "cut_roads": sum(
-                1 for r in roads if r["properties"]["damage_level"] == "SEGMENT_CUT"
+                1 for r in roads if r["properties"].get("road_cut", r["properties"]["damage_level"] == "SEGMENT_CUT")
             ),
             # Network-level: individual road-graph edges severed by flooding.
             # This is the number that explains the cut-off settlements, and it is
@@ -1472,7 +1528,7 @@ def api_status():
             "flooded_road_segments": summary.get("flooded_road_segments", 0),
             "affected_roads": sum(
                 1 for r in roads
-                if r["properties"]["damage_level"] in ("SEGMENT_CUT", "SEGMENT_AFFECTED")
+                if r["properties"].get("road_affected", r["properties"]["damage_level"] in ("SEGMENT_CUT", "SEGMENT_AFFECTED", "FLOODED_PARTIAL", "FLOODED_MAJOR"))
             ),
             "total_bridges": sum(
                 1 for f in damage_features if f["properties"]["feature_type"] == "bridge"
@@ -1480,7 +1536,7 @@ def api_status():
             "damaged_bridges": sum(
                 1 for f in damage_features
                 if f["properties"]["feature_type"] == "bridge"
-                and f["properties"]["damage_level"] == "BRIDGE_DAMAGED"
+                and f["properties"].get("bridge_damaged", f["properties"]["damage_level"] == "BRIDGE_DAMAGED")
             ),
         },
         "cutoff_summary": {
@@ -1646,15 +1702,20 @@ def _group_cutoffs_by_village(cutoff_list: list) -> list:
 def api_cutoffs():
     """Serve cut-off settlement data."""
     cutoffs = load_geojson("cutoff_settlements.geojson") or {}
-    cutoff_list = cutoffs.get("cutoff_settlements", [])
+    cutoff_meta = cutoffs.get("metadata", cutoffs)
+    cutoff_list = cutoff_meta.get("cutoff_settlements", [])
     villages = _group_cutoffs_by_village(cutoff_list)
     return jsonify({
         "cutoff_settlements": cutoff_list,
         "cutoff_villages": villages,
         "village_count": len(villages),
-        "summary": cutoffs.get("summary", {}),
-        "flooded_roads": cutoffs.get("flooded_roads", []),
-        "note": cutoffs.get("note"),
+        "summary": cutoff_meta.get("summary", {}),
+        "flooded_roads": cutoff_meta.get("flooded_roads", []),
+        "flooded_road_features": [
+            feature for feature in cutoffs.get("features", [])
+            if feature.get("geometry", {}).get("type") == "LineString"
+        ],
+        "note": cutoff_meta.get("note"),
     })
 
 
@@ -1707,7 +1768,9 @@ def report_page():
 @app.route("/demo")
 def demo_mode():
     """Run in demo mode with sample data (no real satellite data needed)."""
-    return render_template("demo.html", csp_nonce=g.csp_nonce)
+    meta = current_run_meta()
+    center = [meta.get("center_lat", CENTER_LAT), meta.get("center_lon", CENTER_LON)]
+    return render_template("demo.html", csp_nonce=g.csp_nonce, demo_center=center)
 
 
 # ─── Login ──────────────────────────────────────────────────────────────────
@@ -1734,9 +1797,17 @@ def login():
     if request.method == "POST":
         if not _origin_allowed(request.headers.get("Origin"), allow_opaque=True):
             log.warning("cross-origin login attempt rejected")
+            try:
+                _append_audit_event("auth_failure")
+            except Exception:
+                log.exception("could not audit authentication failure")
             return jsonify({"error": "forbidden", "status": 403}), 403
         if _login_rate_limited():
             log.warning("login rate limit hit for %s", _client_key())
+            try:
+                _append_audit_event("auth_failure")
+            except Exception:
+                log.exception("could not audit authentication failure")
             return (
                 render_template(
                     "login.html", error="Too many attempts. Wait a few minutes.",
@@ -1772,6 +1843,10 @@ def login():
             log.info("login succeeded for %s", _client_key())
             return redirect(target)
         log.warning("failed login attempt from %s", _client_key())
+        try:
+            _append_audit_event("auth_failure")
+        except Exception:
+            log.exception("could not audit authentication failure")
         error = "Incorrect password."
 
     return render_template(
@@ -1959,8 +2034,16 @@ def _origin_allowed(origin: str | None, *, allow_opaque: bool = False) -> bool:
 def _state_change_error() -> str:
     """Empty string when a state-changing request is allowed, else the reason."""
     if not _origin_allowed(request.headers.get("Origin")):
+        try:
+            _append_audit_event("auth_failure")
+        except Exception:
+            log.exception("could not audit rejected state-changing request")
         return "Forbidden: cross-origin requests are not allowed."
     if not _token_ok():
+        try:
+            _append_audit_event("auth_failure")
+        except Exception:
+            log.exception("could not audit rejected state-changing request")
         return "Forbidden: missing or invalid pipeline token."
     return ""
 

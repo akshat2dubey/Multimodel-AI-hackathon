@@ -41,7 +41,7 @@ def _analyze(network, tmp_path, hospitals_gdf="default"):
         network["buildings"], hospitals,
         network["mask"], network["transform"], network["crs"],
         out,
-    )
+    )["metadata"]
 
 
 def _names(result) -> set[str]:

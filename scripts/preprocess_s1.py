@@ -31,7 +31,7 @@ import json
 import math
 import re
 import sys
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -845,7 +845,7 @@ def preprocess_product(
     if not token:
         raise RuntimeError(
             "Sentinel Hub token endpoint returned no access_token. "
-            f"response: {token_r.status_code} {token_r.text[:300]}"
+            f"HTTP {token_r.status_code}; response body omitted to avoid echoing credentials."
         )
 
     west, south, east, north = bbox

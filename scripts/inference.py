@@ -30,6 +30,7 @@ import numpy as np
 import rasterio
 import torch
 import torch.nn.functional as F
+from rasterio.warp import Resampling, reproject
 from rasterio.windows import Window
 from tqdm import tqdm
 
@@ -39,6 +40,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from config.presets import MAX_SLOPE_DEGREES  # noqa: E402
 from config.run_meta import load_run_meta  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
@@ -65,7 +67,7 @@ from s1_normalization import (
     normalization_from_checkpoint,
 )
 
-# Speckle control for the delivered flood mask, shared with make_demo_data.py so
+# Speckle control for the delivered flood mask, shared with demo/make_demo_data.py so
 # the fixture applies the same rule the real run does.
 from mask_postprocess import MIN_COMPONENT_PIXELS, remove_small_components  # noqa: E402
 
@@ -371,7 +373,7 @@ def derive_change_mask(
 
     The after scene contains the permanent river, so writing it as flood_mask.tif
     reports the whole river as "flooded" — every riverside building reads as
-    DESTROYED and every bridge over the river as damaged. The product this
+    structural damage and every bridge over the river as damaged. The product this
     pipeline promises is the *change*: after AND NOT before.
     """
     after_bin = (np.asarray(after_mask) > 0.5)
@@ -648,6 +650,41 @@ def save_valid_mask(
           f"({int((np.asarray(valid) > 0.5).sum()):,} observed px)")
 
 
+def steep_slope_mask(dem_path: Path, profile: dict, shape: tuple[int, int]) -> tuple[np.ndarray, int]:
+    """Return DEM pixels above the configured slope limit on the SAR grid."""
+    from scipy.ndimage import binary_erosion
+
+    with rasterio.open(dem_path) as src:
+        if src.crs is None or profile.get("crs") is None:
+            raise ValueError("DEM and Sentinel-1 grids need a CRS for slope masking")
+        elevation = np.full(shape, np.nan, dtype=np.float32)
+        reproject(
+            source=rasterio.band(src, 1), destination=elevation,
+            src_transform=src.transform, src_crs=src.crs, src_nodata=src.nodata,
+            dst_transform=profile["transform"], dst_crs=profile["crs"],
+            dst_nodata=np.nan, resampling=Resampling.bilinear,
+        )
+
+    finite = np.isfinite(elevation)
+    if not finite.any():
+        return np.zeros(shape, dtype=bool), 0
+    safe = np.where(finite, elevation, 0.0)
+    transform, crs = profile["transform"], profile["crs"]
+    if crs.is_geographic:
+        lat = transform.f + (np.arange(shape[0]) + 0.5) * transform.e
+        dy = abs(transform.e) * 111320.0
+        dx = abs(transform.a) * 111320.0 * np.maximum(np.cos(np.radians(lat)), 1e-3)
+        dz_drow, dz_dcol = np.gradient(safe)
+        slope = np.hypot(dz_drow / dy, dz_dcol / dx[:, None])
+    else:
+        dz_drow, dz_dcol = np.gradient(safe, abs(transform.e), abs(transform.a))
+        slope = np.hypot(dz_drow, dz_dcol)
+    slope_deg = np.degrees(np.arctan(slope))
+    supported = binary_erosion(finite, iterations=1, border_value=0)
+    steep = supported & (slope_deg > MAX_SLOPE_DEGREES)
+    return steep, int(steep.sum())
+
+
 def save_flood_mask(
     mask: np.ndarray,
     prob_map: np.ndarray | None,
@@ -750,6 +787,7 @@ def main():
     parser.add_argument("--after-dir", type=Path, required=True, help="After-event image directory")
     parser.add_argument("--model", type=Path, default=Path("models/flood_unet.pt"), help="Model path")
     parser.add_argument("--output", type=Path, default=Path("results/flood_mask.tif"), help="Output flood mask")
+    parser.add_argument("--dem", type=Path, default=None, help="Optional Copernicus DEM for steep-slope masking")
     parser.add_argument("--img-size", type=int, default=256, help="Tile size for inference")
     parser.add_argument("--threshold", type=float, default=0.5, help="Flood probability threshold")
     parser.add_argument("--device", default="auto", help="Device (cuda/cpu/auto)")
@@ -1023,6 +1061,22 @@ def main():
             before_img, after_img, threshold_db=args.baseline_threshold
         )
 
+    slope_info = {
+        "enabled": False,
+        "max_slope_degrees": MAX_SLOPE_DEGREES,
+        "masked_pixels": 0,
+    }
+    if args.dem and args.dem.is_file() and profile and profile.get("transform") and profile.get("crs"):
+        steep, masked_slope_pixels = steep_slope_mask(args.dem, profile, raw_change.shape)
+        raw_change[steep] = 0
+        after_valid = (
+            ~steep if after_valid is None
+            else (np.asarray(after_valid) > 0.5) & ~steep
+        )
+        slope_info.update(enabled=True, masked_pixels=masked_slope_pixels)
+    elif args.dem:
+        print("  ⚠ DEM missing or raster grid unavailable; slope masking skipped")
+
     # Speckle control on the delivered mask. A flood is a connected patch; a
     # couple of dark pixels is sensor noise, and each one becomes a "flooded"
     # building or a cut road downstream.
@@ -1052,6 +1106,7 @@ def main():
         min_component_pixels=args.min_component_pixels,
         method=method,
     )
+    change["slope_mask"] = slope_info
     print(f"\n{'─'*70}")
     print("Flood Change Detection Results")
     print(f"{'─'*70}")

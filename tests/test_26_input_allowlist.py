@@ -141,7 +141,7 @@ def test_aoi_confirmation_is_forwarded_only_when_explicit(dashboard, monkeypatch
     assert "--confirm-aoi" in captured["argv"]
 
 
-def test_checkbox_cannot_confirm_unverified_default_preset(dashboard):
+def test_checkbox_requires_an_explicit_aoi_to_confirm(dashboard):
     response = _post(dashboard, {"confirm_aoi": True})
     assert response.status_code == 400
-    assert "verify the preset AOI" in response.get_json()["error"]
+    assert "requires an AOI to confirm" in response.get_json()["error"]

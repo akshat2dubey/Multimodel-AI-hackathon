@@ -428,7 +428,7 @@ DEM_SOURCE_SYNTHETIC = (
 
 
 def dem_is_synthetic(dem_path: Path) -> bool:
-    """True when the DEM came from scripts/make_demo_data.py.
+    """True when the DEM came from demo/make_demo_data.py.
 
     Labelling a fabricated elevation model as "Copernicus WorldDEM-30" would put
     a false attribution into the submission, so the sidecar decides the label.

@@ -82,7 +82,8 @@ def test_cutoff_analysis_on_empty_features_exits_zero_with_zero_counts(tmp_path,
         f"{proc.returncode}\nstdout: {proc.stdout[-800:]}\nstderr: {proc.stderr[-800:]}"
     )
     data = json.loads(out.read_text(encoding="utf-8"))
-    summary = data["summary"]
+    metadata = data["metadata"]
+    summary = metadata["summary"]
     assert summary["total_settlements"] == 0, (
         f"expected 0 settlements, got {summary['total_settlements']}"
     )
@@ -92,6 +93,6 @@ def test_cutoff_analysis_on_empty_features_exits_zero_with_zero_counts(tmp_path,
     assert summary["flooded_road_segments"] == 0, (
         f"expected 0 flooded road segments, got {summary['flooded_road_segments']}"
     )
-    assert data["cutoff_settlements"] == [], (
-        f"expected an empty cutoff list, got {len(data['cutoff_settlements'])} entries"
+    assert metadata["cutoff_settlements"] == [], (
+        f"expected an empty cutoff list, got {len(metadata['cutoff_settlements'])} entries"
     )

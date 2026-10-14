@@ -7,6 +7,7 @@ that stayed empty. One results directory, or none of the numbers mean anything.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -87,7 +88,19 @@ def test_every_stage_output_lands_in_the_shared_dirs(
     commands: list[list[str]] = []
 
     def fake_run(cmd, cwd=None):  # noqa: ANN001 - mimics run_pipeline.run
-        commands.append([str(part) for part in cmd])
+        cmd = [str(part) for part in cmd]
+        commands.append(cmd)
+        if cmd[1].endswith("fetch_osm.py"):
+            def value(flag):
+                return cmd[cmd.index(flag) + 1]
+
+            osm_dir = Path(value("--output"))
+            osm_dir.mkdir(parents=True, exist_ok=True)
+            (osm_dir / "osm_metadata.json").write_text(json.dumps({
+                "bbox": [float(part) for part in value("--bbox").split(",")],
+                "snapshot_date": value("--snapshot-date"),
+                "failed_required_categories": [],
+            }), encoding="utf-8")
         return True
 
     monkeypatch.setattr(run_pipeline, "run", fake_run)

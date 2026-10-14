@@ -56,7 +56,7 @@ def test_dashboard_demo_detection_uses_served_results_dir(tmp_path, monkeypatch)
 
 
 def test_run_offline_keeps_every_stage_out_of_results_and_data(tmp_path, monkeypatch):
-    from scripts import run_offline
+    from demo import run_offline
 
     data = tmp_path / "data_demo"
     results = tmp_path / "results_demo"
@@ -75,7 +75,7 @@ def test_run_offline_keeps_every_stage_out_of_results_and_data(tmp_path, monkeyp
 
 
 def test_offline_runner_rejects_real_data_paths_before_writing(tmp_path, monkeypatch):
-    from scripts import run_offline
+    from demo import run_offline
 
     called = False
 

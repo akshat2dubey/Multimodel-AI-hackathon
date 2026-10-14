@@ -239,7 +239,7 @@
         <div class="label">Buildings Affected</div>
         <div class="value warning" id="buildings-affected">—</div>
         <div class="label" style="margin-top:4px;">
-          <span id="buildings-destroyed">0</span> destroyed
+          <span id="buildings-major-flooded">0</span> with major flood overlap
           &middot; <span id="buildings-severe">0</span> severe
         </div>
       </div>
@@ -545,9 +545,9 @@ function updateStats(status) {
   
   document.getElementById('buildings-affected').textContent = 
     (ds.affected_buildings || 0) + ' / ' + (ds.total_buildings || 0);
-  document.getElementById('buildings-destroyed').textContent = ds.destroyed_buildings || 0;
+  document.getElementById('buildings-major-flooded').textContent = ds.major_flooded_buildings || 0;
   document.getElementById('buildings-severe').textContent = 
-    (ds.affected_buildings || 0) - (ds.destroyed_buildings || 0);
+    (ds.affected_buildings || 0) - (ds.major_flooded_buildings || 0);
   // Prefer the network-graph figure: it is the count that actually explains the
   // cut-off settlements. Fall back to the feature-level count if absent.
   document.getElementById('roads-cut').textContent =
@@ -637,15 +637,14 @@ function addDamageLayers(data) {
       style: function(feature) {
         const d = feature.properties.damage;
         const colors = {
-          'DESTROYED': '#b71c1c',
-          'SEVERELY_DAMAGED': '#e65100', 
-          'PARTIAL': '#ffa726',
+          'FLOODED_MAJOR': '#b71c1c',
+          'FLOODED_PARTIAL': '#ffa726',
           'UNAFFECTED': '#4caf50',
           'UNKNOWN': '#999',
         };
         return {
           color: colors[d] || '#999',
-          weight: d === 'DESTROYED' ? 2 : 1,
+          weight: d === 'FLOODED_MAJOR' ? 2 : 1,
           fillColor: colors[d] || '#999',
           fillOpacity: d === 'UNAFFECTED' ? 0.1 : 0.5,
         };
@@ -665,7 +664,7 @@ function addDamageLayers(data) {
       const d = feature.properties.damage;
       const r = feature.properties.ratio;
       return `<b>Building</b><br>` +
-        `Damage: <span class="badge ${d === 'DESTROYED' ? 'critical' : d === 'SEVERELY_DAMAGED' ? 'high' : d === 'PARTIAL' ? 'moderate' : 'low'}">${escapeHtml(d)}</span><br>` +
+        `Flood overlap: <span class="badge ${d === 'FLOODED_MAJOR' ? 'critical' : d === 'FLOODED_PARTIAL' ? 'moderate' : 'low'}">${escapeHtml(d)}</span><br>` +
         `Flood overlap: ${(r * 100).toFixed(1)}%`;
     });
   }
@@ -689,7 +688,7 @@ function addDamageLayers(data) {
         if (feature.properties.cut) {
           return { color: '#b71c1c', weight: 4, dashArray: '5,5' };
         }
-        if (feature.properties.damage === 'SEGMENT_AFFECTED') {
+        if (feature.properties.damage === 'FLOODED_PARTIAL' || feature.properties.damage === 'FLOODED_MAJOR') {
           return { color: '#ffa726', weight: 2 };
         }
         return { color: '#666', weight: 1, opacity: 0.5 };
@@ -727,6 +726,13 @@ function addDamageLayers(data) {
 
 function addCutoffLayer(data) {
   if (layers.cutoffs) map.removeLayer(layers.cutoffs);
+  const cutoffLayers = [];
+  if ((data.flooded_road_features || []).length) {
+    cutoffLayers.push(L.geoJSON({
+      type: 'FeatureCollection',
+      features: data.flooded_road_features,
+    }, { style: { color: '#e94560', weight: 4, dashArray: '6,4' } }));
+  }
   
   // The analysis produces one record per building footprint. Plotting and listing
   // villages answers "who is cut off?" far better than 68 stacked markers on the
@@ -744,6 +750,7 @@ function addCutoffLayer(data) {
   if (villages.length === 0) {
     document.getElementById('cutoffs-list').innerHTML =
       '<div style="color:#888; font-size:13px; text-align:center; padding:12px;">No cut-off settlements identified.</div>';
+    layers.cutoffs = L.layerGroup(cutoffLayers).addTo(map);
     return;
   }
 
@@ -776,7 +783,7 @@ function addCutoffLayer(data) {
     markers.push(marker);
   });
 
-  layers.cutoffs = L.layerGroup(markers).addTo(map);
+  layers.cutoffs = L.layerGroup([...cutoffLayers, ...markers]).addTo(map);
 
   // Update cutoff list in sidebar
   const listEl = document.getElementById('cutoffs-list');

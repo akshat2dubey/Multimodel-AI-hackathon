@@ -1,387 +1,76 @@
-# Jalnetra — Complete Tutorial, Status & Security Baseline
+# Jalnetra — current run guide and status
 
-**Project:** Bhote Koshi–Trishuli flood mapping pipeline (Track B hackathon entry)
-**Last audited:** 2026‑10‑09
-**Audit basis:** filesystem inspection, not memory. Every number below was read off disk.
+**Updated:** 15 October 2026. This replaces the older project audit and its stale completion estimates.
 
----
+Jalnetra is a research prototype for flood-change mapping from Sentinel-1 and overlaying the estimated mask with OpenStreetMap infrastructure. It is not an operational emergency-response tool.
 
-## 0. The 30‑second version
+## Case-study status
 
-You have a **working, end‑to‑end flood‑mapping pipeline** for a Himalayan river corridor.
-It downloads a satellite digital elevation model, traces where water would flow, overlays
-OpenStreetMap infrastructure, and serves the results through a live web dashboard.
+The confirmed study area is Copernicus EMSR927 AOI01, Syapru Besi, Rasuwa District, Nepal: `[85.117358, 27.972395, 85.581515, 28.077922]`. Before/after Sentinel-1 scenes from 24 August and 5 September 2026 share relative orbit 19 and have AOI-matched preprocessing sidecars. Pre-event OSM layers for 27 July were acquired for the same bounds through the Overpass attic fallback. The ohsome v2 extraction key still receives an access-denied response; the fallback handled a truncated mirror response and retrieved the required layers.
 
-**Two outputs are real. The rest are labelled synthetic placeholders** that exist so the
-code, the dashboard and the report could all be built and tested before the satellite
-imagery arrives. The whole system is honest about which is which — there is a
-`DEMO_DATA_NOTICE.txt` and every synthetic artifact carries `"synthetic": true` in its own
-metadata.
-
-**What it is waiting on:** a free Copernicus account. That single 15‑minute signup is the
-gate on the entire remote‑sensing half.
-
----
-
-## 1. Run it right now (the tutorial proper)
-
-### 1.1 Open the folder
-
-`cd` into the repository root — the directory that holds `scripts/`, `dashboard/` and
-`requirements.txt`. Quote the path if it contains spaces (bash and PowerShell both accept
-forward slashes):
-
-```bash
-cd "/path/to/Multimodel-AI-hackathon"
-```
-
-Every command in this tutorial is written for **bash** (Git Bash or WSL on Windows, or any
-POSIX shell elsewhere).
-
-### 1.2 Check Python & dependencies
-
-```bash
-python --version
-python -c "import flask, rasterio, numpy, geopandas; print('deps OK')"
-```
-
-`requirements.txt` covers: Flask, rasterio, numpy, geopandas, shapely, scipy, torch.
-If something is missing: `pip install -r requirements.txt`.
-
-### 1.3 Start the dashboard (no internet, no account needed)
-
-```powershell
-python dashboard/app.py
-```
-
-Then open **http://localhost:5000**.
-
-There are **10 routes**. All 9 GET routes return HTTP 200; the tenth is POST‑only.
-Verified against a live server on 2026‑10‑09:
-
-| Route | What it shows | Status | Size / time |
-|---|---|---|---|
-| `/` | Map UI: flood layer, roads, buildings, bridges, flood path | mixed | 23,363 B / 0.04 s |
-| `/api/status` | Headline stats: flood, damage, cut‑offs | synthetic | 1,029 B / 0.04 s |
-| `/api/flood-mask` | Flood extent polygons | synthetic | 14,530 B / 0.01 s |
-| `/api/damage` | Damaged buildings / bridges | synthetic | 90,360 B / 0.01 s |
-| `/api/cutoffs` | Cut‑off settlements | synthetic | 40,254 B / 0.00 s |
-| `/api/flood-path` | The real DEM flow trace | **REAL** | 343,114 B / 0.04 s |
-| `/api/situation-report` | Situation report as JSON | synthetic | 13,946 B / 0.08 s |
-| `/report` | Rendered situation report | synthetic | 10,716 B / 0.01 s |
-| `/demo` | Static sample view | synthetic | 7,187 B / 0.03 s |
-| `/api/run-pipeline` | POST only (GET → **405**) — re‑runs the pipeline | — | 153 B |
-
-> **`/api/change-detection` does not exist** — it returns **404**. Change‑detection
-> figures are nested inside `/api/status` under `flood_stats` instead. Earlier notes
-> listing that endpoint were wrong; corrected here after testing.
-
-### 1.4 In PowerShell, test a route without a browser
-
-```powershell
-Invoke-RestMethod http://localhost:5000/api/flood-path | Select-Object -First 1
-```
-
-(`Invoke-RestMethod` is the PowerShell way; `curl` on Windows PowerShell is an alias for
-`Invoke-WebRequest` and behaves differently — that trips people up.)
-
-### 1.5 Re‑run the pipeline from the terminal
-
-```powershell
-python scripts/run_pipeline.py --preset trishuli
-```
-
-That resolves the preset into `results/run_meta.json` and every stage reads it. To
-run a different area, pass `--bbox <min_lon,min_lat,max_lon,max_lat>` (the primary
-AOI input) plus `--before-date` / `--after-date` / `--event-date` / `--osm-snapshot`;
-`--center-lat`/`--center-lon`/`--extent` is only a fallback.
-
-> **No `--skip-training` flag:** the orchestrator never trains. If
-> `models/flood_unet.pt` is missing it falls back to the log‑ratio change‑detection
-> baseline, so the command above still yields a real mask from real imagery.
-
-> **The case‑study AOI is NOT confirmed.** The authoritative area is the Copernicus
-> EMSR927 AOI01 footprint (Syabru Bensi, Rasuwa district) — the event is **not** at
-> 85.7°E, which is only the center the existing OSM snapshot was pulled at. The
-> `trishuli` preset therefore carries a clearly marked TODO instead of a guessed
-> bbox, and any run without an explicit `--bbox` is stamped `aoi_confirmed: false`
-> (the report then prints an "AREA OF INTEREST NOT CONFIRMED" banner).
-
-### 1.6 Regenerate just the flood path from the real DEM
-
-```powershell
-python scripts/flood_path.py --pit-radius 3 --max-breaches 5000
-```
-
-Use `--pit-radius 0` to get the original strict‑D8 behaviour (53‑pixel trace, for
-comparison).
-
----
-
-## 2. The pipeline, stage by stage
-
-```
-                        ┌─────────────────────────────────────┐
-                        │  Copernicus Data Space (needs acct) │
-                        └──────────────┬──────────────────────┘
-                                       │
-   ┌───────────────────────────────────┼────────────────────────────┐
-   ▼                                   ▼                            ▼
-Sentinel-1 GRD          Sentinel-2 L2A               Copernicus DEM GLO-30
-download_sentinel.py    download_sentinel2.py        download_dem.py
-   │  SYNTHETIC             │  SYNTHETIC                │  ✅ REAL (no account)
-   ▼                        ▼                           ▼
-inference.py  ──► flood_mask.tif  ──┐                  flood_path.py
-   │  (U-Net, or the log-ratio      │                   │  ✅ REAL
-   │   baseline when no checkpoint   │
-   │   exists: 4 rasters written)    │
-   ▼                                ▼                   ▼
-change_detection.json      damage_assessment.py    flood_path.geojson
-   │  SYNTHETIC              │  SYNTHETIC
-   ▼                          ▼
-cutoff_analysis.py  ──►  cutoff_settlements.geojson  (SYNTHETIC)
-   │
-   ▼
-generate_report.py ──► report/situation_report.html  (SYNTHETIC)
-   │
-   ▼
-dashboard/app.py ──► web UI  (serves all of the above)
-```
-
-Paths in that diagram are relative to whichever run produced them. A real run
-writes `data/`, `results/` and `report/`; the synthetic fixture lives in
-`data_demo/` and `results_demo/` (its report included), and the dashboard shows
-a banner when it is pointed at the fixture.
-
-### 2.1 Script inventory
-
-| Script | Purpose | Status |
-|---|---|---|
-| `download_dem.py` | Pulls Copernicus GLO‑30 1° tiles from the public AWS S3 bucket, mosaics them | ✅ **Works, real data on disk** |
-| `download_sentinel.py` | Searches CDSE for a same‑orbit‑track Sentinel‑1 GRD pair, downloads it | ⛔ Needs CDSE account |
-| `download_sentinel2.py` | Downloads Sentinel‑2 L2A bands B02/B03/B04/B08/B11/B12 + SCL | ⛔ Needs CDSE account |
-| `fetch_osm.py` | Pulls OSM roads/buildings/settlements/hospitals/bridges | ⚠️ Fixture on disk |
-| `make_demo_data.py` | Fabricates the synthetic GeoTIFFs & OSM | ✅ Works (that's the point) |
-| `train_segmentation.py` | U‑Net / ResNet‑U‑Net training on Kuro Siwo | ⚠️ Runs, but **needs a real dataset** — refuses an empty `--dataset`; `--smoke-test` fabricates tiles and writes `*_smoke.pt` |
-| `s1_normalization.py` | The single dB → 0..1 input scaling, shared by training + inference | ✅ Works |
-| `mask_postprocess.py` | Speckle control — drops tiny connected flood blobs | ✅ Works |
-| `preprocess_s1.py` | Sentinel‑1 calibration / speckle filter → dB + sidecar | ✅ Works |
-| `inference.py` | Tiled inference → `flood_mask.tif` (new water only) + `water_after.tif`, `flood_mask_before.tif`, `valid_mask.tif`; auto-falls back to the log‑ratio baseline | ⚠️ U‑Net path needs a trained model; baseline path needs only imagery |
-| `damage_assessment.py` | 3×3 building cluster rule vs flood mask | ✅ Works on synthetic |
-| `cutoff_analysis.py` | Road‑network reachability → cut‑off settlements | ✅ Works on synthetic |
-| `flood_path.py` | D8 steepest‑descent flow trace + sink breaching | ✅ **Works on real DEM** |
-| `generate_report.py` | Renders `situation_report.html` with embedded maps | ✅ Works on synthetic |
-| `run_pipeline.py` | Orchestrates all of the above | ✅ Works |
-| `run_offline.py` | Pipeline variant that skips all downloads | ✅ Works |
-| `dashboard/app.py` | Flask API + web UI | ✅ Works (see §8) |
-
----
-
-## 3. What is REAL vs SYNTHETIC — the honest ledger
-
-### ✅ REAL — verified from disk during this audit
-
-| Artifact | Evidence |
+| Status | Evidence |
 |---|---|
-| `data/dem/dem.tif` | **258 MB**, `PRODUCT_INFO.json` has `"synthetic": false` |
-| `data/dem/tiles/` | **6 real GLO‑30 tiles**, 38–45 MB each, N27–N28 / E084–E086 |
-| DEM bounds | 83.9999–87.0000 °E, 27.0001–29.0001 °N |
-| DEM source | `https://copernicus-dem-30m.s3.amazonaws.com` (public, no account) |
-| `results/flood_path.geojson` | 804 KB, 9,171 vertices, traced from the real DEM |
-| Flood path metadata | `"synthetic": false`, attributed to Copernicus WorldDEM‑30 |
+| REAL INPUTS | Sentinel-1 pair and sidecars; dated OSM (29,601 buildings, 1,879 roads, 74 bridges, 6 hospitals, 85 settlements); Copernicus DEM. |
+| BASELINE RUN | `results/manifest.json` records all four provenance rules as true. The log-ratio baseline reports 16.72 ha newly flooded, 5 buildings with flood overlap, 1 road touched (0 fully cut), 0 bridges with flood overlap, and 0 of 6 mapped settlements cut off. |
+| NOT VALIDATED | No event-trained model, held-out accuracy evaluation, uncertainty assessment, or spatial comparison with EMSR927 has been completed. Baseline outputs are experimental estimates. |
+| OPTIONAL INPUT NOT AVAILABLE | No Sentinel-2 scenes met the cloud limit for this run. |
+| HUMAN DELIVERABLES | The 3-minute demo video and portal submission still need to be produced by the project owner. |
 
-**Flood path specifics:** starts ~28.35 °N / 85.75 °E at ~5,431 m, descends to 234 m,
-**251 km** of channel, **5,961 m** total drop, **1,201 sinks breached**, `cap_reached: false`.
+The building extract is three features below the available ohsome aggregate count. The settlement network is incomplete; a zero cut-off count must not be read as proof that every community is connected. Full results are in `results/`, with the generated report in `report/situation_report.html` and the concise run report in `report/report.md`.
 
-### ⛔ SYNTHETIC — must be replaced before submission
+## Run the case study again
 
-| Artifact | Real? | Why it's fake |
-|---|---|---|
-| `data/sentinel1/{before,after}/` | ❌ | Demo fixture GeoTIFFs (VV/VH), not real SAFE products |
-| `data/sentinel2/{before,after}/` | ❌ | Demo fixture bands + SCL |
-| `data/osm/*.geojson` | ❌ | Fabricated geometry, not a real OSM snapshot |
-| `results/flood_mask.tif` | ❌ | From fixture, not real inference (newly flooded only) |
-| `results/flood_mask_before.tif` | ❌ | Same (pre-event water = permanent water) |
-| `results/water_after.tif` | ❌ | Same (all post-event water, river included) |
-| `results/valid_mask.tif` | ❌ | Same (observed-pixel mask) |
-| `results/flood_mask.geojson` | ❌ | Derived from synthetic mask |
-| `results/change_detection.json` | ❌ | `"synthetic": true` asserted in the file itself |
-| `results/run_meta.json` | — | Not an artifact: the resolved area/bbox/dates every run publishes for its stages to read (see §1.5) |
-| `results/damage_assessment.geojson` | ❌ | Fixture ∩ fixture |
-| `results/cutoff_settlements.geojson` | ❌ | Fixture road graph |
-| `report/situation_report.html` | ❌ | Generated from all of the above |
-| `models/flood_unet.pt` | ❌ | **`models/` is empty — no trained model exists** |
-| `data/kuro_siwo/` | ❌ | Not present |
+From the repository root, install dependencies in a virtual environment:
 
-**Numbers that are fake and must never be quoted as findings:**
-6,740.79 ha total water · 5,278.36 ha flood extent · 78.3 % flood coverage ·
-68 cut‑off settlements · 70.8 % cut‑off rate · 4 severely damaged buildings ·
-3 damaged bridges · 76.57 m resolution · 640×640 px extent.
-
-All of those are properties of the fabricated fixture.
-
----
-
-## 4. How much is done
-
-| Track | Progress | Detail |
-|---|---|---|
-| **Elevation / terrain** | **~95 %** | Real DEM, real flow trace, sink breaching, docs |
-| **Dashboard & API** | **~90 %** | All 10 routes live; map UI complete; needs hardening |
-| **Report generation** | **~85 %** | Template done, renders correctly; content is synthetic |
-| **Documentation** | **~85 %** | README + report.md accurate, caveats written in |
-| **OSM / infrastructure** | **~60 %** | Code works; still pointed at the fixture |
-| **Sentinel ingestion** | **~50 %** | Search/download code written, never executed for real |
-| **ML model** | **~35 %** | Training code complete; no data, no model, no inference run |
-| **Deliverables (video, portal)** | **0 %** | Entirely yours |
-
-**Overall: roughly 65 % of a submission.** That 65 % is solid and honest. The missing 35 %
-is a single blocked dependency plus one deliverable only you can produce.
-
----
-
-## 5. How polished is it
-
-| Component | Polish | Notes |
-|---|---|---|
-| `flood_path.py` | ★★★★★ | Real data, verified, backward‑compatible, well documented |
-| `download_dem.py` | ★★★★☆ | Robust: validates tile size, detects S3 error pages, mosaics cleanly |
-| `dashboard/app.py` | ★★★☆☆ | Functional & complete, but **insecure by default** (§8) |
-| Map UI (`index.html`) | ★★★★☆ | 655 lines, layered map, working |
-| `train_segmentation.py` | ★★★★☆ | 821 lines, U‑Net + ResNet‑U‑Net, Dice/BCE‑Dice, augmentation — but unproven |
-| `inference.py` | ★★★☆☆ | Written, never executed against a real model |
-| `download_sentinel.py` | ★★★☆☆ | Same‑orbit‑track pairing logic is the hard part and it's correct |
-| `generate_report.py` | ★★★☆☆ | Works; output is only as real as its inputs |
-| Docs | ★★★★☆ | Honest, precise, caveats stated |
-| Repo hygiene | ★★☆☆☆ | **Not a git repo; no `.gitignore`; stray debug logs** |
-
-**The code is more polished than the data.** That is the correct order to build in, and it
-means the moment real imagery lands, the system should light up.
-
----
-
-## 6. What is left
-
-### Blocking
-1. **Copernicus account + OAuth client** → unblocks Sentinel‑1, Sentinel‑2, and therefore
-   the flood mask, damage assessment and cut‑off analysis.
-
-### Your decisions
-2. Which Kuro Siwo source (GeoTIFF recommended — simplest mapping to the expected layout).
-3. Supply the confirmed case‑study AOI (Copernicus EMSR927 AOI01 bounds) so the
-   `trishuli` preset's TODO can be filled in — `--bbox` is the primary input and
-   nothing is guessed in the meantime.
-4. Authorise the GB‑scale Kuro Siwo download.
-
-### Work I can do once unblocked
-5. Wire the `.env` loader so `CDSE_CLIENT_ID` / `CDSE_CLIENT_SECRET` never touch a command
-   line or a log.
-6. Build the Kuro Siwo → `images/` + `masks/` converter.
-7. Train the model and run real inference.
-8. Re‑run damage / cut‑off analysis against real OSM.
-9. Regenerate the report with real numbers.
-
-### Yours alone
-10. The 3‑minute demo video.
-11. Hackathon portal submission.
-12. Publishing the repo (nothing has been pushed).
-
-### Housekeeping
-13. `dashboard/tmp_check.log`, `tmp_d.log`, `tmp_dash.log`, `tmp_dash2.log`, `tmp_f.log` —
-    four stray debug logs left over from dashboard testing.
-14. `results/flood_path_SYNTHETIC_BACKUP.geojson` — superseded backup of the old
-    synthetic path.
-
----
-
-## 7. Security & safety baseline (phase 2 starts here)
-
-### Current posture: **publish‑ready for a laptop demo, NOT safe to expose**
-
-The dashboard is built as a local demo tool. It has **zero** authentication, authorization,
-origin control or rate limiting. That would be acceptable if it only ever listened on
-`127.0.0.1` — but as shipped it binds `0.0.0.0` (S2), so it is already exposed to your
-local network *right now*, and materially worse on venue Wi‑Fi or in any deployment.
-
-Anyone who can reach the port can (a) read every result, and (b) with debug on, get a
-Python console on your machine.
-
-**In short: fix S1–S3 before you demo this anywhere but your own machine.**
-
-### Findings
-
-| # | Finding | Location | Severity | Why it matters |
-|---|---|---|---|---|
-| S1 | `debug` defaults to **on** (`FLASK_DEBUG` defaults to `"1"`) | [app.py:381](../dashboard/app.py#L381) | **Critical if exposed** | The Werkzeug debugger console permits **arbitrary code execution** for anyone who can reach a traceback page. This is not theoretical. |
-| S2 | Binds `host="0.0.0.0"` | [app.py:386](../dashboard/app.py#L386) | **High** | Confirmed in the live log: `Running on all addresses (0.0.0.0)` and it announced itself on `10.52.131.43`. Anyone on the same Wi‑Fi can reach it. Combined with S1 this is remote code execution. |
-| S3 | `CORS(app)` with no origin restriction | [app.py:27](../dashboard/app.py#L27) | **High** | **Verified live:** a request with `Origin: https://evil.example.com` came back with `Access-Control-Allow-Origin: https://evil.example.com` — the origin is *reflected*, not allowlisted. Any website a victim browses can read every API response. |
-| S4 | `POST /api/run-pipeline` is unauthenticated and spawns a subprocess (300 s timeout) | [app.py:344](../dashboard/app.py#L344) | **Medium** | Not command injection — the argument list is fixed and no user input reaches it — but it is an unauthenticated action trigger, so it is a trivial resource‑exhaustion / denial‑of‑service vector. **Verified live:** the CORS preflight answered `Access-Control-Allow-Methods: ... POST ...` for a foreign origin, so a hostile page can fire it cross‑site. |
-| S5 | No `.gitignore` | repo root | **High** | Only a matter of time before a 258 MB DEM, a 145 MB dataset, or `.secrets/cdse.env` gets committed. |
-| S6 | Not a git repository at all | repo root | **Medium** | No change history, no way to revert a bad edit, no diff to review. |
-| S7 | Pipeline stdout/stderr echoed to the HTTP client | [app.py](../dashboard/app.py) | **Low** | If the pipeline ever prints a path, token or key, it leaks to the caller. |
-| S8 | No rate limiting or auth on any `/api/*` route | [app.py](../dashboard/app.py) | **Medium** | All data is world‑readable to anyone who can reach the port. |
-| S9 | `CDSE_CLIENT_ID` / `CDSE_CLIENT_SECRET` read straight from environment; no `.env` loader, no `.secrets/` convention yet | `scripts/download_*.py` | **Medium** | Secrets end up on command lines and in shell history. |
-
-**The fix pattern for S1–S3 is small and worth doing before any demo on shared Wi‑Fi:**
-
-```
-host="127.0.0.1"          # not 0.0.0.0
-debug=False               # explicit, not env-defaulted to true
-CORS(app, origins=["http://localhost:5000"])   # or drop CORS entirely
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-### Hardening backlog for phase 2
+Then run the confirmed preset:
 
-**Tier 1 — do before any shared‑network demo**
-- Bind to `127.0.0.1`; make `0.0.0.0` an explicit opt‑in flag.
-- Default `debug=False`; require an explicit env var to enable it.
-- Restrict CORS to known origins, or remove it (same‑origin serving needs none).
-- Add `.gitignore` (`data/`, `results/`, `models/`, `*.tif`, `.secrets/`, `__pycache__/`,
-  `tmp_*.log`).
-- `git init` and make the first commit so changes are reviewable.
+```powershell
+python scripts/run_pipeline.py --preset trishuli --confirm-aoi
+```
 
-**Tier 2 — before any public deployment**
-- Move secrets into `.secrets/cdse.env` + a loader; add `.secrets/` to `.gitignore`.
-- Secret scanning (gitleaks / trufflehog) over the tree before publishing.
-- Rate‑limit `/api/*`; put `/api/run-pipeline` behind a token or turn it off in production.
-- Stop echoing subprocess output to clients; log to a file instead.
-- Add `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options` headers.
-- Serve over HTTPS if it ever leaves localhost.
-- Dependency audit: `pip-audit` over `requirements.txt`, pin the versions.
+The command downloads/checks Sentinel-1, attempts optional Sentinel-2, fetches dated OSM (using the exact AOI/date cache when present), fetches the DEM, preprocesses Sentinel-1 with sidecars, runs the baseline if no verified trained checkpoint exists, builds impact/connectivity layers, writes the report, and validates provenance. It replaces generated files under `results/` and `report/`.
 
-**Tier 3 — data integrity & honesty (fits "safety" as much as "security")**
-- A guard that **refuses to render** `report/situation_report.html` if any upstream input
-  is synthetic, unless explicitly overridden. The project's biggest reputational risk is
-  not an attacker — it's a synthetic number being quoted as a real measurement on stage.
-- Keep the `"synthetic": true` marker propagated through every derived artifact.
-- Verify the licence/attribution lines in report.md §7 survive into whatever is submitted.
+To open the local dashboard:
 
-**Not a concern right now:** SQL injection, XSS via user content, CSRF on state‑changing
-endpoints (there is no user input and no persistent state), and supply‑chain risk beyond
-the requirement pins. The attack surface is small — it's just wide open.
+```powershell
+cd dashboard
+python app.py
+```
 
----
+The normal results dashboard reads `../results` by default. The offline demo uses synthetic data in separate `data_demo/` and `results_demo/` folders:
 
-## 8. Known bugs and rough edges
+```powershell
+cd ..
+python demo/run_offline.py
+```
 
-| Item | Status |
-|---|---|
-| `flood_path.py` start‑coordinate unpacking bug | ✅ Fixed (`start_row, start_col = rowcol(...)`) |
-| Sink breaching (`--pit-radius`, `--max-breaches`) | ✅ Implemented |
-| Backward compatibility (`--pit-radius 0`) | ✅ Reproduces the original 53‑pixel trace |
-| Case‑study values scattered across a dozen files and disagreeing (preset 08‑14/08‑28 vs README 08‑24/08‑31 vs the real pair 08‑24/09‑05) | ✅ **Fixed** — one `results/run_meta.json`, resolved in `config/run_meta.py`; a test scans for stray literals |
-| Stale 78.x coordinates in docstrings | ✅ Removed |
-| **Case‑study AOI (bbox) not confirmed** | ⚠️ TODO in `config/presets.py` — the EMSR927 AOI01 bounds go in there; until then runs stamp `aoi_confirmed: false` |
-| Flood path stops at the southern DEM edge, not a confluence | ⚠️ Documented limitation |
-| Flood path intersects no settlements | ⚠️ Expected — OSM layer is still the fixture |
-| 1,201 sink breaches required | ⚠️ Documented; it's a *least‑obstruction drainage route*, not a surveyed channel |
-| `train_segmentation.py` expects a dataset layout the repo loader doesn't produce | ⚠️ Needs the converter — and a real Kuro Siwo / Sen1Floods11 download; an empty `--dataset` now fails instead of fabricating tiles |
-| Trained checkpoint (`models/flood_unet.pt`) still absent | ⚠️ `inference.py` and `run_pipeline.py` fall back to the log-ratio baseline so a real mask is produced anyway |
+Do not mix demo artifacts with `results/` or use demo numbers as case-study results.
 
----
+## Credentials and data
 
-## 9. The critical path in one line
+- CDSE OAuth credentials go in the ignored `.secrets/cdse.env`; never paste secrets into chat or commit them.
+- The ohsome key goes in `.secrets/ohsome.env` as `OHSOME_API_KEY=actual_key`. Current v2 extraction access is denied for this key, but the tested Overpass attic fallback can fetch historical geometry. Do not use a current OSM snapshot as a substitute for pre-event data.
+- The before/after pair must bracket the event and use the same relative orbit. OSM input must be dated before 26 August 2026. EMSR927 reference products are for checking only, never model input.
 
-**Create the Copernicus account, put the credentials in `hackathon-trackb/.secrets/cdse.env`,
-and tell me.** Everything else downstream I can take from there — and phase‑2 hardening can
-run in parallel with it.
+## Remaining work
+
+- Independently evaluate the log-ratio baseline with suitable held-out flood labels and document its limitations/uncertainty.
+- Compare only spatially overlapping AOI01 outputs against the EMSR927 reference; the comparison is not done yet.
+- Finish the six-page report, judge Q&A, and 3-minute demonstration deliverables after the evaluation claims are settled.
+- Run the final test/security workflow in the submission environment and confirm the workflow passes. The local end-to-end run and manifest do not replace the test suite or external scientific review.
+
+## Attribution
+
+_Contains modified Copernicus Sentinel data 2026._
+
+_Produced using Copernicus WorldDEM-30 © DLR e.V. 2010–2014 and © Airbus Defence and Space GmbH 2014–2018 provided under COPERNICUS by the European Union and ESA; all rights reserved._
+
+_© OpenStreetMap contributors._
+
+When EMSR927 figures are used: _European Union, Copernicus Emergency Management Service data._

@@ -2,7 +2,7 @@
 """Post-processing shared by the real inference and the synthetic demo fixture.
 
 Kept in its own module so both producers of ``flood_mask.tif`` (inference.py and
-make_demo_data.py) apply exactly the same speckle rule. Without that, the demo
+demo/make_demo_data.py) apply exactly the same speckle rule. Without that, the demo
 fixture would quietly stop being a faithful stand-in for a real run.
 
 No torch, no rasterio — just the array operation.

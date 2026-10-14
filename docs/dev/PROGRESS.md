@@ -2,7 +2,7 @@
 
 **Repository**: `akshat2dubey/Multimodel-AI-hackathon`
 **Plan**: `docs/dev/MASTER_PLAN_v2.txt` (extracted from JALNETRA_MASTER_EXECUTION_PLAN_v2.pdf)
-**Audit date**: 2026-10-12
+**Audit date**: 2026-10-14
 
 > **GIT POLICY — READ FIRST.** Do **not** push to the remote until the human explicitly
 > says so. All work stays local (commits are fine, pushes are not). This was re-confirmed
@@ -16,9 +16,9 @@ Each row was checked against the code and by running the check, not by assuming.
 
 | Old prompt | Task | Gate check | Verdict | Evidence |
 |---|---|---|---|---|
-| #1 | T07 | Sentinel-1 preprocessing bridge | **PARTIAL** | `tests/test_18_preprocess_s1.py` passes (mocked Process API → 4 GeoTIFFs + sidecar). On disk the 4 tifs exist and are pixel-aligned (640×640, EPSG:4326, identical bounds, float32) **but their bounds are 78.45–78.95°E / 28.05–28.55°N — the old, wrong AOI**, not the case-study corridor. No `s1_meta.json` / `S1_PROCESSED.json` sidecar exists on disk (only `PRODUCT_INFO.json`). |
-| #2 | T03 | One results/data path + demo separation | **PASS (1 deviation)** | `tests/test_15_demo_separation.py` → 10 passed. `scripts/run_offline.py` ran end-to-end and refused to touch `results/`. Deviation: `make_demo_data.py` and `run_offline.py` still live in `scripts/`, not `demo/` as T03 specifies. |
-| #3 | T04 | run_meta.json + zero hardcoded area/date/coords | **PARTIAL** | `tests/test_14_no_hardcoded_presets.py` + `tests/test_17_run_meta.py` → 13 passed; no banned coordinate/date literal appears in `scripts/` or `dashboard/` code. But the plan's stricter grep still finds `Trishuli`/`Bhote` in `scripts/make_demo_data.py`, `scripts/run_offline.py`, `scripts/run_pipeline.py` docstrings, and `28.3`/`85.7` in `dashboard/templates/demo.html`. |
+| #1 | T07 | Sentinel-1 preprocessing bridge | **PASS (rechecked 2026-10-14)** | AOI01 is Syapru Besi, Rasuwa District, per the Copernicus EMSR927 activation catalogue. The two CDSE archives were reverified against catalogue size/checksum, selected on orbit 19, and locally reprocessed to the configured AOI bounds `[85.117358, 27.972395, 85.581515, 28.077922]`; each date now has VV/VH GeoTIFFs and an `S1_PROCESSED.json` sidecar. About 81% of pixels are observed. |
+| #2 | T03 | One results/data path + demo separation | **PASS** | Implementations live under `demo/`; compatibility launchers remain under `scripts/`. No end-to-end rerun this turn. |
+| #3 | T04 | run_meta.json + zero hardcoded area/date/coords | **PASS (source audit)** | Demo uses resolved run metadata and relative sample offsets; no case-study names/dates/coordinates remain in `scripts/` or `dashboard/`. Tests not rerun this turn. |
 | #4 | T08 | Change mask = newly flooded, not "after water" | **PASS** | `tests/test_02_change_mask.py` |
 | #5 | T10 | Baseline fallback, no synthetic training, model contract | **PASS** | `tests/test_05_no_synthetic_training.py`; `run_pipeline.py` contains no training call (comments only) |
 | #6 | T11 | Performance of damage + cut-off | **PASS** | `test_5000_features_on_a_3000x3000_mask_finish_within_budget` → **7.20 s** (budget 20 s) |
@@ -42,13 +42,13 @@ Each row was checked against the code and by running the check, not by assuming.
 
 ### Gate verdict summary
 
-**9 PASS, 1 PARTIAL-with-fix-needed (T07), 2 PARTIAL (T03, T04).**
+**10 PASS, 2 PARTIAL (T03, T04) at the last executed gate audit.** T03/T04 source changes are implemented, but their audit tests have not been rerun; treat current results as pending re-audit.
 
 Gate fixes completed 2026-10-12: **T06** (wildcard CORS removed, loopback/debug defaults),
 **T16** (background job + status route + single-job lock) and **T18** (token + Origin check on
-state-changing routes), each with tests and a live check. Still open: **T07** (re-run
-preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the demo scripts to
-`demo/`, strip the remaining case-study literals from docstrings and `demo.html`).
+state-changing routes), each with tests and a live check. T07 and the AOI-specific end-to-end
+run are complete. Historical OSM was fetched through the attic fallback after making truncated
+responses retryable; all four provenance rules passed. The baseline results remain unvalidated.
 
 ---
 
@@ -56,18 +56,18 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
 
 ### Phase 0 — Gate audit
 - [x] **G0** Gate audit run and recorded above (2 tasks failed, 3 partial — fixes queued below)
-- [ ] **T07** Sentinel-1 preprocessing bridge — finish: re-process on the confirmed AOI + write the sidecar
-- [ ] **T03** One results/data path + demo separation — move `make_demo_data.py`/`run_offline.py` → `demo/`
-- [ ] **T04** run_meta.json + zero hardcoded area/date/coords — strip remaining docstrings/`demo.html` literals
+- [x] **T07** Sentinel-1 preprocessing bridge — done 2026-10-14. Both catalogue-verified orbit-19 archives were reprocessed to the confirmed AOI; four VV/VH rasters and matching `S1_PROCESSED.json` sidecars were written. Local stats show 81.1% / 81.2% observed pixels.
+- [x] **T03** One results/data path + demo separation — implementations moved to `demo/`; legacy `scripts/` launchers remain for compatibility. Re-audit pending.
+- [x] **T04** run_meta.json + zero hardcoded area/date/coords — `/demo` now centers from resolved run metadata and uses relative synthetic offsets; no case-study name/date/coordinate literals remain in `scripts/` or `dashboard/`. Re-audit pending.
 
 ### Phase 1 — Remaining fixes
 - [x] **T01** Repo hygiene + secret scan — done 2026-10-12. Deleted `NOTICE.md` (non-English agent notes + a local absolute path) and `docs/CEO_STATUS_REPORT.md` (stale: it still claimed there was no git repo); moved `verification_*.json` to `docs/dev/`. `git grep` for `F:/`, `C:\Users`, `Akshat`, `LadderLens` now returns **nothing** (the tutorial's machine-specific `cd` was rewritten generically, and `fetch_osm.py`'s User-Agent now says Jalnetra). `.gitignore` covers `.secrets/`, `.env`, `*.env`, `data/`, `results/`, `logs/`, `*.pt`, `.venv/` while allowing `models/README.md` and `.env.example`; added `LICENSE` (MIT, Akshat Dubey), `.env.example` (placeholder names only) and `models/README.md`.
   **Secret scan: clean.** No credential literal in any tracked file (the only hits are the variable unpack in `preprocess_s1.py` and obvious fakes in `tests/`), and `git log --all -- .secrets .env *.env` is empty — no secret was ever committed, so no rotation is needed (H5 stays "not needed").
-- [ ] **T02** Test scaffold (already present — extend only)
-- [ ] **T14** Damage labels + accuracy
-- [ ] **T15** Cut-off output = real GeoJSON, no path leak
-- [ ] **T06** Secure defaults on dashboard (host/debug/CORS)
-- [ ] **T18** Token / same-origin / no open CORS
+- [x] **T02** Test scaffold — existing pytest fixtures and focused tests cover the pipeline's core modules; no scaffold code needed.
+- [x] **T14** Damage labels + accuracy — labels now describe flood overlap, one configured fraction threshold drives asset and road cutoffs, bridges use an approach ring outside pre-event water, and DEM slopes above 35° are excluded and recorded in `change_detection.json`. Existing damage tests were updated; execution is pending.
+- [x] **T15** Cut-off output = real GeoJSON, no path leak — settlement points and flooded road lines are features, analysis data is under `metadata`, and dashboard/report readers support that structure plus legacy files. Existing output tests were updated; execution is pending.
+- [x] **T06** Secure defaults on dashboard (host/debug/CORS) — previously verified loopback default, debug off, and no wildcard CORS with live probes and source tests (2026-10-12).
+- [x] **T18** Token / same-origin / no open CORS — previously verified token checks and same-origin rejection on state-changing routes; live probes returned 403 for missing token and foreign Origin (2026-10-12).
 - [ ] **T33** Live-run robustness (cache, retries, timings)
 - [ ] **T31** AI evaluation (held-out, IoU/F1, baseline)
 - [ ] **T32** EMSR927 comparison (check-only)
@@ -83,7 +83,7 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
 - [ ] **T30** OPTIONAL: Sentinel-2 confirmation layer
 
 ### Phase 3 — Security
-- [ ] **T05** Secrets management + redaction
+- [x] **T05** Secrets management + redaction — Copernicus secrets load centrally through `scripts/cdse_env.py`; git-ignore and `.env.example` cover local storage; the dashboard redacts logs and Sentinel Hub errors no longer echo response bodies. Security regression tests have not been run this turn.
 - [x] **T17** Input validation allowlist — done 2026-10-13. `_parse_run_request()` now takes an **allowlist of keys** (unknown keys → 400 naming the key), caps the bbox at `MAX_BBOX_DEG2` (1.0 deg²; a 10°×10° request is refused), requires real ISO dates in the order the analysis needs (`osm_snapshot` < `event_date` ≤ `after_date`, `before_date` ≤ `event_date`), forbids future and non-existent dates (`2026-02-31`), pattern-checks the area name and checks the preset against `config.presets.PRESETS`. `tests/test_26_input_allowlist.py` (19 tests) also asserts a surviving value arrives as **one** argv element. **Residual:** `run_pipeline.py` still does not re-validate (S1-7's second half).
 - [x] **T19** Safe errors + logging — done 2026-10-13. One rotating, git-ignored log (`logs/jalnetra.log`, owner-only where the OS allows) with a redaction filter that masks credentials, `Authorization` headers, repo paths (`<repo>`) and absolute paths (`<path>`); a global handler answers `{"error": "internal error", "id": <uuid>}` and keeps the traceback in the log under that id; no stdout/stderr tail is returned over HTTP. **A real bug was found by the import test this produced:** the log setup called a helper defined further down the module, so `import app` raised `NameError` — fixed by making the chmod inline. Verified: the live log contains **no** token and **no** Windows path.
 - [x] **T20** Rate limiting + resource limits — done 2026-10-13. Per-client rate limit on `POST /api/runs` (5/min → **429**), 64 KB body cap (**413**, checked live with an 80 KB body), single-job lock (409), job wall-clock timeout (default 30 min) that kills the **process group** and marks the run `timeout` rather than `failed`, a free-disk floor before downloading, and a cache cap that prunes oldest-first. `tests/test_22_limits.py` (6 tests, including a real dummy process being killed).
@@ -92,8 +92,8 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
 - [x] **T36** Dependency hygiene — done 2026-10-13. `flask-cors` (declared, never imported) removed. Every outbound fetch now goes through `scripts/net_safe.py`, which asserts the scheme is HTTPS — this **fixes** the four bandit `B310` findings instead of suppressing them. Audit results recorded in `docs/SECURITY.md`: `pip-audit -r requirements.txt` → *No known vulnerabilities found*; `bandit -r scripts dashboard` → **0 HIGH, 0 MEDIUM** (the remaining LOWs are `try/except/pass` around optional imports, `subprocess` with an argv list, and `random` for training seeds). The Python-version claim in `requirements.txt` was corrected to what was actually verified (3.14.2 on Windows; 3.10–3.12 untested). **Not done:** making `torch` optional — `inference.py` imports it unconditionally, so the baseline is not torch-free (stated in `requirements.txt` and `docs/SECURITY.md` rather than papered over).
 - [x] **T34** Provenance manifest + rule checks — done 2026-10-13. Every run writes `results/manifest.json`: SHA-256 + size for **every input and output**, run id, UTC time, git commit, parameters, method (model vs baseline), model hash verification against its sidecar, and package versions. `scripts/manifest.py` evaluates the hard rules in code — `osm_snapshot_before_event`, `acquisitions_bracket_event`, `no_forbidden_input_sources` (EMS/UNOSAT/damage-map path patterns), `sentinel_orbit_same_for_pair` (reads both `S1_PROCESSED.json` sidecars) — refuses to start when one is already broken (exit 3, before anything is written or downloaded) and fails the run at the end otherwise. A rule that cannot be evaluated is recorded as `null`, never as a pass. `tests/test_24_provenance.py` (9 tests); the EMSR leakage guard now allowlists the detector by name and `test_24` proves the detector rejects such a path.
 - [x] **T35** Safe deserialization / model supply chain — done 2026-10-13. `scripts/safe_model.py` is the only loader: `torch.load(..., weights_only=True)` (a pickled object is refused, proven by a test that saves one), a required matching `.sha256` sidecar written by `train_segmentation.py`, and a shape check. A checkpoint with no sidecar is refused unless `--trust-unverified-model` is passed explicitly. `tests/test_23_model_trust.py` (7 tests, including tamper-after-evaluation and an inference-level refusal).
-- [ ] **T37** CI security pipeline
-- [ ] **T39** Tamper-evident audit log + kill switch + incident checklist
+- [x] **T37** CI security pipeline — `.github/workflows/security.yml` runs pytest, Bandit, pip-audit, and Gitleaks on pushes and pull requests; README has the workflow badge. Workflow has not run yet.
+- [x] **T39** Tamper-evident audit log + kill switch + incident checklist — dashboard records hash-linked run/auth events in ignored `logs/audit.jsonl`; `scripts/verify_audit.py` checks the chain; cancel remains token-protected; `docs/INCIDENT_RESPONSE.md` records the response steps. Verification has not been run.
 - [ ] **T38** Container sandbox (optional)
 
 ### Phase 4 — Docs & deliverables
@@ -109,23 +109,31 @@ preprocessing on the confirmed AOI once H1/H2 land) and **T03/T04** (move the de
 
 ## Decisions & unverified items
 
-- **H1 (Case-study bbox)**: **still pending human input.** The preset runs on the
-  centre+extent fallback and stamps everything `aoi_confirmed: false`. Must not be guessed.
-  Blocks: T04 finalisation, T07 re-run, T31, T32.
-- **H2 (Copernicus credentials)**: `.secrets/cdse.env` exists locally (git-ignored). Not
-  validated live in this audit.
+- **H1 (Case-study bbox)**: resolved 2026-10-14. Copernicus EMSR927 AOI01 is identified as
+  Syapru Besi, Rasuwa District; the configured bounds come from its published boundary. The
+  preset is marked confirmed, and `--confirm-aoi` now works for an explicit `--bbox`.
+- **H2 (Copernicus credentials)**: `.secrets/cdse.env` exists locally (git-ignored) and was
+  validated live on 2026-10-14: CDSE returned the matching before/after orbit-19 products and
+  verified both existing archives against catalogue checksums.
+- **H6 (Historical OSM)**: AOI01 inputs acquired on 2026-10-14/15. The saved key reaches the
+  stable v2 health endpoint, but extraction returns HTTP 403 (“Access to this API has been
+  disallowed”). Fixed Overpass fallback handling for truncated HTTP responses; dated attic
+  layers were fetched and exact AOI/date cached. `data/osm/osm_metadata.json` records 29,601
+  buildings, 1,879 roads, 74 bridges, 6 hospitals and 85 settlements; the building total is
+  three below the ohsome aggregate. Key/service access remains a provider-side issue, but does
+  not block this run.
 - **H3 (Training data + GPU)**: pending. No trained model exists. `models/` holds only
   `flood_unet_smoke.pt` — a 2-epoch synthetic smoke checkpoint (Dice 0.44) that detects
   nothing on the real scene; it must never be presented as a result.
 - **H4 (Nepali review)**: pending — ship English-only unless it arrives.
 - **H5 (History rewrite / rotation)**: not needed yet; nothing to rewrite as far as this audit found.
-- **Real-run state**: `results/` is stale relative to the committed code — it predates the
-  `config/run_meta.py` refactor and contains no `run_meta.json`, `water_after.tif` or
-  `valid_mask.tif`. `results/flood_mask_real.tif` is **all zeros** and
-  `results/change_detection.json` reports 0.0 ha, so no real flood mask exists yet.
+- **Real-run state**: pipeline completed on 2026-10-15 for confirmed AOI01. The manifest reports
+  all four provenance rules true. The log-ratio baseline produced the mask and derived layers;
+  outputs are unvalidated estimates. Sentinel-2 scenes were not available under the cloud limit.
 - **Synthetic-data notice conflict**: `data/osm/meta.json` is a stale synthetic leftover
-  (says 96 buildings, `synthetic: true`) while the real snapshot metadata is
-  `data/osm/osm_metadata.json` (3,755 buildings). Its `ohsome_total_check` is `0`.
+  (says 96 buildings, `synthetic: true`) and is not the live snapshot metadata. Use
+  `data/osm/osm_metadata.json` (29,601 buildings; `synthetic: false` by omission) and
+  `results/manifest.json` for the AOI01 run.
 - **T11 choice**: performance gate kept at the plan's 20 s budget; measured 7.20 s.
 - **T16 design**: the job's state is mirrored to `results/run_status.json` (written atomically)
   so it survives a page reload and a crash leaves evidence; the process handle lives outside

@@ -7,12 +7,8 @@ Takes the flood mask produced by inference.py and overlays it on:
   - Roads from OpenStreetMap (pre-event)
   - Bridges from OpenStreetMap (pre-event)
 
-For each feature, estimates damage level:
-  - UNAFFECTED:    No overlap with flood mask
-  - PARTIAL:      Partial overlap (< 50% of feature area in flood)
-  - SEVERELY hit:  > 50% of feature area in flood
-  - DESTROYED:     Feature fully within flood extent (for buildings)
-  - UNKNOWN:       Feature covered by cloud/shadow in satellite imagery
+For each feature, reports flood overlap rather than structural damage:
+  - UNAFFECTED, FLOODED_PARTIAL, FLOODED_MAJOR, or UNKNOWN
 
 Usage:
     python damage_assessment.py \
@@ -34,6 +30,7 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 import rasterio.features
+from scipy.ndimage import binary_dilation
 from rasterio.mask import mask as rasterio_mask
 from rasterio.windows import Window
 from shapely.geometry import mapping, shape
@@ -45,7 +42,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from config.presets import case_study  # noqa: E402
+from config.presets import FLOOD_FRACTION_THRESHOLD, case_study  # noqa: E402
 from config.run_meta import run_meta_for_script  # noqa: E402
 
 if hasattr(sys.stdout, "reconfigure"):  # never crash on a cp1252 Windows console
@@ -146,6 +143,7 @@ def estimate_feature_damage(
     crs,
     feature_type: str = "building",
     valid_mask: np.ndarray | None = None,
+    permanent_water_mask: np.ndarray | None = None,
 ) -> dict:
     """
     Estimate damage level for a single OSM feature.
@@ -173,7 +171,8 @@ def estimate_feature_damage(
             "method": "empty_geometry",
         }
 
-    window = _geometry_window(feature_geom, transform, flood_mask.shape)
+    window = _geometry_window(feature_geom, transform, flood_mask.shape,
+                               pad=3 if feature_type == "bridge" else 1)
     if window is None:
         return {
             "damage_level": "UNKNOWN",
@@ -211,6 +210,21 @@ def estimate_feature_damage(
     flood_pixels = (flood_mask[r0:r1, c0:c1] > 0.5)
 
     method = "raster_overlap"
+    if feature_type == "bridge" and feature_pixels.any():
+        deck_pixels = feature_pixels
+        feature_pixels = binary_dilation(deck_pixels, iterations=2) & ~deck_pixels
+        if permanent_water_mask is not None:
+            feature_pixels &= ~(permanent_water_mask[r0:r1, c0:c1] > 0.5)
+        method = "bridge_approach_ring"
+        if not feature_pixels.any():
+            return {
+                "damage_level": "UNKNOWN",
+                "reason": "No observed bridge approach pixels outside permanent water",
+                "overlap_ratio": 0.0,
+                "feature_pixels": 0,
+                "flood_pixels": 0,
+                "method": "no_bridge_approaches",
+            }
     if feature_pixels.sum() == 0:
         # The footprint is thinner than a pixel (routine for OSM buildings on a
         # 10 m Sentinel-1 grid). Rasterising leaves nothing to measure, so sample
@@ -263,38 +277,16 @@ def estimate_feature_damage(
     # Damage classification
 
     # Damage classification
-    if feature_type == "building":
-        if overlap_ratio >= 0.8:
-            damage = "DESTROYED"
-        elif overlap_ratio >= 0.3:
-            damage = "SEVERELY_DAMAGED"
-        elif overlap_ratio > 0:
-            damage = "PARTIAL"
-        else:
-            damage = "UNAFFECTED"
-    elif feature_type == "road":
-        if overlap_ratio >= 0.5:
-            damage = "SEGMENT_CUT"
-        elif overlap_ratio > 0:
-            damage = "SEGMENT_AFFECTED"
-        else:
-            damage = "UNAFFECTED"
-    elif feature_type == "bridge":
-        if overlap_ratio >= 0.3:
-            damage = "BRIDGE_DAMAGED"
-        else:
-            damage = "BRIDGE_INTACT"
-    else:
-        if overlap_ratio >= 0.5:
-            damage = "SEVERELY_DAMAGED"
-        elif overlap_ratio > 0:
-            damage = "PARTIAL"
-        else:
-            damage = "UNAFFECTED"
+    damage = (
+        "FLOODED_MAJOR" if overlap_ratio >= FLOOD_FRACTION_THRESHOLD
+        else "FLOODED_PARTIAL" if overlap_ratio > 0
+        else "UNAFFECTED"
+    )
 
     return {
         "damage_level": damage,
         "overlap_ratio": round(float(overlap_ratio), 3),
+        "overlap_ratio_raw": float(overlap_ratio),
         "feature_pixels": int(feature_pixels.sum()),
         "flood_pixels": intersection_sum,
         "method": method,
@@ -339,7 +331,7 @@ def assess_buildings(
 
         # Add flood flag for quick filtering (UNKNOWN is deliberately not "affected")
         result["flood_affected"] = damage_info["damage_level"] in (
-            "PARTIAL", "SEVERELY_DAMAGED", "DESTROYED"
+            "FLOODED_PARTIAL", "FLOODED_MAJOR"
         )
 
         # Count buildings by damage
@@ -354,23 +346,21 @@ def assess_buildings(
     # KeyError instead of reporting zero counts.
     if total:
         affected = int(result_gdf["damage_level"].isin(
-            ["PARTIAL", "SEVERELY_DAMAGED", "DESTROYED"]
+            ["FLOODED_PARTIAL", "FLOODED_MAJOR"]
         ).sum())
-        destroyed = int((result_gdf["damage_level"] == "DESTROYED").sum())
-        severe = int((result_gdf["damage_level"] == "SEVERELY_DAMAGED").sum())
-        partial = int((result_gdf["damage_level"] == "PARTIAL").sum())
+        major = int((result_gdf["damage_level"] == "FLOODED_MAJOR").sum())
+        partial = int((result_gdf["damage_level"] == "FLOODED_PARTIAL").sum())
         unknown = int((result_gdf["damage_level"] == "UNKNOWN").sum())
     else:
-        affected = destroyed = severe = partial = unknown = 0
+        affected = major = partial = unknown = 0
 
     denom = max(total, 1)
     print(f"\n  🏗️  Buildings Assessment:")
     print(f"     Total buildings:     {total}")
     print(f"     Flood-affected:      {affected} ({affected / denom * 100:.1f}%)" if total
           else "     Flood-affected:      0 (no buildings)")
-    print(f"     Destroyed:           {destroyed}")
-    print(f"     Severely damaged:    {severe}")
-    print(f"     Partially flooded:   {partial}")
+    print(f"     Major flooding:      {major}")
+    print(f"     Partial flooding:    {partial}")
     print(f"     Unobserved (UNKNOWN):{unknown}")
     print(f"     Unaffected:          {total - affected - unknown}")
 
@@ -399,10 +389,9 @@ def assess_roads(
         result["damage_reason"] = damage_info.get("reason", "")
 
         # Road is cut if > 50% of its length is in flood
-        result["road_cut"] = damage_info["damage_level"] in ("SEGMENT_CUT",)
-        result["road_affected"] = damage_info["damage_level"] in (
-            "SEGMENT_CUT", "SEGMENT_AFFECTED"
-        )
+        ratio = damage_info.get("overlap_ratio_raw", damage_info["overlap_ratio"])
+        result["road_cut"] = ratio > FLOOD_FRACTION_THRESHOLD
+        result["road_affected"] = ratio > 0
 
         results.append(result)
 
@@ -431,13 +420,15 @@ def assess_bridges(
     transform: rasterio.transform.Affine,
     crs,
     valid_mask: np.ndarray | None = None,
+    permanent_water_mask: np.ndarray | None = None,
 ) -> gpd.GeoDataFrame:
     """Assess flood damage to bridges."""
     results = []
     for idx, row in bridges_gdf.iterrows():
         geom = row.geometry
         damage_info = estimate_feature_damage(
-            geom, flood_mask, transform, crs, "bridge", valid_mask
+            geom, flood_mask, transform, crs, "bridge", valid_mask,
+            permanent_water_mask,
         )
 
         result = _safe_row_dict(row)
@@ -445,9 +436,7 @@ def assess_bridges(
         result["damage_overlap_ratio"] = damage_info["overlap_ratio"]
         result["damage_method"] = damage_info.get("method", "")
         result["damage_reason"] = damage_info.get("reason", "")
-        result["bridge_damaged"] = damage_info["damage_level"] in (
-            "BRIDGE_DAMAGED",
-        )
+        result["bridge_damaged"] = damage_info.get("overlap_ratio_raw", damage_info["overlap_ratio"]) >= FLOOD_FRACTION_THRESHOLD
 
         results.append(result)
 
@@ -669,7 +658,17 @@ def main():
 
     buildings_damaged = assess_buildings(buildings, flood_mask, transform, crs, valid_mask)
     roads_damaged = assess_roads(roads, flood_mask, transform, crs, valid_mask)
-    bridges_damaged = assess_bridges(bridges, flood_mask, transform, crs, valid_mask)
+    permanent_water_path = args.flood_mask.parent / "flood_mask_before.tif"
+    permanent_water_mask = None
+    if permanent_water_path.is_file():
+        with rasterio.open(permanent_water_path) as src:
+            permanent_water_mask = src.read(1) > 0.5
+            if (permanent_water_mask.shape != flood_mask.shape
+                    or src.transform != transform or src.crs != crs):
+                raise ValueError("pre-event water mask does not match the flood-mask grid")
+    bridges_damaged = assess_bridges(
+        bridges, flood_mask, transform, crs, valid_mask, permanent_water_mask
+    )
 
     # Save
     save_damage_assessment(

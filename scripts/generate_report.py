@@ -2,9 +2,8 @@
 """
 Situation Report Generator
 
-Generates a 1-page situation report (HTML) for rescue teams based on
-the flood mapping results. Every number comes from the system's maps,
-never invented by language models.
+Generates an experimental situation report (HTML) from the flood mapping
+artifacts. Every number comes from the system's maps, never invented by a model.
 
 The report includes:
   - Event overview (area, date)
@@ -166,23 +165,30 @@ def load_damage_stats(damage_path: Path) -> dict:
     total_buildings = len(buildings)
     affected_buildings = sum(
         v for k, v in building_damage.items()
-        if k in ("PARTIAL", "SEVERELY_DAMAGED", "DESTROYED")
+        if k in ("FLOODED_PARTIAL", "FLOODED_MAJOR", "PARTIAL", "SEVERELY_DAMAGED", "DESTROYED")
     )
-    destroyed_buildings = building_damage.get("DESTROYED", 0)
 
     return {
         "total_buildings": total_buildings,
         "affected_buildings": affected_buildings,
         "affected_buildings_pct": round(affected_buildings / max(total_buildings, 1) * 100, 1),
-        "destroyed_buildings": destroyed_buildings,
-        "severely_damaged_buildings": building_damage.get("SEVERELY_DAMAGED", 0),
-        "partially_damaged_buildings": building_damage.get("PARTIAL", 0),
+        "major_flooded_buildings": building_damage.get("FLOODED_MAJOR", building_damage.get("DESTROYED", 0)),
+        "partially_flooded_buildings": building_damage.get("FLOODED_PARTIAL", building_damage.get("PARTIAL", 0)),
         "building_damage_breakdown": building_damage,
         "total_road_segments": len(roads),
-        "cut_road_segments": road_damage.get("SEGMENT_CUT", 0),
-        "affected_road_segments": road_damage.get("SEGMENT_AFFECTED", 0) + road_damage.get("SEGMENT_CUT", 0),
+        "cut_road_segments": sum(
+            1 for feature in roads
+            if feature["properties"].get("road_cut", feature["properties"].get("damage_level") == "SEGMENT_CUT")
+        ),
+        "affected_road_segments": sum(
+            1 for feature in roads
+            if feature["properties"].get("road_affected", feature["properties"].get("damage_level") in ("SEGMENT_AFFECTED", "SEGMENT_CUT", "FLOODED_PARTIAL", "FLOODED_MAJOR"))
+        ),
         "total_bridges": len(bridges),
-        "damaged_bridges": bridge_damage.get("BRIDGE_DAMAGED", 0),
+        "damaged_bridges": sum(
+            1 for feature in bridges
+            if feature["properties"].get("bridge_damaged", feature["properties"].get("damage_level") == "BRIDGE_DAMAGED")
+        ),
     }
 
 
@@ -191,8 +197,9 @@ def load_cutoff_stats(cutoff_path: Path) -> dict:
     with open(cutoff_path) as f:
         data = json.load(f)
 
-    cutoff_list = data.get("cutoff_settlements", [])
-    summary = data.get("summary", {})
+    metadata = data.get("metadata", data)
+    cutoff_list = metadata.get("cutoff_settlements", [])
+    summary = metadata.get("summary", {})
 
     return {
         "total_settlements": summary.get("total_settlements", 0),
@@ -204,8 +211,8 @@ def load_cutoff_stats(cutoff_path: Path) -> dict:
         # Without a reference facility the cut-off analysis deliberately produced
         # an empty list. Carrying the status through stops the report from
         # presenting that as a reassuring "0% cut off".
-        "status": data.get("status", "ok"),
-        "reference_facility_note": data.get("reference_facility_note"),
+        "status": metadata.get("status", "ok"),
+        "reference_facility_note": metadata.get("reference_facility_note"),
         "cutoff_list": cutoff_list,
     }
 
@@ -220,6 +227,7 @@ def generate_html_report(
     output_path: Path,
     synthetic: bool = False,
     run_meta: dict | None = None,
+    method: str = "unknown",
 ):
     """Generate the HTML situation report.
 
@@ -262,7 +270,7 @@ def generate_html_report(
     <strong style="color:#e65100;">DEMONSTRATION OUTPUT — SYNTHETIC DATA</strong>
     <div style="font-size:12px; color:#6d4c41; margin-top:4px;">
       Every figure in this report was computed from a fabricated test fixture
-      (scripts/make_demo_data.py), not from Copernicus Sentinel-1/-2 or a real DEM.
+      (demo/make_demo_data.py), not from Copernicus Sentinel-1/-2 or a real DEM.
       It validates the pipeline, and must not be quoted as a measurement of the
       August 2026 Nepal event.
     </div>
@@ -272,7 +280,11 @@ def generate_html_report(
         data_label = "Sentinel-1 SAR + OSM pre-event snapshot" + (
             f" ({snapshot})" if snapshot else ""
         )
-        synthetic_banner = ""
+        synthetic_banner = """\n  <div style="background:#fff8e1; border:1px solid #ffe082; border-left:4px solid #f9a825;
+              padding:12px 18px; margin:0 0 18px; border-radius:4px; font-size:12px; color:#5d4037;">
+    <strong>EXPERIMENTAL BASELINE — {}</strong>
+    <div style="margin-top:4px">This flood-change estimate and the derived asset/connectivity counts have not been independently validated for this event. Do not use them for emergency decisions.</div>
+  </div>""".format("Sentinel-1 log-ratio" if method == "log_ratio_baseline" else method)
 
     # A cut-off analysis that had no reference facility must not read as "0%".
     if cutoff_stats.get("status", "ok") != "ok" or cutoff_stats.get("reference_facility_note"):
@@ -457,7 +469,7 @@ def generate_html_report(
     <span class="alert-num">{cutoff_stats['cutoff_settlements']}</span>
     settlements cut off from hospitals and towns due to flood-damaged roads.
     <span style="margin-left: 16px; color: #666; font-size: 13px;">
-      Rescue teams should prioritize road clearance on the segments listed below.
+      Review mapped segments with current local reports before making decisions.
     </span>
   </div>
 
@@ -469,9 +481,9 @@ def generate_html_report(
     </div>
 
     <div class="card">
-      <h3>Buildings Affected</h3>
+      <h3>Buildings With Flood Overlap</h3>
       <div class="value warning">{damage_stats['affected_buildings']} <span style="font-size:14px;color:#888;">of {damage_stats['total_buildings']}</span></div>
-      <div class="sub">{damage_stats['affected_buildings_pct']}% affected • {damage_stats['destroyed_buildings']} destroyed</div>
+      <div class="sub">{damage_stats['affected_buildings_pct']}% affected • {damage_stats['major_flooded_buildings']} with major flood overlap</div>
     </div>
 
     <div class="card">
@@ -490,7 +502,7 @@ def generate_html_report(
   </div>
 
   <div class="full-width">
-    <h2 style="font-size:16px; margin-bottom:12px; color:#444;">Cut-Off Settlements — Priority Rescue Targets</h2>
+    <h2 style="font-size:16px; margin-bottom:12px; color:#444;">Settlement Connectivity Review</h2>
     <table>
       <thead>
         <tr>
@@ -542,9 +554,8 @@ def generate_html_report(
         <h3>Buildings by Damage Level</h3>
         <table style="font-size:13px;">
           <tbody>
-            <tr><td>Destroyed</td><td><span class="rating critical">{damage_stats.get('destroyed_buildings', 0)}</span></td></tr>
-            <tr><td>Severely damaged</td><td><span class="rating high">{damage_stats.get('severely_damaged_buildings', 0)}</span></td></tr>
-            <tr><td>Partially flooded</td><td><span class="rating moderate">{damage_stats.get('partially_damaged_buildings', 0)}</span></td></tr>
+            <tr><td>Major flood overlap</td><td><span class="rating critical">{damage_stats.get('major_flooded_buildings', 0)}</span></td></tr>
+            <tr><td>Partial flood overlap</td><td><span class="rating moderate">{damage_stats.get('partially_flooded_buildings', 0)}</span></td></tr>
             <tr><td>Unaffected</td><td><span class="rating low">{damage_stats.get('total_buildings', 0) - damage_stats.get('affected_buildings', 0)}</span></td></tr>
           </tbody>
         </table>
@@ -651,11 +662,13 @@ def main():
     # Flag synthetic inputs so a demo fixture can never be mistaken for a
     # real event measurement in the published report.
     synthetic = False
+    method = "unknown"
     change_json = args.flood_mask.parent / "change_detection.json"
     if change_json.exists():
         try:
-            synthetic = bool(json.loads(
-                change_json.read_text(encoding="utf-8")).get("synthetic"))
+            change_data = json.loads(change_json.read_text(encoding="utf-8"))
+            synthetic = bool(change_data.get("synthetic"))
+            method = str(change_data.get("method", method))
         except Exception:
             pass
     if (args.flood_mask.parent / "DEMO_DATA_NOTICE.txt").exists():
@@ -670,6 +683,7 @@ def main():
         args.output,
         synthetic=synthetic,
         run_meta=run_meta,
+        method=method,
     )
 
     print(f"\n✅ Situation report complete!")

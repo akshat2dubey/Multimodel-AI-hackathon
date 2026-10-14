@@ -229,7 +229,8 @@ def resolve_run_meta(
     # explicit confirmation for CLI overrides; a source-backed preset can carry
     # its own confirmation. A derived fallback is never "confirmed".
     meta["aoi_confirmed"] = bool(
-        source == "preset" and base.get("aoi_confirmed", False)
+        (source == "preset" and base.get("aoi_confirmed", False))
+        or (source == "cli" and confirm_aoi)
     )
 
     # ── Required + consistent values ─────────────────────────────────────────

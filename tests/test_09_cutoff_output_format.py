@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from datetime import datetime
 
 import geopandas as gpd
 
@@ -52,20 +53,20 @@ def test_output_is_valid_geojson(toy_scene, tmp_path):
     )
     assert isinstance(data["features"], list), "features must be a list"
 
-    # The dashboard reads these two custom members; keep them alongside GeoJSON.
-    assert "cutoff_settlements" in data, "the dashboard reads cutoff_settlements"
-    assert "summary" in data, "the report reads summary"
+    metadata = data["metadata"]
+    assert "cutoff_settlements" in metadata
+    assert "summary" in metadata
+    assert datetime.fromisoformat(metadata["analysis_timestamp"]).utcoffset().total_seconds() == 0
 
     for feature in data["features"]:
         assert feature["type"] == "Feature", f"bad feature type: {feature.get('type')!r}"
-        assert feature["geometry"]["type"] == "Point", (
-            f"cut-off settlements must be point features, got "
-            f"{feature['geometry']['type']!r}"
-        )
-        lon, lat = feature["geometry"]["coordinates"]
-        assert -180 <= lon <= 180 and -90 <= lat <= 90, (
-            f"coordinates {lon},{lat} are not lon/lat — check the CRS handling"
-        )
+        geom = feature["geometry"]
+        if geom["type"] == "Point":
+            lon, lat = geom["coordinates"]
+            assert -180 <= lon <= 180 and -90 <= lat <= 90
+        else:
+            assert geom["type"] == "LineString"
+            assert len(geom["coordinates"]) >= 2
 
     # A strict GeoJSON reader (e.g. a browser, or ogr2ogr) must accept it.
     reloaded = gpd.read_file(out)
@@ -102,8 +103,8 @@ def test_no_reference_facility_output_is_still_valid_geojson(toy_scene, tmp_path
     data = json.loads(out.read_text(encoding="utf-8"))
 
     assert data["type"] == "FeatureCollection"
-    assert data["features"] == []
-    assert data["status"] == "no_reference_facility"
-    assert data["reference_facility_note"], (
+    assert not any(f["geometry"]["type"] == "Point" for f in data["features"])
+    assert data["metadata"]["status"] == "no_reference_facility"
+    assert data["metadata"]["reference_facility_note"], (
         "an empty result must explain itself in the artifact, not only on stdout"
     )

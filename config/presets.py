@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 # config/presets.py -> config/ -> project root
@@ -47,8 +48,13 @@ REPORT_DIR = PROJECT_ROOT / "report"
 MODELS_DIR = PROJECT_ROOT / "models"
 LOGS_DIR = PROJECT_ROOT / "logs"
 
+# Shared flood-overlap rules used by asset assessment and road-network analysis.
+FLOOD_FRACTION_THRESHOLD = 0.3
+MAX_SLOPE_DEGREES = 35.0
+MAX_BBOX_DEG2 = float(os.environ.get("JALNETRA_MAX_BBOX_DEG2", "1.0"))
+
 # A results directory is "demo" if it is the demo directory by name, or if it
-# carries the notice make_demo_data.py drops next to the mask. The dashboard uses
+# carries the notice demo/make_demo_data.py drops next to the mask. The dashboard uses
 # this to show a banner; scripts use it to pick a default output dir.
 DEMO_NOTICE_FILENAME = "DEMO_DATA_NOTICE.txt"
 
@@ -141,9 +147,9 @@ TRISHULI = {
     # The authoritative case-study AOI (Copernicus EMSR927 AOI01). Read once from the
     # fetched catalogue sidecar, never invented. See BBOX_EMSR927_AOI01 above.
     "bbox": BBOX_EMSR927_AOI01,
-    # The linked AOI sidecar still requires independent verification against
-    # its source before this preset may be used for operational analysis.
-    "aoi_confirmed": False,
+    # Verified against the Copernicus EMSR927 activation metadata for AOI01
+    # (Syapru Besi, Rasuwa District); this is the case-study footprint.
+    "aoi_confirmed": True,
     # The Sentinel-1 pair actually downloaded for this case study (orbit 19):
     # 2026-08-24 (2 d pre-event) and 2026-09-05 (10 d post-event). Provenance:
     # data/sentinel1/*/PRODUCT_INFO.json and docs/EMSR927_COMPARISON.md. The
