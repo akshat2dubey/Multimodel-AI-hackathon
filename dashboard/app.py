@@ -52,6 +52,7 @@ from flask import (
     session,
 )
 from werkzeug.exceptions import HTTPException
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from config.presets import (  # noqa: E402  (path set up above)
     AREA as CASE_STUDY_AREA,
@@ -66,8 +67,12 @@ from config.presets import (  # noqa: E402  (path set up above)
     is_demo_dir,
 )
 from config.run_meta import load_run_meta  # noqa: E402
+from config.object_storage import ObjectStore, ObjectStoreError  # noqa: E402
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+OBJECT_STORE = ObjectStore.from_env(
+    ROOT, required=os.getenv("JALNETRA_STORAGE_REQUIRED", "0").strip() == "1"
+)
 
 
 def _validate_public_runtime() -> None:
@@ -83,8 +88,8 @@ def _validate_public_runtime() -> None:
         return
     required = (
         "JALNETRA_SECRET_KEY",
-        "JALNETRA_DASHBOARD_PASSWORD",
         "JALNETRA_PIPELINE_TOKEN",
+        "DATABASE_URL",
     )
     missing = [name for name in required if not os.environ.get(name, "").strip()]
     if os.environ.get("JALNETRA_AUTH", "").strip().lower() in ("off", "0", "false", "no"):
@@ -140,13 +145,37 @@ def _require_login():
     if not LOGIN_REQUIRED:
         return None
     path = request.path
-    if path.startswith("/static/") or path in ("/login", "/favicon.ico"):
+    if path.startswith("/static/") or path in ("/login", "/register", "/favicon.ico"):
         return None
     if session.get(AUTH_SESSION_KEY) or _token_ok():
         return None
     if path.startswith("/api/"):
         return jsonify({"error": "authentication required", "status": 401}), 401
     return redirect("/login?next=" + quote(request.full_path.rstrip("?") or "/", safe="/?=&"))
+
+
+@app.before_request
+def _restore_persistent_files():
+    """Refresh dashboard files from S3 before any route reads local paths."""
+    if OBJECT_STORE is None or request.path.startswith("/static/") or request.path in ("/login", "/register", "/logout"):
+        return None
+    roots = {"results", "results_demo", "report"}
+    local_job_running = (
+        _active_job is not None and _active_job.get("state") == "running"
+    )
+    try:
+        if not local_job_running:
+            OBJECT_STORE.sync_roots(sorted(roots))
+        if request.path == "/api/status" and not local_job_running:
+            OBJECT_STORE.sync_keys([
+                "data/sentinel1/before/S1_PROCESSED.json",
+                "data/sentinel1/after/S1_PROCESSED.json",
+                "data/osm/osm_metadata.json",
+            ])
+    except ObjectStoreError as exc:
+        log.error("persistent storage unavailable for %s: %s", request.path, exc)
+        return jsonify({"error": "persistent storage unavailable", "status": 503}), 503
+    return None
 
 
 @app.errorhandler(Exception)
@@ -254,8 +283,14 @@ LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 # mode is still the documented behaviour for a LAN demo, and it must be
 # deliberate rather than accidental.
 AUTH_SESSION_KEY = "jalnetra_authenticated"
+AUTH_USER_KEY = "jalnetra_user"
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_ATTEMPTS = 5
+MIN_ACCOUNT_PASSWORD = 12
+ACCOUNT_USERNAME = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
+ACCOUNT_AUTH_ENABLED = bool(os.environ.get("DATABASE_URL", "").strip())
+_account_table_ready = False
+_account_table_lock = threading.Lock()
 
 
 class _Auth:
@@ -321,6 +356,54 @@ def _login_rate_limited() -> bool:
     return False
 
 
+def _ensure_account_table() -> None:
+    global _account_table_ready
+    if not ACCOUNT_AUTH_ENABLED:
+        raise RuntimeError("account storage is not configured")
+    if _account_table_ready:
+        return
+    with _account_table_lock:
+        if _account_table_ready:
+            return
+        import psycopg
+
+        with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=5) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS jalnetra_users ("
+                "username VARCHAR(32) PRIMARY KEY, password_hash TEXT NOT NULL, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+        _account_table_ready = True
+
+
+def _account_password_hash(username: str) -> str | None:
+    _ensure_account_table()
+    import psycopg
+
+    with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=5) as conn:
+        row = conn.execute(
+            "SELECT password_hash FROM jalnetra_users WHERE username = %s",
+            (username,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def _create_account(username: str, password: str) -> bool:
+    _ensure_account_table()
+    import psycopg
+    from psycopg.errors import UniqueViolation
+
+    try:
+        with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=5) as conn:
+            conn.execute(
+                "INSERT INTO jalnetra_users (username, password_hash) VALUES (%s, %s)",
+                (username, generate_password_hash(password)),
+            )
+    except UniqueViolation:
+        return False
+    return True
+
+
 def _authenticated() -> bool:
     """True when this request may see the dashboard."""
     if not LOGIN_REQUIRED:
@@ -350,6 +433,9 @@ def _safe_next(target: str | None) -> str:
 # directory. The state is mirrored into results/run_status.json so the status
 # survives a page reload and a crash leaves evidence behind.
 RUN_STATUS_FILENAME = "run_status.json"
+_last_status_upload = 0.0
+STATUS_UPLOAD_INTERVAL = 3.0
+JOB_LEASE_STALE_SECONDS = 15.0
 MAX_ARG_STRING = 80
 
 # T17 input allowlist. The request body is the only thing a browser can push
@@ -499,8 +585,10 @@ def _status_path() -> Path:
     return RESULTS / RUN_STATUS_FILENAME
 
 
-def _write_status(status: dict) -> None:
+def _write_status(status: dict, *, force_store: bool = False, require_store: bool = False) -> None:
     """Write the status file atomically so a reader never sees a half-written JSON."""
+    global _last_status_upload
+    status["updated_utc"] = _utc_now()
     try:
         RESULTS.mkdir(parents=True, exist_ok=True)
         path = _status_path()
@@ -510,6 +598,18 @@ def _write_status(status: dict) -> None:
         _restrict_permissions(path)
     except OSError:
         pass  # a status file that cannot be written must not kill the run
+    if OBJECT_STORE is None:
+        return
+    now = time.monotonic()
+    if not force_store and now - _last_status_upload < STATUS_UPLOAD_INTERVAL:
+        return
+    try:
+        OBJECT_STORE.upload_file(f"{RESULTS.name}/{RUN_STATUS_FILENAME}")
+        _last_status_upload = now
+    except ObjectStoreError:
+        if require_store:
+            raise
+        log.exception("could not persist pipeline status")
 
 
 def _read_status_file() -> dict:
@@ -819,11 +919,26 @@ def _arm_timeout(proc, job: dict) -> None:
     the child's stdout, so it cannot notice a job that has gone quiet.
     """
     def _watchdog() -> None:
-        try:
-            proc.wait(timeout=JOB_TIMEOUT_SECONDS)
-            return                             # finished on its own
-        except subprocess.TimeoutExpired:
-            pass
+        deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
+        last_checkpoint = time.monotonic()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                proc.wait(timeout=min(STATUS_UPLOAD_INTERVAL, remaining))
+                return                         # finished on its own
+            except subprocess.TimeoutExpired:
+                with _job_lock:
+                    _write_status(job)
+                if OBJECT_STORE is not None and time.monotonic() - last_checkpoint >= 30:
+                    try:
+                        OBJECT_STORE.upload_roots(
+                            ["data", "results", "report", "models"], stable_seconds=15
+                        )
+                    except ObjectStoreError:
+                        log.exception("could not checkpoint pipeline artifacts")
+                    last_checkpoint = time.monotonic()
         job["state"] = "timeout"
         job["step"] = "timeout"
         job["error"] = f"the job exceeded {int(JOB_TIMEOUT_SECONDS)} s and was stopped"
@@ -845,8 +960,10 @@ def _terminate(proc) -> None:
         return
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, check=False)
+            result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                    capture_output=True, check=False)
+            if result.returncode != 0:
+                proc.kill()
         else:
             os.killpg(os.getpgid(proc.pid), 15)
     except Exception:  # noqa: BLE001 — cancellation must never raise at the caller
@@ -884,7 +1001,12 @@ def _launch_job(argv: list[str], params: dict) -> dict:
     )
     global _active_proc
     _active_proc = proc
-    _write_status(job)
+    try:
+        _write_status(job, force_store=True, require_store=OBJECT_STORE is not None)
+    except ObjectStoreError:
+        _terminate(proc)
+        _active_proc = None
+        raise
     _arm_timeout(proc, job)
 
     def _reader() -> None:
@@ -907,9 +1029,20 @@ def _launch_job(argv: list[str], params: dict) -> dict:
             with _job_lock:
                 job["exit_code"] = code
                 job["finished_utc"] = _utc_now()
+                persistence_error = None
+                if OBJECT_STORE is not None:
+                    try:
+                        OBJECT_STORE.upload_roots(["data", "results", "report", "models"])
+                    except ObjectStoreError as exc:
+                        persistence_error = str(exc)
+                        log.exception("pipeline artifacts were not fully persisted")
                 # A cancelled or timed-out job already has a final state; the
                 # non-zero exit code those produce must not relabel it "failed".
-                if job["state"] not in ("cancelled", "timeout"):
+                if persistence_error:
+                    job["state"] = "failed"
+                    job["step"] = "failed"
+                    job["error"] = "pipeline artifacts could not be saved to persistent storage"
+                elif job["state"] not in ("cancelled", "timeout"):
                     if code == 0:
                         job["state"] = "done"
                         job["step"] = "finished"
@@ -918,7 +1051,14 @@ def _launch_job(argv: list[str], params: dict) -> dict:
                         job["state"] = "failed"
                         job["step"] = "failed"
                         job["error"] = f"the pipeline exited with code {code}"
-                _write_status(job)
+                try:
+                    _write_status(job, force_store=True,
+                                  require_store=OBJECT_STORE is not None)
+                except ObjectStoreError:
+                    job["state"] = "failed"
+                    job["step"] = "failed"
+                    job["error"] = "pipeline status could not be saved to persistent storage"
+                    _write_status(job)
                 _active_job = None
                 _active_proc = None
 
@@ -1579,7 +1719,7 @@ def demo_mode():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """Sign in. GET renders the form, POST checks the password.
+    """Sign in using a database account, or the local shared password.
 
     The comparison is constant-time, attempts are rate-limited per client, and a
     POST must be same-origin, so a foreign page can use this neither as a
@@ -1600,14 +1740,34 @@ def login():
             return (
                 render_template(
                     "login.html", error="Too many attempts. Wait a few minutes.",
-                    csp_nonce=g.csp_nonce, next=target,
+                    csp_nonce=g.csp_nonce, next=target, register_mode=False,
+                    account_auth_enabled=ACCOUNT_AUTH_ENABLED,
                 ),
                 429,
             )
         supplied = request.form.get("password") or ""
-        if AUTH.password and hmac.compare_digest(supplied, AUTH.password):
+        username = request.form.get("username", "").strip().casefold()
+        signed_in_as = None
+        if ACCOUNT_AUTH_ENABLED:
+            try:
+                password_hash = _account_password_hash(username) if ACCOUNT_USERNAME.fullmatch(username) else None
+            except Exception:
+                log.error("account database unavailable during login")
+                return render_template(
+                    "login.html", error="Account service is temporarily unavailable.",
+                    csp_nonce=g.csp_nonce, next=target,
+                    account_auth_enabled=ACCOUNT_AUTH_ENABLED,
+                ), 503
+            if password_hash and check_password_hash(password_hash, supplied):
+                signed_in_as = username
+        else:
+            signed_in_as = "shared" if AUTH.password and hmac.compare_digest(supplied, AUTH.password) else None
+
+        if signed_in_as is not None:
             session.clear()
             session[AUTH_SESSION_KEY] = True
+            if ACCOUNT_AUTH_ENABLED:
+                session[AUTH_USER_KEY] = signed_in_as
             session.permanent = True
             log.info("login succeeded for %s", _client_key())
             return redirect(target)
@@ -1615,7 +1775,64 @@ def login():
         error = "Incorrect password."
 
     return render_template(
-        "login.html", error=error, csp_nonce=g.csp_nonce, next=target
+        "login.html", error=error, csp_nonce=g.csp_nonce, next=target,
+        register_mode=False,
+        account_auth_enabled=ACCOUNT_AUTH_ENABLED,
+    )
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """Create a durable dashboard account; there is no email verification."""
+    if not LOGIN_REQUIRED:
+        return redirect("/")
+    if not ACCOUNT_AUTH_ENABLED:
+        return "Account registration is not configured.", 503
+
+    target = _safe_next(request.values.get("next"))
+    error = None
+    if request.method == "POST":
+        if not _origin_allowed(request.headers.get("Origin"), allow_opaque=True):
+            return jsonify({"error": "forbidden", "status": 403}), 403
+        if _login_rate_limited():
+            error = "Too many attempts. Wait a few minutes."
+            return render_template(
+                "login.html", error=error, csp_nonce=g.csp_nonce, next=target,
+                register_mode=True, account_auth_enabled=True,
+            ), 429
+
+        username = request.form.get("username", "").strip().casefold()
+        password = request.form.get("password", "")
+        if not ACCOUNT_USERNAME.fullmatch(username):
+            error = "Use 3–32 letters, numbers, dots, underscores, or hyphens for the username."
+        elif len(password) < MIN_ACCOUNT_PASSWORD:
+            error = f"Use a password with at least {MIN_ACCOUNT_PASSWORD} characters."
+        elif len(password) > 256:
+            error = "Password is too long."
+        elif password != request.form.get("confirm_password", ""):
+            error = "Passwords do not match."
+        else:
+            try:
+                created = _create_account(username, password)
+            except Exception:
+                log.error("account database unavailable during registration")
+                error = "Account service is temporarily unavailable. Please try again."
+                return render_template(
+                    "login.html", error=error, csp_nonce=g.csp_nonce, next=target,
+                    register_mode=True, account_auth_enabled=True,
+                ), 503
+            if not created:
+                error = "That username is already taken."
+            else:
+                session.clear()
+                session[AUTH_SESSION_KEY] = True
+                session[AUTH_USER_KEY] = username
+                session.permanent = True
+                return redirect(target)
+
+    return render_template(
+        "login.html", error=error, csp_nonce=g.csp_nonce, next=target,
+        register_mode=True, account_auth_enabled=True,
     )
 
 
@@ -1730,8 +1947,13 @@ def _origin_allowed(origin: str | None, *, allow_opaque: bool = False) -> bool:
             return True
         log.warning("opaque Origin rejected on %s", request.path)
         return False
-    host = (urlsplit(origin).hostname or "").lower()
-    return host in LOOPBACK_HOSTS
+    parsed = urlsplit(origin)
+    if (parsed.hostname or "").lower() in LOOPBACK_HOSTS:
+        return True
+    public_url = os.environ.get("APP_URL") or os.environ.get("SITE_URL") or ""
+    public = urlsplit(public_url)
+    return bool(public.netloc and parsed.scheme == public.scheme
+                and parsed.netloc.casefold() == public.netloc.casefold())
 
 
 def _state_change_error() -> str:
@@ -1778,6 +2000,34 @@ def api_start_run():
                 "run_id": _active_job.get("run_id"),
             }), 409
 
+        persisted_job = _read_status_file()
+        if persisted_job.get("state") == "running":
+            try:
+                updated = datetime.fromisoformat(
+                    str(persisted_job.get("updated_utc", "")).replace("Z", "+00:00")
+                )
+                age = (datetime.now(timezone.utc) - updated).total_seconds()
+            except (TypeError, ValueError):
+                age = JOB_LEASE_STALE_SECONDS + 1
+            if age <= JOB_LEASE_STALE_SECONDS:
+                return jsonify({
+                    "success": False,
+                    "error": "A pipeline run is already active on another instance.",
+                    "run_id": persisted_job.get("run_id"),
+                }), 409
+            persisted_job.update({
+                "state": "interrupted",
+                "step": "interrupted",
+                "finished_utc": _utc_now(),
+                "error": "the previous application instance stopped reporting this run",
+            })
+            try:
+                _write_status(persisted_job, force_store=True,
+                              require_store=OBJECT_STORE is not None)
+            except ObjectStoreError:
+                return jsonify({"success": False,
+                                "error": "persistent storage unavailable", "status": 503}), 503
+
         payload = request.get_json(silent=True) or {}
         if not isinstance(payload, dict):
             return jsonify({"success": False, "error": "invalid input"}), 400
@@ -1787,7 +2037,21 @@ def api_start_run():
             message, field = params
             return jsonify({"success": False, "error": message, "field": field}), 400
 
-        _active_job = _launch_job(_pipeline_argv(params), params)
+        if OBJECT_STORE is not None:
+            try:
+                OBJECT_STORE.sync_roots(["data", "models"])
+            except ObjectStoreError as exc:
+                log.error("could not restore pipeline inputs: %s", exc)
+                return jsonify({"success": False,
+                                "error": "pipeline inputs unavailable from persistent storage",
+                                "status": 503}), 503
+
+        try:
+            _active_job = _launch_job(_pipeline_argv(params), params)
+        except ObjectStoreError as exc:
+            log.error("could not initialize persistent run status: %s", exc)
+            return jsonify({"success": False,
+                            "error": "could not persist pipeline run status", "status": 503}), 503
         return jsonify({
             "success": True,
             "run_id": _active_job["run_id"],
@@ -1826,7 +2090,12 @@ def api_cancel_run():
         job["state"] = "cancelled"
         job["step"] = "cancelled"
         job["finished_utc"] = _utc_now()
-        _write_status(job)
+        try:
+            _write_status(job, force_store=True,
+                          require_store=OBJECT_STORE is not None)
+        except ObjectStoreError:
+            return jsonify({"success": False,
+                            "error": "run cancelled but its status could not be persisted"}), 503
         _active_job = None
         _active_proc = None
     return jsonify({"success": True, "run_id": job["run_id"], "state": "cancelled"})

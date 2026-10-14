@@ -38,6 +38,12 @@ def test_wsgi_import_defaults_to_authentication(monkeypatch):
     assert auth.password == ""
 
 
+def test_public_app_origin_is_allowed_but_not_lookalike(monkeypatch):
+    monkeypatch.setenv("APP_URL", "https://jalnetra.antideploy.app")
+    assert app_module._origin_allowed("https://jalnetra.antideploy.app")
+    assert not app_module._origin_allowed("https://jalnetra.antideploy.app.attacker.test")
+
+
 def test_missing_wsgi_password_cannot_be_bypassed_with_blank_login(gated, monkeypatch):
     monkeypatch.setattr(gated.AUTH, "password", "")
     client = gated.app.test_client()
@@ -61,6 +67,7 @@ def gated(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "LOGIN_REQUIRED", True)
     monkeypatch.setattr(app_module.AUTH, "password", PASSWORD)
     monkeypatch.setattr(app_module.AUTH, "enabled", True)
+    monkeypatch.setattr(app_module, "ACCOUNT_AUTH_ENABLED", False)
     monkeypatch.setattr(app_module, "_login_attempts", {})
     app_module.app.config.update(TESTING=True)
     return app_module
@@ -93,6 +100,52 @@ def test_the_sign_in_page_and_its_assets_need_no_session(gated):
     body = page.get_data(as_text=True)
     assert 'name="password"' in body and 'type="password"' in body
     assert client.get("/static/vendor/leaflet/leaflet.css").status_code != 302
+
+
+def test_public_registration_form_and_account_creation(gated, monkeypatch):
+    monkeypatch.setattr(gated, "ACCOUNT_AUTH_ENABLED", True)
+    created = []
+    monkeypatch.setattr(gated, "_create_account", lambda username, password: created.append((username, password)) or True)
+    client = gated.app.test_client()
+
+    page = client.get("/register")
+    assert page.status_code == 200
+    assert 'name="username"' in page.get_data(as_text=True)
+    assert 'name="confirm_password"' in page.get_data(as_text=True)
+
+    response = client.post("/register", data={
+        "username": "Judge.One", "password": PASSWORD,
+        "confirm_password": PASSWORD,
+    })
+    assert response.status_code == 302
+    assert created == [("judge.one", PASSWORD)]
+    assert client.get("/").status_code == 200
+
+
+def test_registration_validates_username_password_and_confirmation(gated, monkeypatch):
+    monkeypatch.setattr(gated, "ACCOUNT_AUTH_ENABLED", True)
+    monkeypatch.setattr(gated, "_create_account", lambda *_: pytest.fail("invalid account reached storage"))
+    client = gated.app.test_client()
+
+    for data, expected in [
+        ({"username": "x", "password": PASSWORD, "password_confirm": PASSWORD}, "3–32"),
+        ({"username": "judge", "password": "short", "password_confirm": "short"}, "at least 12"),
+        ({"username": "judge", "password": PASSWORD, "confirm_password": "different-password"}, "do not match"),
+    ]:
+        response = client.post("/register", data=data)
+        assert response.status_code == 200
+        assert expected in response.get_data(as_text=True)
+
+
+def test_account_login_checks_database_hash(gated, monkeypatch):
+    from werkzeug.security import generate_password_hash
+
+    monkeypatch.setattr(gated, "ACCOUNT_AUTH_ENABLED", True)
+    monkeypatch.setattr(gated, "_account_password_hash", lambda username: generate_password_hash(PASSWORD) if username == "judge" else None)
+    client = gated.app.test_client()
+    response = client.post("/login", data={"username": "Judge", "password": PASSWORD})
+    assert response.status_code == 302
+    assert client.get("/").status_code == 200
 
 
 def test_a_wrong_password_leaves_the_caller_signed_out(gated):

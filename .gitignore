@@ -44,6 +44,8 @@ venv/
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
+.antideploy-sync-state.json
+.antideploy-sync-state.json.tmp
 .vscode/
 .idea/
 *.swp

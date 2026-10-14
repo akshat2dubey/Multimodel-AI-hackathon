@@ -42,15 +42,13 @@ Then open the dashboard in a browser. For local HTTP, the loopback launcher sele
 
 ### Hosted prototype deployment
 
-The Flask development server (`python app.py`) is for local use only. Do not expose it to the internet. This repository does not include a container image, locked dependency set, TLS/reverse-proxy configuration, or managed job/data storage. Those must be selected and reviewed for the target host; setting a host to `0.0.0.0` is not sufficient.
-
-Install dependencies, set `JALNETRA_HOST=127.0.0.1`, and run Waitress bound to loopback behind an HTTPS reverse proxy, for example:
-
-```bash
-waitress-serve --listen=127.0.0.1:8080 --call dashboard.wsgi:app
-```
-
-Configure `JALNETRA_SECRET_KEY`, `JALNETRA_DASHBOARD_PASSWORD`, and `JALNETRA_PIPELINE_TOKEN` with strong unique values in the host's secret manager. Set `JALNETRA_COOKIE_SECURE=1`. The app refuses non-loopback WSGI startup unless authentication and all three secrets are configured. The current pipeline launches long-running local subprocesses and expects persistent local `data/` and `results/` storage, so stateless/serverless hosting is not supported. Complete the checks in [`docs/SECURITY.md`](docs/SECURITY.md) and scientific validation before handling real users or operational data.
+Antideploy deployment uses Waitress and the platform port through the project
+`Dockerfile`. Pipeline inputs and artifacts are stored in the app's private
+S3-compatible bucket, not only in the disposable container. See
+[`docs/ANTIDEPLOY.md`](docs/ANTIDEPLOY.md) for required secrets, initial
+migration and deployment steps. Keep the three `JALNETRA_*` credentials in the
+host's secret manager. Complete the checks in [`docs/SECURITY.md`](docs/SECURITY.md)
+and scientific validation before handling real users or operational data.
 
 To run the full pipeline from raw satellite data:
 

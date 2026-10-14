@@ -35,6 +35,8 @@ torchvision>=0.15      # ResNet-34 encoder for ResNetUNet
 # used; it was removed in T36.
 flask>=3.0
 waitress>=3.0          # production WSGI server (Windows/Linux)
+boto3>=1.36            # streamed persistence to Antideploy's private S3 bucket
+psycopg[binary]>=3.2   # durable self-service dashboard accounts
 
 # --- Progress + CLI --------------------------------------------------------
 tqdm>=4.65

@@ -33,7 +33,7 @@
   .subtitle { font-size: 12px; color: #888; margin: 4px 0 20px; line-height: 1.5; }
   label { display: block; font-size: 11px; text-transform: uppercase;
           letter-spacing: 0.5px; color: #8899aa; margin-bottom: 6px; }
-  input[type=password] {
+  input[type=text], input[type=password] {
     width: 100%;
     background: #1a1a2e;
     border: 1px solid #0f3460;
@@ -43,7 +43,7 @@
     padding: 10px 12px;
     margin-bottom: 14px;
   }
-  input[type=password]:focus { outline: none; border-color: #e94560; }
+  input[type=text]:focus, input[type=password]:focus { outline: none; border-color: #e94560; }
   button {
     width: 100%;
     background: #e94560;
@@ -73,32 +73,54 @@
     border-top: 1px solid #0f3460;
     padding-top: 12px;
   }
+  .note a { color: #ff8294; }
 </style>
 </head>
 <body>
-  <form class="card" method="post" action="/login">
+  <form class="card" method="post" action="{{ '/register' if register_mode else '/login' }}">
     <h1>🌊 Jalnetra</h1>
     <div class="subtitle">
-      Flood damage mapping from Sentinel-1 — sign in to view results and start a run.
+      {% if register_mode %}Create an account to view results and start a run.{% else %}
+      Flood damage mapping from Sentinel-1 — sign in to view results and start a run.{% endif %}
     </div>
 
     {% if error %}
     <div class="error" role="alert">{{ error }}</div>
     {% endif %}
 
-    <label for="password">Dashboard password</label>
-    <input id="password" name="password" type="password" autocomplete="current-password"
+    {% if account_auth_enabled %}
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" autocomplete="username"
+           minlength="3" maxlength="32" pattern="[A-Za-z0-9_.-]{3,32}"
            autofocus required>
+    {% endif %}
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password"
+           autocomplete="{{ 'new-password' if register_mode else 'current-password' }}"
+           minlength="{{ 12 if register_mode else 1 }}" maxlength="256" required>
+    {% if register_mode %}
+    <label for="confirm_password">Confirm password</label>
+    <input id="confirm_password" name="confirm_password" type="password"
+           autocomplete="new-password" minlength="12" maxlength="256" required>
+    {% endif %}
     <!-- Where to go after signing in. The server accepts only a single-slash
          path on this origin, so this cannot be used as an open redirect. -->
     <input type="hidden" name="next" value="{{ next }}">
-    <button type="submit">Sign in</button>
+    <button type="submit">{{ 'Create account' if register_mode else 'Sign in' }}</button>
 
     <div class="note">
+      {% if account_auth_enabled %}
+      {% if register_mode %}
+      Already have an account? <a href="/login?next={{ next|urlencode }}">Sign in</a>.
+      {% else %}
+      New here? <a href="/register?next={{ next|urlencode }}">Create an account</a>.
+      {% endif %}
+      {% else %}
       The password is set with <code>JALNETRA_DASHBOARD_PASSWORD</code>, or generated
       once at startup and printed in the terminal that started the dashboard.
       Sessions are signed with this server process's key: restarting it signs
       everyone out.
+      {% endif %}
     </div>
   </form>
 </body>
